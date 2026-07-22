@@ -34,6 +34,23 @@ def test_gateway_and_per_printer_probe(client: TestClient) -> None:
     }
 
 
+def test_gateway_status_summarizes_printer_monitoring(client: TestClient) -> None:
+    response = client.get("/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["equipment_id"] == "bambu_gateway"
+    assert body["equipment_name"] == "Bambu Gateway"
+    assert body["equipment_status"] == "ready"
+    assert body["allowed_actions"] == []
+    assert body["components"]["bambu_test_01"]["connected"] is True
+    assert body["components"]["bambu_test_01"]["state"] == "ready"
+    assert body["details"] == {
+        "monitoring_only": True,
+        "printer_count": 1,
+    }
+
+
 def test_ready_status_is_cached_and_contains_no_secrets(
     client: TestClient, backend: FakeBackend
 ) -> None:

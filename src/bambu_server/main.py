@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Path
@@ -17,6 +18,7 @@ from .config import (
     resolve_credentials,
 )
 from .models import (
+    ComponentStatus,
     EquipmentStatus,
     GatewayInfo,
     HealthResponse,
@@ -95,6 +97,44 @@ def create_app(
     @app.get("/health", response_model=HealthResponse, tags=["gateway"])
     async def gateway_health() -> HealthResponse:
         return HealthResponse()
+
+    @app.get("/status", response_model=EquipmentStatus, tags=["gateway"])
+    async def gateway_status() -> EquipmentStatus:
+        printer_statuses = {
+            printer_id: monitor.status() for printer_id, monitor in monitors.items()
+        }
+        components: dict[str, ComponentStatus] = {}
+        for printer_id, status in printer_statuses.items():
+            mqtt = status.components.get("mqtt")
+            components[printer_id] = ComponentStatus(
+                connected=bool(mqtt and mqtt.connected),
+                state=status.equipment_status,
+                message=status.message,
+                last_event_at=mqtt.last_event_at if mqtt else None,
+            )
+        connected_count = sum(component.connected for component in components.values())
+        if connected_count == len(components):
+            state = "ready"
+            message = "All printer monitors are connected"
+        elif connected_count:
+            state = "degraded"
+            message = "Some printer monitors are disconnected"
+        else:
+            state = "unknown"
+            message = "No printer monitors are connected"
+
+        return EquipmentStatus(
+            equipment_id="bambu_gateway",
+            equipment_name="Bambu Gateway",
+            equipment_kind="other",
+            equipment_version=__version__,
+            equipment_status=state,
+            message=message,
+            device_time=datetime.now(UTC),
+            components=components,
+            allowed_actions=[],
+            details={"monitoring_only": True, "printer_count": len(monitors)},
+        )
 
     @app.get("/printers", response_model=list[PrinterSummary], tags=["gateway"])
     async def list_printers() -> list[PrinterSummary]:
