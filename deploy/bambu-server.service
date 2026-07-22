@@ -1,0 +1,41 @@
+[Unit]
+Description=AC Bambu printer monitoring gateway
+Documentation=https://github.com/AccelerationConsortium/bambu-server
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ac
+Group=ac
+WorkingDirectory=/opt/bambu-server
+EnvironmentFile=/opt/bambu-server/.env
+ExecStart=/opt/bambu-server/.venv/bin/uvicorn bambu_server.main:application_factory \
+    --factory \
+    --host 127.0.0.1 \
+    --port 8012 \
+    --no-server-header \
+    --log-level info
+
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+SyslogIdentifier=bambu-server
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/opt/bambu-server
+
+[Install]
+WantedBy=multi-user.target

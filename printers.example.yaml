@@ -1,0 +1,14 @@
+# Copy to printers.local.yaml and keep the local file out of git.
+# Addresses, serial numbers, and access codes are resolved from .env so they
+# cannot accidentally appear in this file or in the HTTP API.
+
+poll_interval_seconds: 2.0
+stale_after_seconds: 20.0
+cors_origins:
+  - http://localhost:8000
+
+printers:
+  - id: bambu_x1c_01
+    name: Bambu X1 Carbon 01
+    model: X1 Carbon
+    env_prefix: BAMBU_X1C_01
