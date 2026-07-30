@@ -1,96 +1,29 @@
-"""Lab equipment status spec v1.0 models.
+"""STATUS_SPEC v1.2 models for the Bambu printer gateway.
 
-These models mirror the authoritative contract in
-``ac-organic-lab/docs/STATUS_SPEC.md``. Bambu printers use ``other`` because
-``3d_printer`` is not currently a member of the contract's closed kind enum.
+Wire-contract types are imported from the shared ``sdl-lab-contract`` package
+and re-exported. Device-specific models (``GatewayInfo``, ``PrinterSummary``)
+remain local.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-PROTOCOL_VERSION = "1.0"
+from sdl_lab_contract import (
+    ComponentStatus,
+    EquipmentKind,
+    EquipmentState,
+    EquipmentStatus,
+    ErrorInfo,
+    ErrorSeverity,
+    HealthResponse,
+    MetricValue,
+    ProbeResponse,
+)
 
-EquipmentKind = Literal[
-    "solid_doser",
-    "liquid_handler",
-    "press",
-    "fume_hood",
-    "robot_arm",
-    "environmental_sensor",
-    "hplc",
-    "plate_reader",
-    "plate_sealer",
-    "plate_stacker",
-    "shaker",
-    "camera",
-    "smart_plug",
-    "power_strip",
-    "other",
-]
-
-EquipmentState = Literal[
-    "ready",
-    "busy",
-    "requires_init",
-    "degraded",
-    "dry_run",
-    "error",
-    "e_stop",
-    "unknown",
-]
-
-
-class ComponentStatus(BaseModel):
-    connected: bool
-    state: str
-    message: str | None = None
-    last_event_at: datetime | None = None
-
-
-class MetricValue(BaseModel):
-    value: float | int | str | bool
-    unit: str | None = None
-    timestamp: datetime | None = None
-
-
-class ErrorInfo(BaseModel):
-    code: str | None = None
-    message: str
-    severity: Literal["info", "warning", "error", "critical"]
-    timestamp: datetime
-
-
-class EquipmentStatus(BaseModel):
-    protocol_version: str = PROTOCOL_VERSION
-    equipment_id: str
-    equipment_name: str
-    equipment_kind: EquipmentKind
-    equipment_version: str | None = None
-    host: str | None = None
-    equipment_status: EquipmentState
-    message: str | None = None
-    required_actions: list[str] = Field(default_factory=list)
-    device_time: datetime
-    uptime_seconds: float | None = None
-    components: dict[str, ComponentStatus] = Field(default_factory=dict)
-    metrics: dict[str, MetricValue] = Field(default_factory=dict)
-    last_error: ErrorInfo | None = None
-    allowed_actions: list[str] = Field(default_factory=list)
-    details: dict[str, Any] = Field(default_factory=dict)
-
-
-class ProbeResponse(BaseModel):
-    equipment_id: str
-    equipment_name: str
-    protocol_version: str = PROTOCOL_VERSION
-
-
-class HealthResponse(BaseModel):
-    status: Literal["healthy"] = "healthy"
+PROTOCOL_VERSION = "1.2"
 
 
 class GatewayInfo(BaseModel):
@@ -105,3 +38,21 @@ class PrinterSummary(BaseModel):
     name: str
     model: str | None = None
     status_path: str
+
+
+__all__ = [
+    # Re-exported from sdl_lab_contract
+    "ComponentStatus",
+    "EquipmentKind",
+    "EquipmentState",
+    "EquipmentStatus",
+    "ErrorInfo",
+    "ErrorSeverity",
+    "HealthResponse",
+    "MetricValue",
+    "ProbeResponse",
+    # Local
+    "PROTOCOL_VERSION",
+    "GatewayInfo",
+    "PrinterSummary",
+]

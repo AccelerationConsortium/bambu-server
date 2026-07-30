@@ -30,7 +30,7 @@ def test_gateway_and_per_printer_probe(client: TestClient) -> None:
     assert client.get("/printers/bambu_test_01/").json() == {
         "equipment_id": "bambu_test_01",
         "equipment_name": "Bambu Test 01",
-        "protocol_version": "1.0",
+        "protocol_version": "1.2",
     }
 
 
@@ -59,7 +59,7 @@ def test_ready_status_is_cached_and_contains_no_secrets(
     assert response.status_code == 200
     body = response.json()
     assert backend.read_count == initial_reads
-    assert body["protocol_version"] == "1.0"
+    assert body["protocol_version"] == "1.2"
     assert body["equipment_kind"] == "other"
     assert body["equipment_status"] == "ready"
     assert body["allowed_actions"] == []

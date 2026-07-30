@@ -12,7 +12,13 @@ from time import monotonic
 from . import __version__
 from .backend import PrinterBackend, PrinterReading
 from .config import PrinterDefinition
-from .models import ComponentStatus, EquipmentStatus, ErrorInfo, MetricValue
+from .models import (
+    PROTOCOL_VERSION,
+    ComponentStatus,
+    EquipmentStatus,
+    ErrorInfo,
+    MetricValue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -121,12 +127,15 @@ class PrinterMonitor:
             )
 
         return EquipmentStatus(
+            protocol_version=PROTOCOL_VERSION,
             equipment_id=self.definition.id,
             equipment_name=self.definition.name,
             equipment_kind="other",
             equipment_version=__version__,
             host=socket.gethostname(),
             equipment_status=state,
+            activity=("idle" if state == "ready" else "unknown"),
+            activity_since=now if state == "ready" else None,
             message=message,
             device_time=now,
             uptime_seconds=monotonic() - self._started_at,

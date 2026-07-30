@@ -18,6 +18,7 @@ from .config import (
     resolve_credentials,
 )
 from .models import (
+    PROTOCOL_VERSION,
     ComponentStatus,
     EquipmentStatus,
     GatewayInfo,
@@ -64,7 +65,7 @@ def create_app(
         version=__version__,
         description=(
             "Monitoring-only MQTT gateway for Bambu Lab printers. Each configured "
-            "printer is exposed through the AC lab equipment status spec v1.0."
+            "printer is exposed through the AC lab equipment status spec v1.2."
         ),
         lifespan=lifespan,
     )
@@ -155,6 +156,7 @@ def create_app(
         return ProbeResponse(
             equipment_id=monitor.definition.id,
             equipment_name=monitor.definition.name,
+            protocol_version=PROTOCOL_VERSION,
         )
 
     @app.get(
