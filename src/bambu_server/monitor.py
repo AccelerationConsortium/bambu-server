@@ -14,6 +14,7 @@ from .backend import PrinterBackend, PrinterReading
 from .config import PrinterDefinition
 from .models import (
     PROTOCOL_VERSION,
+    Activity,
     ComponentStatus,
     EquipmentStatus,
     ErrorInfo,
@@ -24,6 +25,20 @@ logger = logging.getLogger(__name__)
 
 _READY_STATES = {"IDLE", "FINISH"}
 _BUSY_STATES = {"PREPARE", "RUNNING", "PAUSE"}
+
+# Activity mapping (STATUS_SPEC §2.3). The primary operation of a printer is a
+# print job. These sets map the printer's *observed* gcode state, independently
+# of the health mapping above -- §2.3 forbids deriving `activity` from
+# `equipment_status`, because computing one from the other adds no information.
+#
+# PAUSE counts as running: the job is in flight and the printer cannot take
+# another one. That also keeps the §2.3 invariant `busy => running` true, since
+# `_map_state` reports PAUSE as `busy`. The exact sub-state stays visible in
+# `components["print_job"]` and in `message`.
+_RUNNING_JOB_STATES = {"PREPARE", "RUNNING", "PAUSE"}
+# FAILED is *not* running -- the job stopped -- even though health is `error`.
+# §2.3 allows any activity under `error`, so the honest answer is `idle`.
+_IDLE_JOB_STATES = {"IDLE", "FINISH", "FAILED"}
 
 
 class PrinterMonitor:
@@ -43,6 +58,8 @@ class PrinterMonitor:
         self._reading: PrinterReading | None = None
         self._monitor_error_type: str | None = None
         self._task: asyncio.Task[None] | None = None
+        self._activity: Activity = "unknown"
+        self._activity_since: datetime | None = None
 
     async def start(self) -> None:
         await asyncio.to_thread(self._backend.start)
@@ -71,6 +88,52 @@ class PrinterMonitor:
         except Exception as exc:
             self._monitor_error_type = type(exc).__name__
             logger.exception("Printer monitor failed for %s", self.definition.id)
+        self._track_activity(datetime.now(UTC))
+
+    def _track_activity(self, now: datetime) -> None:
+        """Record the instant ``activity`` last changed value (STATUS_SPEC §2.3).
+
+        Called from the background poll and never from a status request, so the
+        timestamp marks when the change was *observed* rather than when a reader
+        happened to ask.
+        """
+        observed = self._observed_activity(now)
+        if observed == self._activity:
+            return
+
+        previous = self._activity
+        self._activity = observed
+        # Only a transition between two *known* values can be timestamped.
+        # Coming out of `unknown` -- a cold start mid-print, or telemetry that
+        # went stale and recovered -- means the span began before this service
+        # could observe it, so the honest answer is null (§2.3). Stamping the
+        # first-observation instant would report a wrong, far-too-short duration
+        # for the very in-progress operation the field exists to measure.
+        self._activity_since = (
+            now if "unknown" not in (previous, observed) else None
+        )
+
+    def _observed_activity(self, now: datetime) -> Activity:
+        """Derive ``activity`` from observed print state only.
+
+        Returns ``unknown`` whenever the observation itself cannot be trusted
+        (monitor failure, MQTT down, no telemetry yet, stale telemetry) rather
+        than reporting a stale ``idle``/``running`` as current fact.
+        """
+        reading = self._reading
+        if (
+            self._monitor_error_type is not None
+            or reading is None
+            or not reading.connected
+            or not reading.data_ready
+            or self._is_stale(reading, now)
+        ):
+            return "unknown"
+        if reading.gcode_state in _RUNNING_JOB_STATES:
+            return "running"
+        if reading.gcode_state in _IDLE_JOB_STATES:
+            return "idle"
+        return "unknown"
 
     def status(self) -> EquipmentStatus:
         now = datetime.now(UTC)
@@ -103,6 +166,13 @@ class PrinterMonitor:
                 last_event_at=reading.data_updated_at if reading else None,
             )
         }
+        # Evaluated at request time so `activity` cannot contradict the state
+        # computed above (staleness is the one input that moves between polls).
+        # `activity_since` is only reported when the request-time answer matches
+        # the tracked one, so it is never a timestamp for a different value.
+        activity = self._observed_activity(now)
+        activity_since = self._activity_since if activity == self._activity else None
+
         metrics = self._metrics(reading) if reading and reading.data_ready else {}
         details: dict[str, object] = {
             "device_type": "3d_printer",
@@ -134,8 +204,8 @@ class PrinterMonitor:
             equipment_version=__version__,
             host=socket.gethostname(),
             equipment_status=state,
-            activity=("idle" if state == "ready" else "unknown"),
-            activity_since=now if state == "ready" else None,
+            activity=activity,
+            activity_since=activity_since,
             message=message,
             device_time=now,
             uptime_seconds=monotonic() - self._started_at,
