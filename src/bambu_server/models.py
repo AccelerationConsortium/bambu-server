@@ -10,8 +10,8 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import BaseModel
-
 from sdl_lab_contract import (
+    Activity,
     ComponentStatus,
     EquipmentKind,
     EquipmentState,
@@ -42,6 +42,7 @@ class PrinterSummary(BaseModel):
 
 __all__ = [
     # Re-exported from sdl_lab_contract
+    "Activity",
     "ComponentStatus",
     "EquipmentKind",
     "EquipmentState",

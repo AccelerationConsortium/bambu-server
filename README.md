@@ -3,8 +3,10 @@
 A monitoring-only FastAPI gateway for the Bambu Lab printers in the lab. It
 uses [`bambulabs_api`](https://github.com/BambuTools/bambulabs_api) for local
 MQTT telemetry and publishes one
-[AC lab STATUS_SPEC v1.0](../ac-organic-lab/docs/STATUS_SPEC.md) surface per
-printer.
+[AC lab STATUS_SPEC v1.2](../ac-organic-lab/docs/STATUS_SPEC.md) surface per
+printer. This repo conforms to lab status spec v1.2 on its per-printer
+surfaces; the aggregate gateway envelope stays on v1.0 (it fronts printers and
+has no primary operation of its own).
 
 The service deliberately exposes **no control endpoints** in v0.1. The
 third-party package supports commands, but those methods are isolated behind a
@@ -80,6 +82,39 @@ contract does not yet define a `3d_printer` kind. `details.device_type` carries
 `3d_printer` without extending the closed enum locally. A reachable printer
 reporting `FAILED` maps to `error`; missing or stale MQTT telemetry maps to
 `unknown`, never to a fabricated hardware fault.
+
+### Primary operation and `activity` (spec §2.3)
+
+The **primary operation** of a printer is running a print job. `activity` is
+derived from the printer's observed gcode state alone — never from
+`equipment_status`, which answers the independent question of whether the
+printer is healthy:
+
+| observed gcode state | `equipment_status` | `activity` |
+|---|---|---|
+| `IDLE`, `FINISH` | `ready` | `idle` |
+| `PREPARE`, `RUNNING`, `PAUSE` | `busy` | `running` |
+| `FAILED` | `error` | `idle` |
+| anything else | `unknown` | `unknown` |
+| MQTT down / no telemetry / stale | `unknown` | `unknown` |
+
+`PAUSE` counts as `running`: the job is in flight and the printer cannot accept
+another one, which also satisfies the spec's `busy` ⇒ `running` invariant. The
+exact sub-state stays visible in `components["print_job"]` and `message`.
+`FAILED` is `idle` because the job has stopped — §2.3 permits any activity
+under `error`.
+
+`activity_since` is the instant the value last changed, observed by the
+background poll (every `poll_interval_seconds`), not the time the status request
+was built. It is `null` whenever the transition itself was never observed — a
+service restart mid-print, or telemetry that went stale and recovered — because
+the span began before this service could see it and stamping first-observation
+time would report a far-too-short duration. Expect `activity: running` with
+`activity_since: null` for a job that was already underway when the service
+started; it gets a timestamp at the next real transition.
+
+Print jobs run far longer than the dashboard's 60 s poll, so the sampling caveat
+in §2.3.1 does not apply and no `cycles_total` metric is published.
 
 ## Dashboard registration
 

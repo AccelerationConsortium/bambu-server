@@ -1,0 +1,43 @@
+[Unit]
+Description=AC Bambu printer monitoring gateway
+Documentation=https://github.com/AccelerationConsortium/bambu-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sdl2
+Group=sdl2
+WorkingDirectory=/home/sdl2/caoyang/bambu-server
+EnvironmentFile=/home/sdl2/caoyang/bambu-server/.env
+ExecStart=/home/sdl2/caoyang/bambu-server/.venv/bin/uvicorn bambu_server.main:application_factory \
+    --factory \
+    --host 127.0.0.1 \
+    --port 8012 \
+    --no-server-header \
+    --log-level info
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+NoNewPrivileges=true
+ProtectSystem=strict
+# ProtectHome=true is intentionally omitted: the venv and source live
+# under /home/sdl2. ReadWritePaths covers only what the service writes.
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=65536
+ReadWritePaths=/home/sdl2/caoyang/bambu-server
+
+SyslogIdentifier=bambu-server
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

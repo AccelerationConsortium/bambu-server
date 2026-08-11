@@ -86,6 +86,55 @@ def test_running_print_is_busy(settings: Settings) -> None:
     with TestClient(app) as test_client:
         body = test_client.get("/printers/bambu_test_01/status").json()
     assert body["equipment_status"] == "busy"
+    assert body["activity"] == "running"
+    # Cold start mid-print: the transition was never observed, so it cannot be
+    # timestamped. See tests/test_monitor.py for the observed-transition case.
+    assert body["activity_since"] is None
+
+
+def test_activity_comes_from_print_state_not_equipment_status(
+    settings: Settings,
+) -> None:
+    """STATUS_SPEC §2.3: activity is observed, and the invariants hold."""
+    cases = [
+        ("IDLE", "ready", "idle"),
+        ("FINISH", "ready", "idle"),
+        ("PREPARE", "busy", "running"),
+        ("RUNNING", "busy", "running"),
+        # A paused job is still in flight: `busy` requires `running`.
+        ("PAUSE", "busy", "running"),
+        # The job stopped, so nothing is running even though health is `error`.
+        ("FAILED", "error", "idle"),
+        ("SOMETHING_NEW", "unknown", "unknown"),
+    ]
+    for gcode_state, expected_status, expected_activity in cases:
+        backend = FakeBackend(
+            PrinterReading(
+                data_updated_at=datetime.now(UTC),
+                connected=True,
+                data_ready=True,
+                gcode_state=gcode_state,
+                activity=gcode_state,
+            )
+        )
+        app = create_app(
+            settings=settings,
+            backend_factory=lambda _definition, _creds, value=backend: value,
+        )
+        with TestClient(app) as test_client:
+            body = test_client.get("/printers/bambu_test_01/status").json()
+        assert body["equipment_status"] == expected_status, gcode_state
+        assert body["activity"] == expected_activity, gcode_state
+
+
+def test_activity_since_does_not_advance_per_request(client: TestClient) -> None:
+    """`activity_since` must not be rebuilt from the request clock (§2.3)."""
+    first = client.get("/printers/bambu_test_01/status").json()
+    second = client.get("/printers/bambu_test_01/status").json()
+
+    assert first["activity"] == second["activity"] == "idle"
+    assert first["activity_since"] == second["activity_since"]
+    assert first["device_time"] != second["device_time"]
 
 
 def test_unreachable_and_stale_are_unknown(settings: Settings) -> None:
@@ -113,6 +162,9 @@ def test_unreachable_and_stale_are_unknown(settings: Settings) -> None:
             body = test_client.get("/printers/bambu_test_01/status").json()
         assert body["equipment_status"] == "unknown"
         assert body["message"] == expected_message
+        # Untrustworthy telemetry must not be reported as a stale idle/running.
+        assert body["activity"] == "unknown"
+        assert body["activity_since"] is None
 
 
 def test_failed_print_is_error(settings: Settings) -> None:
