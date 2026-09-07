@@ -80,6 +80,17 @@ class ApprovalRequest(BaseModel):
     approved_by: str = Field(min_length=1, max_length=120)
 
 
+class CancellationRequest(BaseModel):
+    """Withdrawal of a waiting submission.
+
+    ``cancelled_by`` is opaque, on the same terms as ``approved_by``. ``reason``
+    is free text kept in the job's history so a withdrawal is explicable later.
+    """
+
+    cancelled_by: str = Field(min_length=1, max_length=120)
+    reason: str | None = Field(default=None, max_length=500)
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -390,6 +401,37 @@ def create_app(
             return await store.approve(job, approved_by=approval.approved_by)
         except InvalidTransition as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post(
+        "/submissions/{submission_id}/cancel",
+        response_model=SubmissionJob,
+        tags=["submissions"],
+    )
+    async def cancel_submission(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+        cancellation: CancellationRequest,
+    ) -> SubmissionJob:
+        """Withdraw a waiting submission from its machine's queue.
+
+        A queue operation, not an abort: it reaches no printer and is refused
+        for anything past the queue. Deletes the stored artifact and keeps the
+        job record, so the withdrawal stays auditable.
+        """
+
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        try:
+            return await store.cancel(
+                job,
+                cancelled_by=cancellation.cancelled_by,
+                reason=cancellation.reason,
+            )
+        except InvalidTransition as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except SubmissionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
 

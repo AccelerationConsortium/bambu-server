@@ -300,3 +300,80 @@ async def test_a_blank_material_is_treated_as_absent(store: SubmissionStore) -> 
         original_filename="part.gcode",
     )
     assert job.material is None
+
+
+async def test_cancelling_a_queued_job_removes_it_and_its_artifact(
+    store: SubmissionStore, profile: MachineProfile
+) -> None:
+    job = await run_validation(store, await _accept(store), profile)
+    path = store.artifact_path(job)
+    assert path.exists()
+
+    cancelled = await store.cancel(job, cancelled_by="operator", reason="wrong plate")
+
+    assert cancelled.state == "cancelled"
+    assert cancelled.artifact_removed is True
+    assert not path.exists()
+    assert store.queue_for("bambu_test_01") == []
+    # The record outlives the file, so the withdrawal stays explicable.
+    assert cancelled.history[-1].note == "cancelled by operator: wrong plate"
+    assert store.get(job.submission_id) is not None
+
+
+async def test_cancelling_an_approved_job_retracts_dispatch_ready(
+    store: SubmissionStore, profile: MachineProfile
+) -> None:
+    job = await run_validation(store, await _accept(store), profile)
+    approved = await store.approve(job, approved_by="operator")
+    assert approved.verdict.dispatch_ready is True
+
+    cancelled = await store.cancel(approved, cancelled_by="operator")
+
+    assert cancelled.state == "cancelled"
+    # A withdrawn job must not still read as cleared to run.
+    assert cancelled.verdict.dispatch_ready is False
+
+
+async def test_cancellation_is_terminal_and_not_repeatable(
+    store: SubmissionStore, profile: MachineProfile
+) -> None:
+    job = await run_validation(store, await _accept(store), profile)
+    cancelled = await store.cancel(job, cancelled_by="operator")
+
+    for attempt in (
+        store.cancel(cancelled, cancelled_by="operator"),
+        store.approve(cancelled, approved_by="operator"),
+    ):
+        with pytest.raises(InvalidTransition):
+            await attempt
+
+
+async def test_a_rejected_job_cannot_be_cancelled(
+    store: SubmissionStore, profile: MachineProfile
+) -> None:
+    """Rejection is already terminal; cancelling it would muddy the record."""
+    body = SAMPLE_GCODE.replace("; nozzle_diameter = 0.4", "; nozzle_diameter = 0.6")
+    job = await run_validation(store, await _accept(store, body.encode()), profile)
+
+    with pytest.raises(InvalidTransition, match="only a waiting submission"):
+        await store.cancel(job, cancelled_by="operator")
+
+
+async def test_cancel_refuses_a_blank_actor(
+    store: SubmissionStore, profile: MachineProfile
+) -> None:
+    job = await run_validation(store, await _accept(store), profile)
+
+    with pytest.raises(SubmissionError, match="cancelled_by"):
+        await store.cancel(job, cancelled_by="  ")
+
+    assert store.get(job.submission_id).state == "queued"
+
+
+def test_cancellation_can_never_reach_a_dispatched_job() -> None:
+    """Cancel is a queue operation; stopping a print is the control plane's job."""
+    from bambu_server.submissions import ALLOWED_TRANSITIONS, CANCELLABLE_STATES
+
+    assert CANCELLABLE_STATES == {"queued", "approved"}
+    for state in ("dispatching", "running", "finished", "failed", "rejected"):
+        assert "cancelled" not in ALLOWED_TRANSITIONS[state]

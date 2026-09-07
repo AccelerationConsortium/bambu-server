@@ -294,3 +294,75 @@ def test_reads_never_cause_printer_io(client: TestClient, backend: FakeBackend) 
     client.get("/submissions")
 
     assert backend.read_count == before
+
+
+def test_cancelling_removes_a_job_from_the_queue(client: TestClient) -> None:
+    created = _upload(client).json()
+    assert len(client.get("/printers/bambu_test_01/queue").json()["queued"]) == 1
+
+    response = client.post(
+        f"/submissions/{created['submission_id']}/cancel",
+        json={"cancelled_by": "lab-operator", "reason": "superseded"},
+    )
+
+    assert response.status_code == 200
+    job = response.json()
+    assert job["state"] == "cancelled"
+    assert job["artifact_removed"] is True
+    assert job["history"][-1]["note"] == "cancelled by lab-operator: superseded"
+    assert client.get("/printers/bambu_test_01/queue").json()["queued"] == []
+    # The record survives so the withdrawal stays auditable.
+    assert client.get(f"/submissions/{created['submission_id']}").status_code == 200
+
+
+def test_cancelling_an_approved_job_is_allowed(client: TestClient) -> None:
+    created = _upload(client).json()
+    client.post(
+        f"/submissions/{created['submission_id']}/approve",
+        json={"approved_by": "lab-operator"},
+    )
+
+    response = client.post(
+        f"/submissions/{created['submission_id']}/cancel",
+        json={"cancelled_by": "lab-operator"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["verdict"]["dispatch_ready"] is False
+
+
+def test_cancelling_twice_is_a_conflict(client: TestClient) -> None:
+    created = _upload(client).json()
+    path = f"/submissions/{created['submission_id']}/cancel"
+    client.post(path, json={"cancelled_by": "lab-operator"})
+
+    assert client.post(path, json={"cancelled_by": "lab-operator"}).status_code == 409
+
+
+def test_cancelling_a_rejected_submission_is_a_conflict(client: TestClient) -> None:
+    body = SAMPLE_GCODE.replace("; nozzle_diameter = 0.4", "; nozzle_diameter = 0.6")
+    created = _upload(client, body=body.encode()).json()
+
+    response = client.post(
+        f"/submissions/{created['submission_id']}/cancel",
+        json={"cancelled_by": "lab-operator"},
+    )
+    assert response.status_code == 409
+
+
+def test_cancelling_an_unknown_submission_is_404(client: TestClient) -> None:
+    response = client.post(
+        "/submissions/" + "0" * 32 + "/cancel", json={"cancelled_by": "lab-operator"}
+    )
+    assert response.status_code == 404
+
+
+def test_a_cancelled_job_can_be_filtered_for(client: TestClient) -> None:
+    created = _upload(client).json()
+    client.post(
+        f"/submissions/{created['submission_id']}/cancel",
+        json={"cancelled_by": "lab-operator"},
+    )
+
+    assert len(client.get("/submissions", params={"state": "cancelled"}).json()) == 1
+    assert client.get("/submissions", params={"state": "queued"}).json() == []
