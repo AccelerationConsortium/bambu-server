@@ -38,6 +38,11 @@ bambu-server = "bambu_server.__main__:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The submission page ships with the package so a non-editable install serves
+# /ui too, not just a checkout-based deploy.
+[tool.setuptools.package-data]
+bambu_server = ["static/*.html"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

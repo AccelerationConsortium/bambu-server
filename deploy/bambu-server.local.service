@@ -10,9 +10,21 @@ User=sdl2
 Group=sdl2
 WorkingDirectory=/home/sdl2/caoyang/bambu-server
 EnvironmentFile=/home/sdl2/caoyang/bambu-server/.env
+# Bound to every interface, not loopback, for two readers that cannot share one
+# address: the dashboard aggregator polls this service on 127.0.0.1:8012 (see
+# ac-organic-lab/equipment.yaml), while a person opening /ui reaches it over the
+# tailnet at 100.64.254.6:8012 -- loopback means the visitor's own machine in a
+# browser, so a loopback-only bind serves the aggregator and nobody else.
+#
+# This matches the fleet's documented posture (DEVICE_PC_SETUP: device services
+# bind 0.0.0.0 and access is gated by Tailscale ACLs, not by a local firewall).
+# Note what it widens: port 8012 is now reachable on every interface this host
+# has, and POST /submissions has no application-level auth. A tighter shape, if
+# the exposure ever matters, is to keep loopback and front /ui through the Caddy
+# edge like the camera gateway -- which would also put it behind ac_auth.
 ExecStart=/home/sdl2/caoyang/bambu-server/.venv/bin/uvicorn bambu_server.main:application_factory \
     --factory \
-    --host 127.0.0.1 \
+    --host 0.0.0.0 \
     --port 8012 \
     --no-server-header \
     --log-level info

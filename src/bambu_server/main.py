@@ -18,11 +18,13 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path as PathLib
 from pathlib import PurePosixPath
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -61,6 +63,11 @@ BackendFactory = Callable[[PrinterDefinition, PrinterCredentials], PrinterBacken
 
 #: Read size for streaming an upload to disk.
 _UPLOAD_CHUNK_BYTES = 1 << 20
+
+#: The submission page. One self-contained file with no build step and no
+#: external resources, served from the same origin as the API it calls, so a
+#: browser needs neither a bundler nor a CORS exemption to use it.
+_UI_PAGE = PathLib(__file__).parent / "static" / "index.html"
 
 #: Leading bytes an artifact must start with, keyed by kind. A ``.3mf`` is a
 #: zip container; anything else under that name is a malformed submission and
@@ -168,6 +175,17 @@ def create_app(
             version=__version__,
             printer_count=len(monitors),
         )
+
+    @app.get("/ui", response_class=HTMLResponse, include_in_schema=False, tags=["gateway"])
+    async def submission_ui() -> HTMLResponse:
+        """The operator/submitter page.
+
+        Deliberately a single static file: it calls the same public endpoints
+        any other client would, holds no state of its own, and cannot do
+        anything the API would refuse.
+        """
+
+        return HTMLResponse(_UI_PAGE.read_text(encoding="utf-8"))
 
     @app.get("/health", response_model=HealthResponse, tags=["gateway"])
     async def gateway_health() -> HealthResponse:

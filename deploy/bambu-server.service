@@ -10,6 +10,9 @@ User=ac
 Group=ac
 WorkingDirectory=/opt/bambu-server
 EnvironmentFile=/opt/bambu-server/.env
+# Loopback by default: the conservative choice for a fresh host. Change --host
+# to 0.0.0.0 if people need to reach /ui over the tailnet -- see the note in
+# bambu-server.local.service for what that widens.
 ExecStart=/opt/bambu-server/.venv/bin/uvicorn bambu_server.main:application_factory \
     --factory \
     --host 127.0.0.1 \
