@@ -82,6 +82,7 @@ Gateway routes:
 | GET | `/health` | Process liveness |
 | GET | `/printers` | Safe printer inventory (no addresses or credentials) |
 | GET | `/status` | Aggregate gateway envelope (one component per printer) |
+| GET | `/ui` | Submission page for people (see below) |
 
 Per-printer STATUS_SPEC routes:
 
@@ -246,7 +247,27 @@ dispatches, so a running print was started by some other route to the printer
 (Bambu Studio, the handset, the cloud) and the gateway reports only what it
 observes.
 
+### The page
+
+`GET /ui` serves a submission page: pick a machine (its plate size, nozzle,
+chamber and limits are shown so you know what you are targeting), upload a
+file, and read the per-check verdict. It also lists that machine's queue with
+finish times, and offers Approve / Cancel.
+
+It is one static file with **no build step and no external resources** — no
+CDN, no npm, no bundler — served from the same origin as the API it calls, so
+it needs no CORS exemption and works on an isolated lab network. It holds no
+state of its own and calls only the public endpoints below, so it can do
+nothing the API would refuse. It offers Approve only on a `queued` job, which
+is the same rule the server enforces: never advertise an action that would be
+refused.
+
+The page has no sign-in. The name you type is a label, not an identity — see
+*Identity and approval* below.
+
 ### Submitting
+
+The page is the easy path. Directly:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8012/submissions \

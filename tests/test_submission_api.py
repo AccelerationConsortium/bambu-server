@@ -366,3 +366,37 @@ def test_a_cancelled_job_can_be_filtered_for(client: TestClient) -> None:
 
     assert len(client.get("/submissions", params={"state": "cancelled"}).json()) == 1
     assert client.get("/submissions", params={"state": "queued"}).json() == []
+
+
+def test_the_ui_page_is_served(client: TestClient) -> None:
+    response = client.get("/ui")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "<title>Submit a print" in response.text
+
+
+def test_the_ui_page_loads_nothing_from_off_host(client: TestClient) -> None:
+    """No CDN, no build step: the page must work on an isolated lab network."""
+    body = client.get("/ui").text
+
+    assert "//cdn" not in body
+    for marker in ('src="http', "src='http", 'href="http', "href='http", "@import"):
+        assert marker not in body, marker
+
+
+def test_the_ui_page_only_calls_public_endpoints(client: TestClient) -> None:
+    body = client.get("/ui").text
+    paths = client.get("/openapi.json").json()["paths"]
+
+    # The approve/cancel URLs are built by concatenation, so match the verbs.
+    for called in ("/printers", "/submissions", "/queue", "/profile", '"approve"', '"cancel"'):
+        assert called in body, called
+    # It must not reach for anything that would actuate a printer.
+    assert "/control/" not in body
+    assert not any("/control/" in path for path in paths)
+
+
+def test_the_ui_page_is_not_in_the_api_schema(client: TestClient) -> None:
+    """It is a page, not part of the contract a machine client reads."""
+    assert "/ui" not in client.get("/openapi.json").json()["paths"]

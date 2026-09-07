@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Submit a print — AC Bambu Gateway</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f4; --panel: #fff; --ink: #1a1a18; --muted: #6b6b63;
+    --line: #dcdcd6; --accent: #2f6f4f; --warn: #8a5a00; --bad: #9b2c2c;
+    --chip: #eeeee9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a; --panel: #1f2124; --ink: #e9e9e6; --muted: #9a9a94;
+      --line: #33363a; --accent: #7fc0a0; --warn: #d9a54a; --bad: #e88b8b;
+      --chip: #2a2d31;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 64px; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 12px; letter-spacing: .02em; text-transform: uppercase; color: var(--muted); }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 18px; }
+  .banner { border-left: 3px solid var(--warn); background: var(--chip); padding: 10px 14px; border-radius: 6px; color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  select, input[type=text], input[type=file] {
+    width: 100%; padding: 8px 10px; font: inherit; color: var(--ink);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  }
+  .row { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; margin-bottom: 14px; }
+  @media (max-width: 620px) { .row { grid-template-columns: 1fr; } }
+  button {
+    font: inherit; padding: 8px 16px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--chip); color: var(--ink);
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.small { padding: 4px 10px; font-size: 13px; }
+  .specs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .chip { background: var(--chip); border-radius: 20px; padding: 3px 10px; font-size: 12px; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); font-weight: 500; }
+  td.mark { width: 1.6em; font-weight: 700; }
+  .pass { color: var(--accent); } .fail { color: var(--bad); } .na { color: var(--muted); }
+  .detail { color: var(--muted); }
+  .verdict-head { font-weight: 600; margin-bottom: 10px; }
+  .empty { color: var(--muted); font-size: 14px; }
+  code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  .err { color: var(--bad); font-size: 14px; }
+  .actions { display: flex; gap: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Submit a print</h1>
+  <p class="sub">Upload a sliced <code>.3mf</code> or <code>.gcode</code>. It is checked against the machine you pick before it joins that machine's queue.</p>
+
+  <div class="banner" id="banner">
+    No sign-in: the name you enter is a label, not an identity, and anyone who can reach this page can submit.
+    Submitting queues a job — <strong>nothing is sent to a printer</strong>. Dispatch is not implemented.
+  </div>
+
+  <section class="panel">
+    <h2>Machine</h2>
+    <div class="row">
+      <div>
+        <label for="machine">Target</label>
+        <select id="machine"></select>
+      </div>
+      <div>
+        <label for="requested_by">Your name</label>
+        <input type="text" id="requested_by" placeholder="e.g. alice" autocomplete="name">
+      </div>
+    </div>
+    <div class="specs" id="specs"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Artifact</h2>
+    <div class="row">
+      <div>
+        <label for="file">File (.3mf or .gcode)</label>
+        <input type="file" id="file" accept=".3mf,.gcode">
+      </div>
+      <div>
+        <label for="material">Material (optional — read from the file if blank)</label>
+        <input type="text" id="material" placeholder="e.g. PLA">
+      </div>
+    </div>
+    <button class="primary" id="submit">Submit</button>
+    <span id="submit-msg" class="detail"></span>
+  </section>
+
+  <section class="panel" id="verdict-panel" hidden>
+    <h2>Result</h2>
+    <div class="verdict-head" id="verdict-head"></div>
+    <table><tbody id="verdict-rows"></tbody></table>
+  </section>
+
+  <section class="panel">
+    <h2>Queue</h2>
+    <div id="queue"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// Every value that reaches the DOM goes through textContent. Filenames and
+// submitter names are user-supplied and are never interpolated as markup.
+const $ = (id) => document.getElementById(id);
+const el = (tag, text, cls) => {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (cls) node.className = cls;
+  return node;
+};
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  let body = null;
+  try { body = await response.json(); } catch (_) { /* no body */ }
+  if (!response.ok) {
+    const detail = body && body.detail ? body.detail : response.status + " " + response.statusText;
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return body;
+}
+
+const state = { machine: null, profile: null };
+
+function renderSpecs(profile) {
+  const specs = $("specs");
+  specs.replaceChildren();
+  if (!profile) return;
+  const chips = [];
+  if (profile.bed_size_mm) chips.push(profile.bed_size_mm[0] + " × " + profile.bed_size_mm[1] + " mm plate");
+  else chips.push("plate size not declared — fit is not checked");
+  if (profile.nozzle_diameter_mm) {
+    chips.push(profile.nozzle_diameter_mm + " mm nozzle" +
+      (profile.nozzle_type ? " · " + profile.nozzle_type : "") +
+      " (" + profile.nozzle_diameter_source + ")");
+  }
+  if (profile.enclosure) chips.push(profile.enclosure);
+  chips.push(profile.chamber_temperature_c === null ? "no chamber control" : "heated chamber");
+  const limits = profile.limits || {};
+  if (limits.nozzle_temperature_c) chips.push("nozzle ≤ " + limits.nozzle_temperature_c.max_c + " °C");
+  if (limits.bed_temperature_c) chips.push("bed ≤ " + limits.bed_temperature_c.max_c + " °C");
+  const forbidden = (profile.ams && profile.ams.filament_forbidden) || [];
+  if (forbidden.length) chips.push("not runnable: " + forbidden.join(", "));
+  const trays = (profile.observed && profile.observed.loaded_trays) || [];
+  chips.push(trays.length ? trays.length + " AMS tray(s) loaded" : "no AMS inventory reported");
+  for (const text of chips) specs.append(el("span", text, "chip"));
+  for (const warning of profile.warnings || []) specs.append(el("span", "⚠ " + warning, "chip"));
+}
+
+const MARKS = { pass: ["✓", "pass"], fail: ["✗", "fail"], not_applicable: ["–", "na"] };
+
+function renderVerdict(job) {
+  $("verdict-panel").hidden = false;
+  const verdict = job.verdict || { verdict: "?", checks: [] };
+  const head = $("verdict-head");
+  head.replaceChildren();
+  const label = verdict.verdict === "pass" ? "Passed" : "Rejected";
+  head.append(el("span", label + " · " + job.state, verdict.verdict === "pass" ? "pass" : "fail"));
+  if (job.estimated_duration_minutes) {
+    head.append(el("span", " · about " + Math.round(job.estimated_duration_minutes) + " min", "detail"));
+  }
+  head.append(el("span", " · " + job.original_filename, "detail"));
+
+  const rows = $("verdict-rows");
+  rows.replaceChildren();
+  for (const check of verdict.checks || []) {
+    const [glyph, cls] = MARKS[check.status] || ["?", "na"];
+    const tr = document.createElement("tr");
+    tr.append(el("td", glyph, "mark " + cls));
+    tr.append(el("td", check.check));
+    tr.append(el("td", check.detail, "detail"));
+    rows.append(tr);
+  }
+  // A check that could not run is shown as "–", never as a tick: the machine
+  // profile or the printer did not supply what it needed.
+}
+
+function clock(iso) {
+  if (!iso) return "—";
+  const when = new Date(iso);
+  return isNaN(when) ? "—" : when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+async function act(id, path, field) {
+  const who = $("requested_by").value.trim() || window.prompt("Your name, for the record:");
+  if (!who) return;
+  const body = {};
+  body[field] = who;
+  if (field === "cancelled_by") {
+    const reason = window.prompt("Reason (optional):");
+    if (reason) body.reason = reason;
+  }
+  try {
+    await api("/submissions/" + id + "/" + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    window.alert(error.message);
+  }
+  refreshQueue();
+}
+
+async function refreshQueue() {
+  const box = $("queue");
+  if (!state.machine) { box.replaceChildren(el("p", "No machine selected.", "empty")); return; }
+  let view;
+  try {
+    view = await api("/printers/" + state.machine + "/queue");
+  } catch (error) {
+    box.replaceChildren(el("p", "Could not read the queue: " + error.message, "err"));
+    return;
+  }
+  box.replaceChildren();
+
+  if (view.running) {
+    const running = view.running;
+    const parts = ["Printing now: " + (running.job_name || "unnamed job")];
+    if (running.progress_percent !== null) parts.push(Math.round(running.progress_percent) + "%");
+    if (running.remaining_time_minutes !== null) {
+      parts.push(Math.round(running.remaining_time_minutes) + " min left, ends " + clock(running.expected_end));
+    } else {
+      parts.push("remaining time unknown");
+    }
+    box.append(el("p", parts.join(" · "), "detail"));
+    box.append(el("p", "Started outside this service — the gateway only observes it.", "empty"));
+  } else {
+    box.append(el("p", "Idle: " + view.activity, "detail"));
+  }
+
+  if (!view.queued.length) {
+    box.append(el("p", "Nothing waiting.", "empty"));
+    return;
+  }
+
+  const table = document.createElement("table");
+  const head = document.createElement("tr");
+  for (const column of ["#", "Job", "Submitted by", "Duration", "Expected end", ""]) {
+    head.append(el("th", column));
+  }
+  table.append(head);
+
+  for (const job of view.queued) {
+    const tr = document.createElement("tr");
+    tr.append(el("td", job.position));
+    tr.append(el("td", job.job_name));
+    tr.append(el("td", job.requested_by));
+    tr.append(el("td", job.estimated_duration_minutes ? Math.round(job.estimated_duration_minutes) + " min" : "unknown"));
+    tr.append(el("td", job.expected_end ? clock(job.expected_end) : "unknown"));
+
+    const cell = document.createElement("td");
+    const actions = el("div", null, "actions");
+    // Only offer what the server would accept: approval applies to a queued
+    // job, cancellation to a waiting one. Never advertise a refusal.
+    if (job.state === "queued") {
+      const approve = el("button", "Approve", "small");
+      approve.onclick = () => act(job.submission_id, "approve", "approved_by");
+      actions.append(approve);
+    }
+    const cancel = el("button", "Cancel", "small");
+    cancel.onclick = () => act(job.submission_id, "cancel", "cancelled_by");
+    actions.append(cancel);
+    if (job.approved) actions.append(el("span", "approved", "chip"));
+    cell.append(actions);
+    tr.append(cell);
+    table.append(tr);
+  }
+  box.append(table);
+  if (!view.estimates_complete) {
+    box.append(el("p", "Some finish times are unknown, so everything after them is unknown too.", "empty"));
+  }
+}
+
+async function selectMachine(id) {
+  state.machine = id;
+  try {
+    state.profile = await api("/printers/" + id + "/profile");
+  } catch (_) {
+    state.profile = null;
+  }
+  renderSpecs(state.profile);
+  refreshQueue();
+}
+
+async function submit() {
+  const button = $("submit");
+  const message = $("submit-msg");
+  const file = $("file").files[0];
+  const who = $("requested_by").value.trim();
+  message.className = "detail";
+  if (!file) { message.textContent = "Choose a file first."; return; }
+  if (!who) { message.textContent = "Enter your name first."; return; }
+
+  const form = new FormData();
+  form.append("file", file);
+  form.append("target_machine", state.machine);
+  form.append("requested_by", who);
+  const material = $("material").value.trim();
+  if (material) form.append("material", material);
+
+  button.disabled = true;
+  message.textContent = "Checking the model…";
+  try {
+    const job = await api("/submissions", { method: "POST", body: form });
+    message.textContent = "";
+    renderVerdict(job);
+    $("file").value = "";
+    refreshQueue();
+  } catch (error) {
+    message.className = "err";
+    message.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+(async function start() {
+  try {
+    const printers = await api("/printers");
+    const picker = $("machine");
+    for (const printer of printers) {
+      const option = el("option", printer.name + (printer.model ? " · " + printer.model : ""));
+      option.value = printer.id;
+      picker.append(option);
+    }
+    picker.onchange = () => selectMachine(picker.value);
+    if (printers.length) await selectMachine(printers[0].id);
+  } catch (error) {
+    $("banner").append(el("div", "Could not load printers: " + error.message, "err"));
+  }
+  $("submit").onclick = submit;
+  setInterval(refreshQueue, 10000);
+})();
+</script>
+</body>
+</html>

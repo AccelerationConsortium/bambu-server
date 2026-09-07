@@ -86,10 +86,28 @@ Open, from the design's §10 data gaps and what the build surfaced:
   stay on disk and in `GET /submissions` indefinitely. Fine at current volume,
   but it needs a sweep before this runs unattended for long.
 
+## Submission page
+
+`GET /ui` — one static file (`src/bambu_server/static/index.html`), no build
+step, no external resources, served from the same origin as the API. Added
+because the pipeline shipped with no human-facing surface at all: the design
+assumed the lab dashboard would render these endpoints, so a UI was never in
+its scope, which left `curl` and Swagger as the only way in.
+
+Deliberate limits: it holds no state, calls only public endpoints, and offers
+Approve only on a `queued` job so it can never advertise a refusal. It has no
+sign-in, matching the rest of the service.
+
+Not visually verified — there is no browser on this host, so only the HTML
+structure and the script's syntax were checked. Worth a look in a real browser
+before pointing users at it. The durable home is probably the lab dashboard
+(`ac-organic-lab/web`) once `ac_auth` makes `requested_by` a real identity;
+this page is the interim surface.
+
 ## Test suite
 
 - `uv run ruff check .` passes.
-- `uv run pytest -q` passes all 126 tests, including the FastAPI API tests and
+- `uv run pytest -q` passes all 130 tests, including the FastAPI API tests and
   the submission pipeline (artifact inspection, validation, store/state machine,
   queue ETA, HTTP surface). Tests build their own `.3mf` and `.gcode` fixtures
   and use fake backends; nothing touches hardware.
