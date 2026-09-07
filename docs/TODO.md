@@ -125,6 +125,17 @@ label. What shipped:
 - `ac-organic-lab`: the `/bambu/*` route in `deploy/Caddyfile.single-edge`, and
   Utils → 3D Printers frames `/bambu/ui/`.
 
+**Found while preparing the deploy (2026-09-07):**
+`/etc/caddy/Caddyfile` has **diverged** from
+`ac-organic-lab/deploy/Caddyfile.single-edge`. Production factored its routes
+into a shared `(edge_routes)` snippet imported by two site blocks — an `http://`
+address and an `https://` MagicDNS one, added when TLS was turned on — while the
+repo copy still has the older single-`http://` layout. Copying the repo file
+over the deployed one would silently drop the HTTPS site. `docs/EDGE_DEPLOY.md`
+now applies the `/bambu/*` block *into* the deployed file instead. Reconciling
+the repo copy with production is a separate task and belongs to whoever added
+the HTTPS block, since only they know what else changed.
+
 **Not deployed.** Three root steps, none of which I can do:
 
 1. Install the updated `deploy/Caddyfile.single-edge` into `/etc/caddy` and

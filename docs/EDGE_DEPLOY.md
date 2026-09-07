@@ -55,19 +55,52 @@ sudo grep -c '^BAMBU_EDGE_SHARED_SECRET=' /etc/caddy/edge-secrets.env   # expect
 
 ## 2. Install the edge route
 
-The `/bambu/*` block lives in `ac-organic-lab/deploy/Caddyfile.single-edge`.
-Validate before installing — a bad config takes the whole dashboard down:
+> **Do not `cp` the repo Caddyfile over the deployed one.** As of 2026-09-07
+> `/etc/caddy/Caddyfile` has diverged from
+> `ac-organic-lab/deploy/Caddyfile.single-edge`: production factored its routes
+> into a shared `(edge_routes)` snippet imported by **two** site blocks (an
+> `http://` address and an `https://` MagicDNS one, added when TLS was turned
+> on), while the repo copy still has the older single-`http://` layout. Copying
+> the repo file over it would silently drop the HTTPS site. Reconciling the two
+> is its own task — see `docs/TODO.md`.
+
+So apply the block *into* the deployed file instead. It is the section between
+the `# ---- Bambu printer gateway submission page` banner and the next `# ----`
+banner in the repo copy, and it belongs inside `(edge_routes)`, immediately
+before the `# ---- AnaliticaDB results catalog` banner.
+
+Build the merged file, diff it, then install:
 
 ```bash
 cd /home/sdl2/caoyang/ac-organic-lab
-caddy validate --config deploy/Caddyfile.single-edge --adapter caddyfile
-sudo cp deploy/Caddyfile.single-edge /etc/caddy/Caddyfile
+python3 - <<'EOF'
+import pathlib
+repo = pathlib.Path("deploy/Caddyfile.single-edge").read_text().split("\n")
+live = pathlib.Path("/etc/caddy/Caddyfile").read_text().split("\n")
+start = next(i for i, l in enumerate(repo) if "Bambu printer gateway submission page" in l)
+end   = next(i for i, l in enumerate(repo) if "AnaliticaDB results catalog" in l and i > start)
+assert not any("bambu" in l.lower() for l in live), "already installed"
+anchor = next(i for i, l in enumerate(live) if "AnaliticaDB results catalog" in l)
+pathlib.Path("/tmp/Caddyfile.new").write_text("\n".join(live[:anchor] + repo[start:end] + live[anchor:]))
+print("wrote /tmp/Caddyfile.new")
+EOF
+
+# Purely additive? Expect only additions, none removed.
+diff /etc/caddy/Caddyfile /tmp/Caddyfile.new | grep -c '^<'   # expect 0
+
+# Syntax check. `caddy validate` also provisions, which needs to read the TLS
+# certs — run it under sudo, or use `adapt` (parse only) as this user.
+sudo caddy validate --config /tmp/Caddyfile.new --adapter caddyfile
+
+sudo cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak-$(date +%F)   # keep a way back
+sudo cp /tmp/Caddyfile.new /etc/caddy/Caddyfile
 sudo systemctl reload caddy          # reload, not restart: no dropped connections
 systemctl is-active caddy
 ```
 
 If the reload fails, Caddy keeps running the old config — fix and retry rather
-than restarting.
+than restarting. If it succeeded but something is wrong, the backup above is the
+way back.
 
 ## 3. Restart the gateway so it reads the secret
 
