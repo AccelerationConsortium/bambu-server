@@ -144,6 +144,22 @@ class PrinterCredentials(BaseModel):
     serial: SecretStr
 
 
+#: Env var holding the secret the lab's Caddy edge presents on every proxied
+#: request. Set the *same* value here and in the edge's EnvironmentFile.
+EDGE_SECRET_ENV = "BAMBU_EDGE_SHARED_SECRET"
+
+
+def resolve_edge_secret() -> str | None:
+    """The shared secret that lets this service trust an injected identity.
+
+    Read from the environment, never from the YAML: it is a credential, and
+    `printers.local.yaml` is a config file people paste into issues. Absent
+    means no identity is ever trusted (see :mod:`bambu_server.identity`).
+    """
+
+    return (os.getenv(EDGE_SECRET_ENV) or "").strip() or None
+
+
 def resolve_credentials(printer: PrinterDefinition) -> PrinterCredentials:
     names = {
         "host": f"{printer.env_prefix}_HOST",

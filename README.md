@@ -83,6 +83,7 @@ Gateway routes:
 | GET | `/printers` | Safe printer inventory (no addresses or credentials) |
 | GET | `/status` | Aggregate gateway envelope (one component per printer) |
 | GET | `/ui` | Submission page for people (see below) |
+| GET | `/whoami` | Whether this request carries an edge-verified identity |
 
 Per-printer STATUS_SPEC routes:
 
@@ -288,14 +289,56 @@ mirrored to one JSON file each, so a restart does not empty a machine's queue.
 
 ### Identity and approval
 
-`requested_by` and `approved_by` are **opaque identifiers, not authenticated
-identities**. This service has no login; access is gated at the network layer by
-Tailscale ACLs, exactly as for the status surface. They are recorded in the job's
-history so decisions become attributable the moment a real identity provider
-(`ac_auth`) is wired in.
+This service has no login of its own, so who did what depends on how it is
+reached, and every job records which of the two it got:
+
+- **Through the lab's Caddy edge** (`/bambu/*` — see *Behind the dashboard's
+  login* below), the edge authenticates the person against `ac_auth` and injects
+  `X-Auth-User`. The gateway believes that header **only** when the request also
+  carries `X-Edge-Auth` matching `BAMBU_EDGE_SHARED_SECRET`, which a caller
+  coming straight off the tailnet cannot produce. The signed-in account becomes
+  the recorded actor, overriding anything the client supplied — a signed-in
+  person must not be able to file work under someone else's name — and
+  `requested_by_verified` / `approved_by_verified` are `true`.
+- **Reached directly**, `requested_by` / `approved_by` / `cancelled_by` are
+  **opaque labels, not identities**, exactly as the status surface is
+  unauthenticated. The `*_verified` fields are `false`.
+
+Two properties are deliberate. The gateway **fails closed**: with no
+`BAMBU_EDGE_SHARED_SECRET` configured it trusts no injected identity at all,
+rather than believing a header it cannot check. And the secret is compared in
+constant time, because `==` on a secret leaks it a byte at a time.
+
+`GET /whoami` reports what the current request carries, which is how the page
+words itself honestly — it distinguishes "not signed in" from "this deployment
+cannot tell who you are" (`identity_available`).
 
 Approval is human-in-the-loop by design: nothing auto-approves, and a submission
 that did not pass validation can never be approved.
+
+### Behind the dashboard's login
+
+The page is served at `/ui` relative to wherever the service is reached, and it
+derives its API base by stripping that trailing `/ui` from its own URL. One file
+therefore serves both the direct deployment and a path prefix behind the lab's
+single Caddy edge, with no server-side rewrite and no build-time config — the
+same arrangement as the OT-2 operator SPA.
+
+Fronting it that way is the **only** way it participates in SSO: a session
+cookie cannot be shared with this gateway on its own address, because raw
+`100.x` addresses cannot carry a `Domain` cookie and `*.ts.net` is on the Public
+Suffix List, so browsers drop tailnet-wide cookies. One origin behind the edge
+means one login (see `ac-organic-lab/docs/AUTH_DESIGN.md`).
+
+The route lives in `ac-organic-lab/deploy/Caddyfile.single-edge` as `/bambu/*`,
+gated by `forward_auth` and injecting the identity described above; the dashboard
+frames `/bambu/ui/` under Utils → 3D Printers. Once that route is live the
+service's bind can go back to loopback, closing the unauthenticated
+`/submissions` path on the tailnet.
+
+Note the page answers at both `/ui` and `/ui/`. Serving only one would make
+Starlette redirect between them with a `Location` that drops the edge prefix,
+landing the visitor on the dashboard.
 
 ### Cancelling
 

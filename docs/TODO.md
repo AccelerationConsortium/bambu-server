@@ -104,10 +104,46 @@ before pointing users at it. The durable home is probably the lab dashboard
 (`ac-organic-lab/web`) once `ac_auth` makes `requested_by` a real identity;
 this page is the interim surface.
 
+## Edge identity / SSO (code done, deployment pending)
+
+The submission page and its API now work behind the lab's single Caddy edge, so
+a submission can be attributed to a signed-in person instead of a typed-in
+label. What shipped:
+
+- `identity.py` — trusts `X-Auth-User` only when `X-Edge-Auth` matches
+  `BAMBU_EDGE_SHARED_SECRET` (constant-time), **fails closed** with no secret
+  configured, and a verified identity overrides any client-supplied name.
+- `requested_by_verified` / `approved_by_verified` on every job; the history
+  note marks a verified actor.
+- `GET /whoami` so the page can word itself honestly.
+- The page derives its API base from its own URL (strips a trailing `/ui`), so
+  one file serves the direct deployment and any edge prefix. Answers at both
+  `/ui` and `/ui/` — a slash redirect would drop the edge prefix.
+- `ac-organic-lab`: the `/bambu/*` route in `deploy/Caddyfile.single-edge`, and
+  Utils → 3D Printers frames `/bambu/ui/`.
+
+**Not deployed.** Three root steps, none of which I can do:
+
+1. Install the updated `deploy/Caddyfile.single-edge` into `/etc/caddy` and
+   reload Caddy.
+2. Set the *same* `BAMBU_EDGE_SHARED_SECRET` in Caddy's systemd
+   `EnvironmentFile` and in bambu-server's unit environment, then restart both.
+   Until then the embed shows a blank frame and the gateway trusts nothing —
+   both fail closed, which is why shipping this ahead of deployment is safe.
+3. **Then** revert the bind to `127.0.0.1` (step 5 of the plan). It was widened
+   to `0.0.0.0` so the page was reachable at all; once the edge fronts it, the
+   loopback bind closes the unauthenticated `/submissions` path on the tailnet.
+   Doing it before the route exists would break the working page.
+
+Known gap, inherited from the OT-2 embed: a write inside the framed panel
+bypasses the dashboard's `control_action` audit row. Submissions are recorded in
+the job store's history, so there is a trail; it is not in `equipment_events`
+until the gateway pushes to `/api/ingest/events`.
+
 ## Test suite
 
 - `uv run ruff check .` passes.
-- `uv run pytest -q` passes all 130 tests, including the FastAPI API tests and
+- `uv run pytest -q` passes all 152 tests, including the FastAPI API tests and
   the submission pipeline (artifact inspection, validation, store/state machine,
   queue ETA, HTTP surface). Tests build their own `.3mf` and `.gcode` fixtures
   and use fake backends; nothing touches hardware.

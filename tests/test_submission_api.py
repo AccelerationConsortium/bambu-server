@@ -400,3 +400,178 @@ def test_the_ui_page_only_calls_public_endpoints(client: TestClient) -> None:
 def test_the_ui_page_is_not_in_the_api_schema(client: TestClient) -> None:
     """It is a page, not part of the contract a machine client reads."""
     assert "/ui" not in client.get("/openapi.json").json()["paths"]
+
+
+# --- edge-injected identity over HTTP ---------------------------------------
+
+EDGE_SECRET = "test-edge-secret"
+
+
+def _edge_client(settings: Settings, backend: FakeBackend, monkeypatch) -> TestClient:
+    monkeypatch.setenv("BAMBU_EDGE_SHARED_SECRET", EDGE_SECRET)
+    app = create_app(settings=settings, backend_factory=lambda _d, _c: backend)
+    return TestClient(app)
+
+
+def _edge_headers(user: str = "alice", role: str = "operator") -> dict[str, str]:
+    return {"X-Edge-Auth": EDGE_SECRET, "X-Auth-User": user, "X-Auth-Role": role}
+
+
+def test_whoami_reports_no_identity_by_default(client: TestClient) -> None:
+    body = client.get("/whoami").json()
+
+    assert body == {
+        "user": None,
+        "role": None,
+        "verified": False,
+        "identity_available": False,
+    }
+
+
+def test_whoami_reports_the_edge_identity(
+    settings: Settings, backend: FakeBackend, monkeypatch
+) -> None:
+    with _edge_client(settings, backend, monkeypatch) as client:
+        body = client.get("/whoami", headers=_edge_headers()).json()
+
+    assert body == {
+        "user": "alice",
+        "role": "operator",
+        "verified": True,
+        "identity_available": True,
+    }
+
+
+def test_whoami_distinguishes_not_signed_in_from_cannot_tell(
+    settings: Settings, backend: FakeBackend, monkeypatch
+) -> None:
+    """`identity_available` is what lets the page word itself honestly."""
+    with _edge_client(settings, backend, monkeypatch) as client:
+        body = client.get("/whoami").json()
+
+    assert body["verified"] is False
+    assert body["identity_available"] is True
+
+
+def test_a_forged_identity_header_is_ignored(
+    settings: Settings, backend: FakeBackend, monkeypatch
+) -> None:
+    """The port stays reachable on the tailnet, so a bare header proves nothing."""
+    with _edge_client(settings, backend, monkeypatch) as client:
+        body = client.get("/whoami", headers={"X-Auth-User": "admin"}).json()
+        assert body["verified"] is False
+
+        response = _upload_with(client, headers={"X-Auth-User": "admin"})
+        job = response.json()
+
+    assert job["requested_by"] == "remote-user-1"
+    assert job["requested_by_verified"] is False
+
+
+def _upload_with(client: TestClient, *, headers: dict[str, str], form: dict | None = None):
+    data = {"target_machine": "bambu_test_01", "requested_by": "remote-user-1"}
+    if form:
+        data.update(form)
+    return client.post(
+        "/submissions",
+        files={"file": ("part.gcode", SAMPLE_GCODE.encode(), "application/octet-stream")},
+        data=data,
+        headers=headers,
+    )
+
+
+def test_a_verified_identity_becomes_the_submitter(
+    settings: Settings, backend: FakeBackend, monkeypatch
+) -> None:
+    with _edge_client(settings, backend, monkeypatch) as client:
+        job = _upload_with(client, headers=_edge_headers()).json()
+
+    # The form said remote-user-1; the signed-in account wins.
+    assert job["requested_by"] == "alice"
+    assert job["requested_by_verified"] is True
+
+
+def test_approval_and_cancellation_record_the_verified_actor(
+    settings: Settings, backend: FakeBackend, monkeypatch
+) -> None:
+    with _edge_client(settings, backend, monkeypatch) as client:
+        first = _upload_with(client, headers=_edge_headers()).json()
+        approved = client.post(
+            f"/submissions/{first['submission_id']}/approve",
+            json={"approved_by": "somebody-else"},
+            headers=_edge_headers(user="bob"),
+        ).json()
+
+        second = _upload_with(client, headers=_edge_headers()).json()
+        cancelled = client.post(
+            f"/submissions/{second['submission_id']}/cancel",
+            json={"reason": "not needed"},
+            headers=_edge_headers(user="carol"),
+        ).json()
+
+    assert approved["approved_by"] == "bob"
+    assert approved["approved_by_verified"] is True
+    assert approved["history"][-1]["note"] == "approved by bob (verified identity)"
+
+    assert cancelled["state"] == "cancelled"
+    assert cancelled["history"][-1]["note"] == (
+        "cancelled by carol (verified identity): not needed"
+    )
+
+
+def test_an_unverified_actor_is_marked_as_such(client: TestClient) -> None:
+    created = _upload(client).json()
+    approved = client.post(
+        f"/submissions/{created['submission_id']}/approve",
+        json={"approved_by": "lab-operator"},
+    ).json()
+
+    assert created["requested_by_verified"] is False
+    assert approved["approved_by_verified"] is False
+    assert approved["history"][-1]["note"] == "approved by lab-operator"
+
+
+def test_a_name_is_required_when_no_identity_is_verified(client: TestClient) -> None:
+    response = client.post(
+        "/submissions",
+        files={"file": ("part.gcode", SAMPLE_GCODE.encode(), "application/octet-stream")},
+        data={"target_machine": "bambu_test_01"},
+    )
+    assert response.status_code == 422
+
+    created = _upload(client).json()
+    for path, _ in (("approve", None), ("cancel", None)):
+        refused = client.post(f"/submissions/{created['submission_id']}/{path}", json={})
+        assert refused.status_code == 422, path
+
+
+def test_the_page_derives_its_api_base_from_its_own_url(client: TestClient) -> None:
+    """One file must serve both the direct deployment and an edge path prefix."""
+    body = client.get("/ui").text
+
+    assert "API_BASE" in body
+    assert 'window.location.pathname.replace' in body
+    # No bare-rooted fetch: that would reach the dashboard behind the edge.
+    assert 'fetch("/' not in body
+    assert "/whoami" in body
+
+
+def test_no_secret_is_ever_returned(
+    settings: Settings, backend: FakeBackend, monkeypatch
+) -> None:
+    with _edge_client(settings, backend, monkeypatch) as client:
+        for path in ("/whoami", "/", "/status", "/ui", "/submissions"):
+            assert EDGE_SECRET not in client.get(path, headers=_edge_headers()).text, path
+
+
+def test_the_ui_is_served_at_both_slash_spellings(client: TestClient) -> None:
+    """Behind an edge prefix the canonical URL ends in a slash.
+
+    Serving only `/ui` would make Starlette redirect `/ui/` to `/ui`, and that
+    Location drops the edge prefix — landing the visitor on the dashboard
+    instead of the page. Both spellings must answer directly.
+    """
+    for path in ("/ui", "/ui/"):
+        response = client.get(path, follow_redirects=False)
+        assert response.status_code == 200, path
+        assert "<title>Submit a print" in response.text

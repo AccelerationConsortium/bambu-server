@@ -124,8 +124,16 @@ const el = (tag, text, cls) => {
   return node;
 };
 
+// This page is served at <base>/ui, and everything it calls lives under the
+// same <base>. Behind the lab's Caddy edge that base is a path prefix
+// (/bambu), so a hardcoded "/printers" would reach the dashboard instead of
+// this gateway. Deriving it from our own URL means one file serves both the
+// direct deployment (base "") and any edge prefix, with no server-side rewrite
+// and no build-time configuration.
+const API_BASE = window.location.pathname.replace(/\/ui\/?$/, "");
+
 async function api(path, options) {
-  const response = await fetch(path, options);
+  const response = await fetch(API_BASE + path, options);
   let body = null;
   try { body = await response.json(); } catch (_) { /* no body */ }
   if (!response.ok) {
@@ -135,7 +143,41 @@ async function api(path, options) {
   return body;
 }
 
-const state = { machine: null, profile: null };
+const state = { machine: null, profile: null, actor: null };
+
+/** Show who the edge says you are, or admit that nobody checked. */
+async function loadIdentity() {
+  let who;
+  try {
+    who = await api("/whoami");
+  } catch (_) {
+    return;
+  }
+  state.actor = who;
+  const field = $("requested_by");
+  const label = document.querySelector('label[for="requested_by"]');
+  const banner = $("banner");
+
+  if (who.verified && who.user) {
+    field.value = who.user;
+    field.readOnly = true;
+    field.disabled = true;
+    if (label) label.textContent = "Signed in as";
+    banner.replaceChildren(
+      el("span", "Signed in as " + who.user + (who.role ? " (" + who.role + ")" : "") +
+        " — submissions are recorded against this account. "),
+    );
+  } else if (who.identity_available) {
+    banner.replaceChildren(
+      el("span", "Not signed in: the name you enter is a label, not an identity. " +
+        "Open this page through the dashboard to have it recorded against your account. "),
+    );
+  } else {
+    return; // Keep the page's default no-sign-in wording.
+  }
+  const note = el("strong", "Nothing is sent to a printer");
+  banner.append(note, el("span", " — submitting queues a job; dispatch is not implemented."));
+}
 
 function renderSpecs(profile) {
   const specs = $("specs");
@@ -197,10 +239,14 @@ function clock(iso) {
 }
 
 async function act(id, path, field) {
-  const who = $("requested_by").value.trim() || window.prompt("Your name, for the record:");
-  if (!who) return;
   const body = {};
-  body[field] = who;
+  // With a verified identity the server ignores any name we send and uses the
+  // signed-in account, so there is nothing to ask for.
+  if (!(state.actor && state.actor.verified)) {
+    const who = $("requested_by").value.trim() || window.prompt("Your name, for the record:");
+    if (!who) return;
+    body[field] = who;
+  }
   if (field === "cancelled_by") {
     const reason = window.prompt("Reason (optional):");
     if (reason) body.reason = reason;
@@ -302,15 +348,16 @@ async function submit() {
   const button = $("submit");
   const message = $("submit-msg");
   const file = $("file").files[0];
+  const verified = Boolean(state.actor && state.actor.verified);
   const who = $("requested_by").value.trim();
   message.className = "detail";
   if (!file) { message.textContent = "Choose a file first."; return; }
-  if (!who) { message.textContent = "Enter your name first."; return; }
+  if (!verified && !who) { message.textContent = "Enter your name first."; return; }
 
   const form = new FormData();
   form.append("file", file);
   form.append("target_machine", state.machine);
-  form.append("requested_by", who);
+  if (!verified) form.append("requested_by", who);
   const material = $("material").value.trim();
   if (material) form.append("material", material);
 
@@ -331,6 +378,7 @@ async function submit() {
 }
 
 (async function start() {
+  await loadIdentity();
   try {
     const printers = await api("/printers");
     const picker = $("machine");

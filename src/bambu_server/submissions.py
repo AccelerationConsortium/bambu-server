@@ -126,6 +126,16 @@ def clean_text(value: str | None, *, field: str, required: bool) -> str | None:
     return cleaned
 
 
+def _verified_suffix(verified: bool) -> str:
+    """Mark a verified actor in free-text history.
+
+    Structured fields carry a boolean; the history note is read by people, and
+    "who did this, and did we actually check" is the part worth spelling out.
+    """
+
+    return " (verified identity)" if verified else ""
+
+
 def safe_display_name(name: str) -> str:
     """Reduce a client-supplied filename to something safe to echo back.
 
@@ -152,6 +162,11 @@ class SubmissionJob(BaseModel):
     submission_id: str
     target_machine: str
     requested_by: str = Field(min_length=1, max_length=120)
+    #: True when `requested_by` is an edge-verified identity rather than a name
+    #: the client typed. Recorded per job so a reader can tell an attributable
+    #: submission from a self-declared one, instead of having to know how the
+    #: service happened to be deployed when it arrived.
+    requested_by_verified: bool = False
     material: str | None = Field(default=None, max_length=60)
     original_filename: str
     artifact_kind: ArtifactKind
@@ -161,6 +176,7 @@ class SubmissionJob(BaseModel):
     created_at: datetime
     updated_at: datetime
     approved_by: str | None = None
+    approved_by_verified: bool = False
     approved_at: datetime | None = None
     #: True once the stored artifact has been deleted (cancellation). The job
     #: record outlives its file so the audit trail survives, but nothing can be
@@ -259,6 +275,7 @@ class SubmissionStore:
         extension: str,
         target_machine: str,
         requested_by: str,
+        requested_by_verified: bool = False,
         material: str | None,
         original_filename: str,
     ) -> SubmissionJob:
@@ -304,6 +321,7 @@ class SubmissionStore:
             submission_id=submission_id,
             target_machine=target_machine,
             requested_by=owner,  # type: ignore[arg-type]
+            requested_by_verified=requested_by_verified,
             material=filament,
             original_filename=safe_display_name(original_filename),
             artifact_kind=kind,
@@ -347,7 +365,9 @@ class SubmissionStore:
             await self._persist(updated)
             return updated
 
-    async def approve(self, job: SubmissionJob, *, approved_by: str) -> SubmissionJob:
+    async def approve(
+        self, job: SubmissionJob, *, approved_by: str, verified: bool = False
+    ) -> SubmissionJob:
         """Record the human sign-off that gates dispatch.
 
         Approval is a *record*, not an action: it moves no hardware and starts
@@ -372,12 +392,15 @@ class SubmissionStore:
                 update={
                     "verdict": verdict,
                     "approved_by": _CONTROL_CHARS.sub("", approved_by).strip()[:120],
+                    "approved_by_verified": verified,
                     "approved_at": now,
                 }
             )
             self._jobs[updated.submission_id] = updated
             return await self._transition_locked(
-                updated.submission_id, "approved", f"approved by {updated.approved_by}"
+                updated.submission_id,
+                "approved",
+                f"approved by {updated.approved_by}{_verified_suffix(verified)}",
             )
 
     async def cancel(
@@ -386,6 +409,7 @@ class SubmissionStore:
         *,
         cancelled_by: str,
         reason: str | None = None,
+        verified: bool = False,
     ) -> SubmissionJob:
         """Withdraw a waiting job from its machine's queue.
 
@@ -423,7 +447,7 @@ class SubmissionStore:
                 )
             self._jobs[current.submission_id] = current.model_copy(update=update)
 
-            note = f"cancelled by {who}"
+            note = f"cancelled by {who}{_verified_suffix(verified)}"
             if why:
                 note = f"{note}: {why}"
             return await self._transition_locked(
