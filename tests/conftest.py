@@ -1,13 +1,103 @@
 from __future__ import annotations
 
+import json
+import zipfile
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from bambu_server.backend import PrinterReading
+from bambu_server.backend import AmsTrayReading, PrinterReading
 from bambu_server.config import Settings
 from bambu_server.main import create_app
+
+# A Bambu-shaped slicer header followed by a short toolpath. The motion spans
+# X 10..110 and Y 10..60, so its footprint is 100 x 50 mm -- small enough to fit
+# the test machine's 256 x 256 plate and large enough that a bed-size check has
+# something real to measure.
+SAMPLE_GCODE = """; HEADER_BLOCK_START
+; BambuStudio 01.09.00.70
+; model printing time: 1h 2m 3s; total estimated time: 1h 10m 0s
+; HEADER_BLOCK_END
+
+; CONFIG_BLOCK_START
+; curr_bed_type = Textured PEI Plate
+; textured_plate_temp = 55
+; hot_plate_temp = 60
+; chamber_temperature = 0
+; filament_type = PLA
+; layer_height = 0.2
+; nozzle_diameter = 0.4
+; nozzle_temperature = 220
+; nozzle_type = hardened_steel
+; printer_model = Bambu Lab X1 Carbon
+; CONFIG_BLOCK_END
+
+G90
+M140 S55
+M104 S220
+G1 X10 Y10 Z0.2 F3000
+G1 X110 Y60 E5.0
+G1 X10 Y10 E7.5
+M104 S0
+"""
+
+SLICE_INFO_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <plate>
+    <metadata key="index" value="1"/>
+    <metadata key="prediction" value="4200"/>
+    <metadata key="weight" value="12.34"/>
+    <filament id="1" type="PLA" color="#FF0000" used_g="12.08"/>
+  </plate>
+</config>
+"""
+
+
+def write_gcode(path: Path, body: str = SAMPLE_GCODE) -> Path:
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def write_3mf(
+    path: Path,
+    *,
+    plate_gcode: str | None = SAMPLE_GCODE,
+    project_settings: dict[str, object] | None = None,
+    slice_info: str | None = SLICE_INFO_XML,
+) -> Path:
+    """Build a minimal Bambu-shaped 3mf container.
+
+    ``plate_gcode=None`` produces an *unsliced* project file -- the shape a user
+    gets from "save project" rather than "export plate sliced file", which no
+    printer can run.
+    """
+
+    settings = {
+        "printer_model": "Bambu Lab X1 Carbon",
+        "nozzle_diameter": ["0.4"],
+        "nozzle_temperature": ["220"],
+        "curr_bed_type": "Textured PEI Plate",
+        "textured_plate_temp": ["55"],
+        "chamber_temperature": ["0"],
+        "filament_type": ["PLA"],
+        "layer_height": "0.2",
+    }
+    if project_settings is not None:
+        settings.update(project_settings)
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "3D/3dmodel.model",
+            '<?xml version="1.0"?><model unit="millimeter"><resources/></model>',
+        )
+        archive.writestr("Metadata/project_settings.config", json.dumps(settings))
+        if slice_info is not None:
+            archive.writestr("Metadata/slice_info.config", slice_info)
+        if plate_gcode is not None:
+            archive.writestr("Metadata/plate_1.gcode", plate_gcode)
+    return path
 
 
 class FakeBackend:
@@ -47,11 +137,31 @@ def reading() -> PrinterReading:
         light_state="on",
         job_name="test_part.3mf",
         firmware_version="01.08.00.00",
+        nozzle_type="hardened_steel",
+        nozzle_diameter=0.4,
+        print_type="local",
+        wifi_signal="-42",
+        print_error_code=0,
+        skipped_objects=[3],
+        ams_trays=[
+            AmsTrayReading(
+                ams_id=0,
+                tray_id=1,
+                tray_index=1,
+                tray_type="PLA",
+                tray_color="#FF0000",
+                tray_weight="1000",
+                tray_diameter="1.75",
+                tray_temp="220",
+                nozzle_temp_min=190,
+                nozzle_temp_max=240,
+            )
+        ],
     )
 
 
 @pytest.fixture
-def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
+def settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
     prefix = "BAMBU_TEST_01"
     monkeypatch.setenv(f"{prefix}_HOST", "printer.invalid")
     monkeypatch.setenv(f"{prefix}_ACCESS_CODE", "secret-access-code")
@@ -60,12 +170,26 @@ def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
         {
             "poll_interval_seconds": 60,
             "stale_after_seconds": 120,
+            # Submissions land in a per-test directory: the intake writes real
+            # files and must never touch the repository or a shared path.
+            "submissions": {"directory": str(tmp_path / "submissions")},
             "printers": [
                 {
                     "id": "bambu_test_01",
                     "name": "Bambu Test 01",
                     "model": "X1 Carbon",
                     "env_prefix": prefix,
+                    "profile": {
+                        "enclosure": "enclosed",
+                        "nozzle_type": "hardened_steel",
+                        "nozzle_diameter_mm": 0.4,
+                        "bed_size_mm": [256, 256],
+                        "limits": {
+                            "nozzle_temperature_c": [0, 300],
+                            "bed_temperature_c": [0, 110],
+                        },
+                        "ams": {"filament_forbidden": ["ABS"]},
+                    },
                 }
             ],
         }

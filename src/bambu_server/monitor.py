@@ -20,6 +20,7 @@ from .models import (
     ErrorInfo,
     MetricValue,
 )
+from .profiles import MachineProfile, ObservedMachineState, build_profile
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,20 @@ class PrinterMonitor:
             return "idle"
         return "unknown"
 
+    def observed(self) -> ObservedMachineState:
+        """Machine facts read from the cached telemetry.
+
+        Reads the poll loop's cache only -- a profile or queue request must
+        never cause printer I/O.
+        """
+
+        return ObservedMachineState.from_reading(self._reading)
+
+    def profile(self) -> MachineProfile:
+        """The submitter-facing machine profile for this printer."""
+
+        return build_profile(self.definition, self.observed())
+
     def status(self) -> EquipmentStatus:
         now = datetime.now(UTC)
         reading = self._reading
@@ -195,6 +210,35 @@ class PrinterMonitor:
                     "light_state": reading.light_state,
                 }
             )
+            # Optional enrichment is only reported when actually observed, never
+            # as a bare null or an empty sentinel.
+            advanced: dict[str, object] = {
+                "print_type": reading.print_type,
+                "nozzle_type": reading.nozzle_type,
+                "nozzle_diameter": reading.nozzle_diameter,
+                "wifi_signal": reading.wifi_signal,
+                "print_error_code": reading.print_error_code,
+                "skipped_objects": reading.skipped_objects,
+            }
+            for key, value in advanced.items():
+                if value is not None and value != []:
+                    details[key] = value
+            if reading.ams_trays:
+                details["ams_trays"] = [
+                    {
+                        "ams_id": tray.ams_id,
+                        "tray_id": tray.tray_id,
+                        "tray_index": tray.tray_index,
+                        "tray_type": tray.tray_type,
+                        "tray_color": tray.tray_color,
+                        "tray_weight": tray.tray_weight,
+                        "tray_diameter": tray.tray_diameter,
+                        "tray_temp": tray.tray_temp,
+                        "nozzle_temp_min": tray.nozzle_temp_min,
+                        "nozzle_temp_max": tray.nozzle_temp_max,
+                    }
+                    for tray in reading.ams_trays
+                ]
 
         return EquipmentStatus(
             protocol_version=PROTOCOL_VERSION,
@@ -230,12 +274,16 @@ class PrinterMonitor:
         if reading.gcode_state in _BUSY_STATES:
             return "busy", f"Print job is {reading.gcode_state.lower()}", None
         if reading.gcode_state == "FAILED":
+            message = "Printer reported a failed print job"
+            error_code = reading.print_error_code
+            if error_code:
+                message += f" (error {error_code})"
             return (
                 "error",
-                "Printer reported a failed print job",
+                message,
                 ErrorInfo(
                     code="print_failed",
-                    message="Printer reported a failed print job",
+                    message=message,
                     severity="error",
                     timestamp=reading.data_updated_at or now,
                 ),

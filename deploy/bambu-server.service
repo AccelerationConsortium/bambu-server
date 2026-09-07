@@ -35,6 +35,9 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# The submission intake writes uploaded artifacts and their metadata under
+# `submissions.directory` (default `var/submissions`, relative to the config
+# file). Keep that path inside ReadWritePaths or intake fails at startup.
 ReadWritePaths=/opt/bambu-server
 
 [Install]

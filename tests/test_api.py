@@ -175,6 +175,7 @@ def test_failed_print_is_error(settings: Settings) -> None:
             data_ready=True,
             gcode_state="FAILED",
             activity="UNKNOWN",
+            print_error_code=502,
         )
     )
     app = create_app(settings=settings, backend_factory=lambda _definition, _creds: backend)
@@ -182,6 +183,38 @@ def test_failed_print_is_error(settings: Settings) -> None:
         body = test_client.get("/printers/bambu_test_01/status").json()
     assert body["equipment_status"] == "error"
     assert body["last_error"]["code"] == "print_failed"
+    assert body["last_error"]["message"] == (
+        "Printer reported a failed print job (error 502)"
+    )
+    assert body["details"]["print_error_code"] == 502
+
+
+def test_status_surfaces_advanced_telemetry(client: TestClient) -> None:
+    body = client.get("/printers/bambu_test_01/status").json()
+    details = body["details"]
+    assert details["print_type"] == "local"
+    assert details["nozzle_type"] == "hardened_steel"
+    assert details["nozzle_diameter"] == 0.4
+    assert details["wifi_signal"] == "-42"
+    assert details["print_error_code"] == 0
+    assert details["skipped_objects"] == [3]
+    assert details["ams_trays"] == [
+        {
+            "ams_id": 0,
+            "tray_id": 1,
+            "tray_index": 1,
+            "tray_type": "PLA",
+            "tray_color": "#FF0000",
+            "tray_weight": "1000",
+            "tray_diameter": "1.75",
+            "tray_temp": "220",
+            "nozzle_temp_min": 190,
+            "nozzle_temp_max": 240,
+        }
+    ]
+    # No AMS UUIDs or raw telemetry identifiers leak through.
+    serialized = body["details"]["ams_trays"][0]
+    assert not any("uuid" in key for key in serialized)
 
 
 def test_no_control_routes_are_exposed(client: TestClient) -> None:
