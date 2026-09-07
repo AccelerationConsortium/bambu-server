@@ -76,8 +76,12 @@ Open, from the design's §10 data gaps and what the build surfaced:
   slow (the read is on a worker thread, so it does not stall status polls). If
   that becomes a problem, move it to an async worker — the state machine already
   has the `validating` state for it.
-- No cancel/withdraw path exists for a queued job; the contract's state machine
-  declares none.
+- **Beyond the design's state machine:** a `cancelled` terminal state and
+  `POST /submissions/{id}/cancel` were added after the first live test left an
+  unremovable job in the P1S queue. The contract's §5 declares no such state.
+  It is legal only from `queued` / `approved`, never for a dispatched job —
+  aborting a print stays a control-plane action. Worth folding back into
+  `SUBMISSION_PIPELINE_DESIGN.md` §5 when that doc is next revised.
 - No retention policy: rejected and finished jobs, and their uploaded artifacts,
   stay on disk and in `GET /submissions` indefinitely. Fine at current volume,
   but it needs a sweep before this runs unattended for long.
@@ -85,7 +89,7 @@ Open, from the design's §10 data gaps and what the build surfaced:
 ## Test suite
 
 - `uv run ruff check .` passes.
-- `uv run pytest -q` passes all 114 tests, including the FastAPI API tests and
+- `uv run pytest -q` passes all 126 tests, including the FastAPI API tests and
   the submission pipeline (artifact inspection, validation, store/state machine,
   queue ETA, HTTP surface). Tests build their own `.3mf` and `.gcode` fixtures
   and use fake backends; nothing touches hardware.

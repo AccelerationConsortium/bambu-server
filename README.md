@@ -102,6 +102,7 @@ Submission pipeline routes:
 | GET | `/submissions` | List jobs (`machine`, `state`, `limit` filters) |
 | GET | `/submissions/{submission_id}` | One job with its verdict and history |
 | POST | `/submissions/{submission_id}/approve` | Record sign-off on a queued job |
+| POST | `/submissions/{submission_id}/cancel` | Withdraw a waiting job from the queue |
 
 No `/control/*` routes exist, and no route dispatches a print.
 
@@ -174,6 +175,7 @@ wait in a per-machine queue with expected finish times. The design contract is
 ```text
 submitted -> validating -> validated -> queued -> approved -> | dispatch
                        \-> rejected (terminal)                | not implemented
+                                          \--------\-> cancelled (terminal)
 ```
 
 Everything up to and including approval is analysis and bookkeeping. Approval is
@@ -273,6 +275,20 @@ history so decisions become attributable the moment a real identity provider
 
 Approval is human-in-the-loop by design: nothing auto-approves, and a submission
 that did not pass validation can never be approved.
+
+### Cancelling
+
+`POST /submissions/{id}/cancel` withdraws a waiting job. It is a **queue
+operation, not an abort**: it is legal only from `queued` and `approved`, it
+reaches no printer, and it is deliberately refused for anything past the queue —
+stopping a running print is a control-plane action that needs a claim, and this
+surface has none.
+
+Cancelling deletes the stored artifact (a withdrawn job has no further use for
+it, and it is the submitter's data) and marks `artifact_removed`. The job record
+stays, with the actor and reason in its history, so the withdrawal remains
+auditable. There is no undo — a withdrawn job is resubmitted, not revived. An
+approved job that is cancelled has its `dispatch_ready` retracted.
 
 ## Dashboard registration
 

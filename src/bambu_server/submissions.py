@@ -57,18 +57,25 @@ JobState = Literal[
     "finished",
     "failed",
     "rejected",
+    "cancelled",
 ]
 
 #: Which states are waiting in a machine's queue. ``approved`` stays queued
 #: because approval alone moves nothing -- only dispatch does.
 QUEUED_STATES: frozenset[str] = frozenset({"queued", "approved"})
 
+#: States a submitter or operator may withdraw a job from. Deliberately only
+#: the waiting ones: cancelling means "take this out of the queue", never "stop
+#: a print". A job that has reached the printer is the control plane's problem,
+#: and abort belongs there under a claim -- not on this surface.
+CANCELLABLE_STATES: frozenset[str] = frozenset({"queued", "approved"})
+
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "submitted": frozenset({"validating", "failed"}),
     "validating": frozenset({"validated", "rejected", "failed"}),
     "validated": frozenset({"queued", "failed"}),
-    "queued": frozenset({"approved", "failed"}),
-    "approved": frozenset({"dispatching", "failed"}),
+    "queued": frozenset({"approved", "cancelled", "failed"}),
+    "approved": frozenset({"dispatching", "cancelled", "failed"}),
     "dispatching": frozenset({"running", "failed"}),
     "running": frozenset({"finished", "failed"}),
     # Terminal. `failed` is deliberately terminal too: the contract sends it to
@@ -77,6 +84,7 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "finished": frozenset(),
     "failed": frozenset(),
     "rejected": frozenset(),
+    "cancelled": frozenset(),
 }
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
@@ -154,6 +162,10 @@ class SubmissionJob(BaseModel):
     updated_at: datetime
     approved_by: str | None = None
     approved_at: datetime | None = None
+    #: True once the stored artifact has been deleted (cancellation). The job
+    #: record outlives its file so the audit trail survives, but nothing can be
+    #: run from it afterwards.
+    artifact_removed: bool = False
     estimated_duration_minutes: float | None = None
     facts: ArtifactFacts | None = None
     verdict: ValidationVerdict | None = None
@@ -366,6 +378,56 @@ class SubmissionStore:
             self._jobs[updated.submission_id] = updated
             return await self._transition_locked(
                 updated.submission_id, "approved", f"approved by {updated.approved_by}"
+            )
+
+    async def cancel(
+        self,
+        job: SubmissionJob,
+        *,
+        cancelled_by: str,
+        reason: str | None = None,
+    ) -> SubmissionJob:
+        """Withdraw a waiting job from its machine's queue.
+
+        Legal only from the states in :data:`CANCELLABLE_STATES`. This is a
+        queue operation, **not** an abort: it can never reach a printer, and it
+        is deliberately not offered for a job that has been dispatched --
+        stopping a running print is a control-plane action that needs a claim.
+
+        The stored artifact is deleted, because a withdrawn job has no further
+        use for it and it is the submitter's data. The job record stays, so the
+        decision and its reason remain auditable; ``artifact_removed`` marks
+        that the file is gone. There is no undo -- a withdrawn job is
+        resubmitted, not revived.
+        """
+
+        async with self._lock:
+            current = self._require(job.submission_id)
+            if current.state not in CANCELLABLE_STATES:
+                raise InvalidTransition(
+                    f"only a waiting submission can be cancelled; "
+                    f"{current.submission_id} is {current.state}"
+                )
+
+            path = self.artifact_path(current)
+            await asyncio.to_thread(path.unlink, True)
+
+            who = clean_text(cancelled_by, field="cancelled_by", required=True)
+            why = clean_text(reason, field="reason", required=False)
+            update: dict[str, object] = {"artifact_removed": True}
+            if current.verdict is not None:
+                # An approved job carries dispatch_ready; withdrawing it must
+                # retract that, or the record would still read as cleared to run.
+                update["verdict"] = current.verdict.model_copy(
+                    update={"dispatch_ready": False}
+                )
+            self._jobs[current.submission_id] = current.model_copy(update=update)
+
+            note = f"cancelled by {who}"
+            if why:
+                note = f"{note}: {why}"
+            return await self._transition_locked(
+                current.submission_id, "cancelled", note
             )
 
     # -- internals ---------------------------------------------------------
