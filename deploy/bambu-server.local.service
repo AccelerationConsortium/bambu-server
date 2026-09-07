@@ -33,6 +33,9 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LimitNOFILE=65536
+# The submission intake writes uploaded artifacts and their metadata under
+# `submissions.directory` (default `var/submissions`, relative to the config
+# file). Keep that path inside ReadWritePaths or intake fails at startup.
 ReadWritePaths=/home/sdl2/caoyang/bambu-server
 
 SyslogIdentifier=bambu-server

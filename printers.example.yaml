@@ -7,8 +7,33 @@ stale_after_seconds: 20.0
 cors_origins:
   - http://localhost:8000
 
+# Submission intake. `directory` holds uploaded artifacts and their metadata;
+# a relative path is resolved against this file, not the working directory.
+submissions:
+  directory: var/submissions
+  max_file_bytes: 209715200      # 200 MiB
+  scan_max_bytes: 67108864       # 64 MiB; above this only the head and tail of
+                                 # an artifact are read and plate fit is not
+                                 # reported rather than guessed from a partial scan
+
 printers:
   - id: bambu_x1c_01
     name: Bambu X1 Carbon 01
     model: X1 Carbon
     env_prefix: BAMBU_X1C_01
+    # Operator-declared machine profile. This is what a remote submitter targets
+    # and what their model is validated against, so every value should be a fact
+    # about the machine. Omit a field and the checks that need it report
+    # `not_applicable` -- they never fall back to a guessed limit.
+    profile:
+      enclosure: enclosed            # `enclosed` or `open`
+      nozzle_type: hardened_steel    # fallback for printers whose live field is blank
+      nozzle_diameter_mm: 0.4
+      bed_size_mm: [256, 256]        # X, Y
+      chamber_temperature_c: null    # null on a machine with no chamber control
+      limits:                        # `[min, max]` or `{min_c: , max_c: }`
+        nozzle_temperature_c: [0, 300]
+        bed_temperature_c: [0, 110]
+        chamber_temperature_c: null
+      ams:
+        filament_forbidden: []       # e.g. [ABS, ASA] on an open-frame machine

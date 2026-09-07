@@ -15,6 +15,29 @@ class FakeMqttClient:
         return "01.08.00.00"
 
 
+class FakeTray:
+    n = 1
+    tray_type = "PLA"
+    tray_color = "#FF0000"
+    tray_weight = "1000"
+    tray_diameter = "1.75"
+    tray_temp = "220"
+    # Firmware types these as ints; the payload has also been seen carrying
+    # numeric strings, which is why the adapter coerces rather than casts.
+    nozzle_temp_min = 190
+    nozzle_temp_max = "240"
+
+
+class FakeAMS:
+    def __init__(self) -> None:
+        self.filament_trays = {1: FakeTray()}
+
+
+class FakeAmSHub:
+    def __init__(self) -> None:
+        self.ams_hub = {0: FakeAMS()}
+
+
 class FakePrinter:
     def __init__(self, host: str, access_code: str, serial: str) -> None:
         self.constructor_values = (host, access_code, serial)
@@ -70,6 +93,27 @@ class FakePrinter:
     def get_file_name(self) -> str:
         return "part.3mf"
 
+    def nozzle_type(self) -> str:
+        return "hardened_steel"
+
+    def nozzle_diameter(self) -> float:
+        return 0.4
+
+    def print_type(self) -> str:
+        return "local"
+
+    def wifi_signal(self) -> str:
+        return "-42"
+
+    def print_error_code(self) -> int:
+        return 0
+
+    def get_skipped_objects(self) -> list[int]:
+        return [3]
+
+    def ams_hub(self) -> FakeAmSHub:
+        return FakeAmSHub()
+
 
 def test_backend_starts_only_mqtt_and_builds_reading(monkeypatch) -> None:
     fake = FakePrinter("printer.invalid", "access-secret", "serial-secret")
@@ -96,3 +140,16 @@ def test_backend_starts_only_mqtt_and_builds_reading(monkeypatch) -> None:
     assert reading.gcode_state == "RUNNING"
     assert reading.progress_percent == 42
     assert reading.remaining_time_minutes == 18
+    assert reading.nozzle_type == "hardened_steel"
+    assert reading.nozzle_diameter == 0.4
+    assert reading.print_type == "local"
+    assert reading.wifi_signal == "-42"
+    assert reading.print_error_code == 0
+    assert reading.skipped_objects == [3]
+    assert reading.ams_trays is not None
+    assert reading.ams_trays[0].tray_type == "PLA"
+    assert reading.ams_trays[0].tray_index == 1
+    # The spool's own nozzle window, which the submission validator checks a
+    # model's configured temperature against.
+    assert reading.ams_trays[0].nozzle_temp_min == 190
+    assert reading.ams_trays[0].nozzle_temp_max == 240
