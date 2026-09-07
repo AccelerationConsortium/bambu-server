@@ -116,6 +116,10 @@ class SubmissionSettings(BaseModel):
     # enough to trust a motion-derived bounding box, so plate fit is reported
     # as not applicable rather than computed from a partial scan.
     scan_max_bytes: int = Field(default=64 * 1024 * 1024, ge=64 * 1024)
+    #: Age after which a *terminal* job's record is swept at startup. Jobs that
+    #: are still in play are never swept however old they are: a job stuck in
+    #: `validating` is a signal, not litter. Set to null to keep everything.
+    retain_terminal_days: float | None = Field(default=30.0, gt=0)
 
 
 class Settings(BaseModel):
@@ -142,6 +146,22 @@ class PrinterCredentials(BaseModel):
     host: SecretStr
     access_code: SecretStr
     serial: SecretStr
+
+
+#: Env var holding the secret the lab's Caddy edge presents on every proxied
+#: request. Set the *same* value here and in the edge's EnvironmentFile.
+EDGE_SECRET_ENV = "BAMBU_EDGE_SHARED_SECRET"
+
+
+def resolve_edge_secret() -> str | None:
+    """The shared secret that lets this service trust an injected identity.
+
+    Read from the environment, never from the YAML: it is a credential, and
+    `printers.local.yaml` is a config file people paste into issues. Absent
+    means no identity is ever trusted (see :mod:`bambu_server.identity`).
+    """
+
+    return (os.getenv(EDGE_SECRET_ENV) or "").strip() or None
 
 
 def resolve_credentials(printer: PrinterDefinition) -> PrinterCredentials:

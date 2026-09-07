@@ -15,6 +15,7 @@ commands.
 """
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -22,7 +23,17 @@ from pathlib import Path as PathLib
 from pathlib import PurePosixPath
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Path, Query, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -36,7 +47,9 @@ from .config import (
     Settings,
     load_settings,
     resolve_credentials,
+    resolve_edge_secret,
 )
+from .identity import Actor, actor_for, resolve_actor
 from .models import (
     PROTOCOL_VERSION,
     ComponentStatus,
@@ -59,6 +72,8 @@ from .submissions import (
     run_validation,
 )
 
+logger = logging.getLogger(__name__)
+
 BackendFactory = Callable[[PrinterDefinition, PrinterCredentials], PrinterBackend]
 
 #: Read size for streaming an upload to disk.
@@ -78,13 +93,16 @@ _MAGIC_PREFIXES: dict[str, bytes] = {"3mf": b"PK\x03\x04"}
 class ApprovalRequest(BaseModel):
     """Sign-off recorded against a queued submission.
 
-    ``approved_by`` is an opaque identifier, **not** an authenticated identity:
-    this service has no login, and access is gated at the network layer. It is
-    recorded in the job's history so the decision is attributable once a real
-    identity provider is wired in.
+    When the request arrives through the lab's authenticating edge, the
+    signed-in identity is used and this field is ignored — a signed-in person
+    must not be able to file a decision under someone else's name. Without a
+    verified identity it is an opaque label, and the job records which of the
+    two it got.
     """
 
-    approved_by: str = Field(min_length=1, max_length=120)
+    #: Optional: ignored when the edge supplies a verified identity, and
+    #: required only when it does not.
+    approved_by: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class CancellationRequest(BaseModel):
@@ -94,8 +112,24 @@ class CancellationRequest(BaseModel):
     is free text kept in the job's history so a withdrawal is explicable later.
     """
 
-    cancelled_by: str = Field(min_length=1, max_length=120)
+    cancelled_by: str | None = Field(default=None, min_length=1, max_length=120)
     reason: str | None = Field(default=None, max_length=500)
+
+
+class Whoami(BaseModel):
+    """Who the service thinks you are, for the page to render honestly.
+
+    The page shows a name field when nobody is verified and the signed-in user
+    when someone is; without this it would have to guess how it was deployed.
+    """
+
+    user: str | None = None
+    role: str | None = None
+    verified: bool = False
+    #: True when this deployment is capable of verifying an identity at all
+    #: (a secret is configured). Distinguishes "not signed in" from "this
+    #: service cannot tell who you are".
+    identity_available: bool = False
 
 
 def create_app(
@@ -107,11 +141,16 @@ def create_app(
     # One-slot holder rather than a module global: `create_app` may be called
     # more than once in a process (tests do), and each app owns its own store.
     stores: dict[str, SubmissionStore] = {}
+    # Resolved once at startup, not per request: it is a process-level
+    # credential, and re-reading the environment per call would let a later
+    # change silently alter who the service trusts mid-run.
+    secrets: dict[str, str | None] = {"edge": None}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         active_settings = settings or load_settings()
         app.state.settings = active_settings
+        secrets["edge"] = resolve_edge_secret()
         store = SubmissionStore(active_settings.submissions)
         await asyncio.to_thread(store.load)
         stores["default"] = store
@@ -162,6 +201,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="printer not configured")
         return monitor
 
+    def get_actor(request: Request) -> Actor:
+        """The caller, as far as the trusted edge will vouch for them."""
+
+        return resolve_actor(request.headers, edge_secret=secrets["edge"])
+
     def get_store() -> SubmissionStore:
         store = stores.get("default")
         if store is None:  # pragma: no cover - only outside the app lifespan
@@ -176,7 +220,13 @@ def create_app(
             printer_count=len(monitors),
         )
 
+    # Registered at both spellings on purpose. Behind an edge path prefix the
+    # canonical URL is `<prefix>/ui/`, and serving only `/ui` would make
+    # Starlette answer the trailing-slash form with a redirect to `/ui` --
+    # whose Location drops the prefix, landing the visitor on the dashboard.
+    # (The same trap the xArm's /web/ route documents in the edge config.)
     @app.get("/ui", response_class=HTMLResponse, include_in_schema=False, tags=["gateway"])
+    @app.get("/ui/", response_class=HTMLResponse, include_in_schema=False, tags=["gateway"])
     async def submission_ui() -> HTMLResponse:
         """The operator/submitter page.
 
@@ -227,6 +277,21 @@ def create_app(
             components=components,
             allowed_actions=[],
             details={"monitoring_only": True, "printer_count": len(monitors)},
+        )
+
+    @app.get("/whoami", response_model=Whoami, tags=["gateway"])
+    async def whoami(actor: Annotated[Actor, Depends(get_actor)]) -> Whoami:
+        """Report the caller's verified identity, if the edge supplied one.
+
+        Never echoes the shared secret, and says nothing a caller did not
+        already present.
+        """
+
+        return Whoami(
+            user=actor.user,
+            role=actor.role,
+            verified=actor.verified,
+            identity_available=secrets["edge"] is not None,
         )
 
     @app.get("/printers", response_model=list[PrinterSummary], tags=["gateway"])
@@ -316,8 +381,9 @@ def create_app(
     async def create_submission(
         store: Annotated[SubmissionStore, Depends(get_store)],
         file: Annotated[UploadFile, File(description="A .3mf or .gcode artifact")],
+        actor: Annotated[Actor, Depends(get_actor)],
         target_machine: Annotated[str, Form(max_length=120)],
-        requested_by: Annotated[str, Form(max_length=120)],
+        requested_by: Annotated[str | None, Form(max_length=120)] = None,
         material: Annotated[str | None, Form(max_length=60)] = None,
     ) -> SubmissionJob:
         """Accept a print artifact, validate it, and queue it if it passes.
@@ -326,6 +392,13 @@ def create_app(
         per-check verdict in the response; the file read happens on a worker
         thread so a large artifact does not stall the status poll loop.
         """
+
+        # A verified identity wins over the form field: a signed-in person must
+        # not be able to submit under someone else's name.
+        try:
+            owner, owner_verified = actor_for(actor, requested_by)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="requested_by is required") from exc
 
         monitor = monitors.get(target_machine)
         if monitor is None:
@@ -361,7 +434,8 @@ def create_app(
                 chunks=chunks(),
                 extension=extension,
                 target_machine=target_machine,
-                requested_by=requested_by,
+                requested_by=owner,
+                requested_by_verified=owner_verified,
                 material=material,
                 original_filename=file.filename or "",
             )
@@ -402,6 +476,7 @@ def create_app(
     )
     async def approve_submission(
         store: Annotated[SubmissionStore, Depends(get_store)],
+        actor: Annotated[Actor, Depends(get_actor)],
         submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
         approval: ApprovalRequest,
     ) -> SubmissionJob:
@@ -416,7 +491,11 @@ def create_app(
         if job is None:
             raise HTTPException(status_code=404, detail="unknown submission")
         try:
-            return await store.approve(job, approved_by=approval.approved_by)
+            who, verified = actor_for(actor, approval.approved_by)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="approved_by is required") from exc
+        try:
+            return await store.approve(job, approved_by=who, verified=verified)
         except InvalidTransition as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -427,6 +506,7 @@ def create_app(
     )
     async def cancel_submission(
         store: Annotated[SubmissionStore, Depends(get_store)],
+        actor: Annotated[Actor, Depends(get_actor)],
         submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
         cancellation: CancellationRequest,
     ) -> SubmissionJob:
@@ -441,15 +521,52 @@ def create_app(
         if job is None:
             raise HTTPException(status_code=404, detail="unknown submission")
         try:
+            who, verified = actor_for(actor, cancellation.cancelled_by)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="cancelled_by is required") from exc
+        try:
             return await store.cancel(
                 job,
-                cancelled_by=cancellation.cancelled_by,
+                cancelled_by=who,
                 reason=cancellation.reason,
+                verified=verified,
             )
         except InvalidTransition as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SubmissionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete(
+        "/submissions/{submission_id}",
+        status_code=204,
+        tags=["submissions"],
+    )
+    async def delete_submission(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        actor: Annotated[Actor, Depends(get_actor)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> None:
+        """Delete a finished job's record and artifact.
+
+        Retention housekeeping. Only a terminal job can be deleted: withdrawing
+        one that is still waiting is `cancel`, which leaves a record of the
+        decision, and deleting it instead would erase that along with the job.
+        """
+
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        try:
+            forgotten = await store.forget(job)
+        except InvalidTransition as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.info(
+            "Deleted submission %s (%s) on behalf of %s%s",
+            forgotten.submission_id,
+            forgotten.state,
+            actor.user or "an unidentified caller",
+            " (verified)" if actor.verified else "",
+        )
 
     return app
 
