@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -377,3 +378,115 @@ def test_cancellation_can_never_reach_a_dispatched_job() -> None:
     assert CANCELLABLE_STATES == {"queued", "approved"}
     for state in ("dispatching", "running", "finished", "failed", "rejected"):
         assert "cancelled" not in ALLOWED_TRANSITIONS[state]
+
+
+# --- retention ---------------------------------------------------------------
+
+
+def test_terminal_states_are_derived_from_the_transition_table() -> None:
+    """A state added to the table cannot be forgotten in the retention set."""
+    from bambu_server.submissions import ALLOWED_TRANSITIONS, TERMINAL_STATES
+
+    assert TERMINAL_STATES == {"rejected", "finished", "failed", "cancelled"}
+    for state in TERMINAL_STATES:
+        assert ALLOWED_TRANSITIONS[state] == frozenset()
+    for state in set(ALLOWED_TRANSITIONS) - TERMINAL_STATES:
+        assert ALLOWED_TRANSITIONS[state], state
+
+
+async def test_only_a_finished_job_can_be_deleted(
+    store: SubmissionStore, profile: MachineProfile
+) -> None:
+    job = await run_validation(store, await _accept(store), profile)
+
+    with pytest.raises(InvalidTransition, match="only a finished submission"):
+        await store.forget(job)
+
+    cancelled = await store.cancel(job, cancelled_by="operator")
+    forgotten = await store.forget(cancelled)
+
+    assert forgotten.submission_id == job.submission_id
+    assert store.get(job.submission_id) is None
+    assert not (store.root / f"{job.submission_id}.json").exists()
+
+
+async def test_deleting_removes_a_leftover_artifact_too(
+    store: SubmissionStore, profile: MachineProfile
+) -> None:
+    """A rejected job keeps its artifact; deleting the record must not orphan it."""
+    body = SAMPLE_GCODE.replace("; nozzle_diameter = 0.4", "; nozzle_diameter = 0.6")
+    job = await run_validation(store, await _accept(store, body.encode()), profile)
+    path = store.artifact_path(job)
+    assert job.state == "rejected"
+    assert path.exists()
+
+    await store.forget(job)
+
+    assert not path.exists()
+    assert list(store.root.iterdir()) == []
+
+
+async def test_expired_terminal_records_are_swept_at_startup(
+    store: SubmissionStore, profile: MachineProfile, tmp_path: Path
+) -> None:
+    job = await run_validation(store, await _accept(store), profile)
+    cancelled = await store.cancel(job, cancelled_by="operator")
+
+    # Backdate the record past the window, as an old job on disk would be.
+    stale = cancelled.model_copy(
+        update={"updated_at": datetime.now(UTC) - timedelta(days=40)}
+    )
+    (store.root / f"{job.submission_id}.json").write_text(
+        stale.model_dump_json(), encoding="utf-8"
+    )
+
+    reopened = SubmissionStore(
+        SubmissionSettings(directory=tmp_path / "submissions", retain_terminal_days=30)
+    )
+    reopened.load()
+
+    assert reopened.get(job.submission_id) is None
+    assert list((tmp_path / "submissions").iterdir()) == []
+
+
+async def test_a_job_still_in_play_is_never_swept_however_old(
+    store: SubmissionStore, profile: MachineProfile, tmp_path: Path
+) -> None:
+    """A job stuck mid-pipeline is a signal, not litter."""
+    job = await run_validation(store, await _accept(store), profile)
+    stale = job.model_copy(
+        update={"updated_at": datetime.now(UTC) - timedelta(days=400)}
+    )
+    (store.root / f"{job.submission_id}.json").write_text(
+        stale.model_dump_json(), encoding="utf-8"
+    )
+
+    reopened = SubmissionStore(
+        SubmissionSettings(directory=tmp_path / "submissions", retain_terminal_days=1)
+    )
+    reopened.load()
+
+    assert reopened.get(job.submission_id) is not None
+    assert reopened.get(job.submission_id).state == "queued"
+
+
+async def test_retention_can_be_disabled(
+    store: SubmissionStore, profile: MachineProfile, tmp_path: Path
+) -> None:
+    job = await run_validation(store, await _accept(store), profile)
+    cancelled = await store.cancel(job, cancelled_by="operator")
+    stale = cancelled.model_copy(
+        update={"updated_at": datetime.now(UTC) - timedelta(days=4000)}
+    )
+    (store.root / f"{job.submission_id}.json").write_text(
+        stale.model_dump_json(), encoding="utf-8"
+    )
+
+    reopened = SubmissionStore(
+        SubmissionSettings(
+            directory=tmp_path / "submissions", retain_terminal_days=None
+        )
+    )
+    reopened.load()
+
+    assert reopened.get(job.submission_id) is not None

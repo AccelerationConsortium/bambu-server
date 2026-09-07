@@ -284,7 +284,8 @@ def test_the_pipeline_exposes_no_control_routes_and_no_dispatch(
     assert not any("dispatch" in path for path in paths)
     for path, operations in paths.items():
         for method in operations:
-            assert method.lower() in {"get", "post"}, (path, method)
+            # delete exists only for retention housekeeping on finished jobs.
+            assert method.lower() in {"get", "post", "delete"}, (path, method)
 
 
 def test_reads_never_cause_printer_io(client: TestClient, backend: FakeBackend) -> None:
@@ -575,3 +576,30 @@ def test_the_ui_is_served_at_both_slash_spellings(client: TestClient) -> None:
         response = client.get(path, follow_redirects=False)
         assert response.status_code == 200, path
         assert "<title>Submit a print" in response.text
+
+
+def test_a_finished_job_can_be_deleted_over_http(client: TestClient) -> None:
+    created = _upload(client).json()
+    sid = created["submission_id"]
+    client.post(f"/submissions/{sid}/cancel", json={"cancelled_by": "lab-operator"})
+
+    response = client.delete(f"/submissions/{sid}")
+
+    assert response.status_code == 204
+    assert client.get(f"/submissions/{sid}").status_code == 404
+    assert client.get("/submissions").json() == []
+
+
+def test_a_waiting_job_cannot_be_deleted(client: TestClient) -> None:
+    """Withdrawing a queued job is `cancel`, which leaves a record."""
+    created = _upload(client).json()
+
+    response = client.delete(f"/submissions/{created['submission_id']}")
+
+    assert response.status_code == 409
+    assert "only a finished submission" in response.json()["detail"]
+    assert client.get(f"/submissions/{created['submission_id']}").status_code == 200
+
+
+def test_deleting_an_unknown_submission_is_404(client: TestClient) -> None:
+    assert client.delete("/submissions/" + "0" * 32).status_code == 404

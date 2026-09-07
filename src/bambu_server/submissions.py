@@ -27,7 +27,7 @@ import os
 import re
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, NoReturn
 
@@ -86,6 +86,12 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "rejected": frozenset(),
     "cancelled": frozenset(),
 }
+
+#: States with nowhere left to go. Derived from the transition table rather
+#: than listed again, so a state added there cannot be forgotten here.
+TERMINAL_STATES: frozenset[str] = frozenset(
+    state for state, onward in ALLOWED_TRANSITIONS.items() if not onward
+)
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -223,7 +229,13 @@ class SubmissionStore:
         return self._settings
 
     def load(self) -> None:
-        """Read persisted jobs from disk. Called once at startup."""
+        """Read persisted jobs from disk, then sweep expired ones.
+
+        Called once at startup. Sweeping here rather than on a timer keeps the
+        store's on-disk and in-memory views identical: a record removed while
+        the process runs would linger in memory until a restart, which is the
+        divergence that made manual cleanup necessary in the first place.
+        """
 
         self._root.mkdir(parents=True, exist_ok=True)
         for path in sorted(self._root.glob("*.json")):
@@ -235,7 +247,36 @@ class SubmissionStore:
                 logger.warning("Ignoring unreadable submission record %s", path.name)
                 continue
             self._jobs[job.submission_id] = job
-        logger.info("Loaded %d submission(s) from %s", len(self._jobs), self._root)
+        swept = self._sweep_expired()
+        logger.info(
+            "Loaded %d submission(s) from %s (%d expired record(s) swept)",
+            len(self._jobs),
+            self._root,
+            swept,
+        )
+
+    def _sweep_expired(self) -> int:
+        """Drop terminal records past the retention window."""
+
+        retain_days = self._settings.retain_terminal_days
+        if retain_days is None:
+            return 0
+        cutoff = datetime.now(UTC) - timedelta(days=retain_days)
+        expired = [
+            job
+            for job in self._jobs.values()
+            if job.state in TERMINAL_STATES and job.updated_at < cutoff
+        ]
+        for job in expired:
+            self._forget(job)
+        return len(expired)
+
+    def _forget(self, job: SubmissionJob) -> None:
+        """Remove a job's record and any artifact still on disk."""
+
+        self.artifact_path(job).unlink(missing_ok=True)
+        (self._root / f"{job.submission_id}.json").unlink(missing_ok=True)
+        self._jobs.pop(job.submission_id, None)
 
     # -- reads -------------------------------------------------------------
 
@@ -453,6 +494,25 @@ class SubmissionStore:
             return await self._transition_locked(
                 current.submission_id, "cancelled", note
             )
+
+    async def forget(self, job: SubmissionJob) -> SubmissionJob:
+        """Delete a terminal job's record and artifact.
+
+        Retention housekeeping, not a workflow step: only a job that has
+        finished going anywhere can be forgotten. Withdrawing one that is still
+        waiting is :meth:`cancel`, which leaves an auditable record -- deleting
+        it instead would erase the decision along with the job.
+        """
+
+        async with self._lock:
+            current = self._require(job.submission_id)
+            if current.state not in TERMINAL_STATES:
+                raise InvalidTransition(
+                    f"only a finished submission can be deleted; "
+                    f"{current.submission_id} is {current.state}"
+                )
+            await asyncio.to_thread(self._forget, current)
+            return current
 
     # -- internals ---------------------------------------------------------
 

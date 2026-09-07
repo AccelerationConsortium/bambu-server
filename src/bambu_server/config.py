@@ -116,6 +116,10 @@ class SubmissionSettings(BaseModel):
     # enough to trust a motion-derived bounding box, so plate fit is reported
     # as not applicable rather than computed from a partial scan.
     scan_max_bytes: int = Field(default=64 * 1024 * 1024, ge=64 * 1024)
+    #: Age after which a *terminal* job's record is swept at startup. Jobs that
+    #: are still in play are never swept however old they are: a job stuck in
+    #: `validating` is a signal, not litter. Set to null to keep everything.
+    retain_terminal_days: float | None = Field(default=30.0, gt=0)
 
 
 class Settings(BaseModel):

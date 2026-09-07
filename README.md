@@ -105,6 +105,7 @@ Submission pipeline routes:
 | GET | `/submissions/{submission_id}` | One job with its verdict and history |
 | POST | `/submissions/{submission_id}/approve` | Record sign-off on a queued job |
 | POST | `/submissions/{submission_id}/cancel` | Withdraw a waiting job from the queue |
+| DELETE | `/submissions/{submission_id}` | Delete a finished job's record (retention) |
 
 No `/control/*` routes exist, and no route dispatches a print.
 
@@ -330,6 +331,8 @@ cookie cannot be shared with this gateway on its own address, because raw
 Suffix List, so browsers drop tailnet-wide cookies. One origin behind the edge
 means one login (see `ac-organic-lab/docs/AUTH_DESIGN.md`).
 
+**Deploying it: [`docs/EDGE_DEPLOY.md`](docs/EDGE_DEPLOY.md).**
+
 The route lives in `ac-organic-lab/deploy/Caddyfile.single-edge` as `/bambu/*`,
 gated by `forward_auth` and injecting the identity described above; the dashboard
 frames `/bambu/ui/` under Utils → 3D Printers. Once that route is live the
@@ -339,6 +342,25 @@ service's bind can go back to loopback, closing the unauthenticated
 Note the page answers at both `/ui` and `/ui/`. Serving only one would make
 Starlette redirect between them with a `Location` that drops the edge prefix,
 landing the visitor on the dashboard.
+
+### Retention
+
+Terminal records (`rejected`, `finished`, `failed`, `cancelled`) are swept at
+startup once older than `submissions.retain_terminal_days` (30 by default; set
+it to null to keep everything). A job that is **still in play is never swept**,
+however old — one stuck in `validating` is a signal, not litter. The set of
+terminal states is derived from the transition table rather than listed twice,
+so a state added there cannot be missed here.
+
+`DELETE /submissions/{id}` removes one finished job's record and artifact
+immediately. Only a terminal job can be deleted: withdrawing one that is still
+waiting is `cancel`, which leaves a record of the decision — deleting it would
+erase that along with the job.
+
+Sweeping happens at startup rather than on a timer so the store's on-disk and
+in-memory views stay identical. A record removed underneath a running process
+lingers in memory until a restart, which is exactly the divergence that made
+hand-cleanup necessary before this existed.
 
 ### Cancelling
 

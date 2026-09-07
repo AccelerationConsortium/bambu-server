@@ -15,6 +15,7 @@ commands.
 """
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -70,6 +71,8 @@ from .submissions import (
     SubmissionStore,
     run_validation,
 )
+
+logger = logging.getLogger(__name__)
 
 BackendFactory = Callable[[PrinterDefinition, PrinterCredentials], PrinterBackend]
 
@@ -532,6 +535,38 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SubmissionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete(
+        "/submissions/{submission_id}",
+        status_code=204,
+        tags=["submissions"],
+    )
+    async def delete_submission(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        actor: Annotated[Actor, Depends(get_actor)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> None:
+        """Delete a finished job's record and artifact.
+
+        Retention housekeeping. Only a terminal job can be deleted: withdrawing
+        one that is still waiting is `cancel`, which leaves a record of the
+        decision, and deleting it instead would erase that along with the job.
+        """
+
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        try:
+            forgotten = await store.forget(job)
+        except InvalidTransition as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.info(
+            "Deleted submission %s (%s) on behalf of %s%s",
+            forgotten.submission_id,
+            forgotten.state,
+            actor.user or "an unidentified caller",
+            " (verified)" if actor.verified else "",
+        )
 
     return app
 

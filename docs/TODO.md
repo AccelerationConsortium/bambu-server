@@ -82,9 +82,12 @@ Open, from the design's §10 data gaps and what the build surfaced:
   It is legal only from `queued` / `approved`, never for a dispatched job —
   aborting a print stays a control-plane action. Worth folding back into
   `SUBMISSION_PIPELINE_DESIGN.md` §5 when that doc is next revised.
-- No retention policy: rejected and finished jobs, and their uploaded artifacts,
-  stay on disk and in `GET /submissions` indefinitely. Fine at current volume,
-  but it needs a sweep before this runs unattended for long.
+- ~~No retention policy~~ — done. Terminal records are swept at startup past
+  `submissions.retain_terminal_days` (30 default, null disables), and
+  `DELETE /submissions/{id}` removes one finished job immediately. A job still
+  in play is never swept however old. Sweeping at startup rather than on a
+  timer keeps on-disk and in-memory views identical — the divergence that
+  forced hand-cleanup during bring-up.
 
 ## Submission page
 
@@ -143,7 +146,7 @@ until the gateway pushes to `/api/ingest/events`.
 ## Test suite
 
 - `uv run ruff check .` passes.
-- `uv run pytest -q` passes all 152 tests, including the FastAPI API tests and
+- `uv run pytest -q` passes all 161 tests, including the FastAPI API tests and
   the submission pipeline (artifact inspection, validation, store/state machine,
   queue ETA, HTTP surface). Tests build their own `.3mf` and `.gcode` fixtures
   and use fake backends; nothing touches hardware.
