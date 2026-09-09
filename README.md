@@ -150,8 +150,18 @@ null or empty sentinel):
 - `skipped_objects` — object indices skipped in the current job.
 - `ams_trays` — loaded AMS filament inventory: per-tray `tray_type`,
   `tray_color`, `tray_weight`, `tray_diameter`, `tray_temp`, and the spool's own
-  `nozzle_temp_min` / `nozzle_temp_max` window. Tray/tag UUIDs are intentionally
-  not surfaced (identifiers, not inventory).
+  `nozzle_temp_min` / `nozzle_temp_max` window, and `remaining_percent` (null
+  when unreported). `ams_unit_ids` preserves units with no loaded filament.
+  Unit/tray IDs are the inventory address; `tray_index` is retained as null
+  for compatibility, because the MQTT `n` field is not a slot index.
+  Tray/tag UUIDs are intentionally not surfaced (identifiers, not inventory).
+
+AMS inventory is decoded from the MQTT client's cache without the library's
+hub conversion: optional `ams_exist_bits`, `n`, and spool-tag fields must not
+be required to recognize a loaded tray. Unknown inventory is distinct from a
+known empty list. The submission page shows each reported tray and remaining
+percentage, including AMS-HT units. Percentages are printer estimates; missing
+estimates are never replaced with a guessed full spool.
 
 These are best-effort: a failure in any one getter is isolated, and the core
 `activity`/state decision never depends on them.
@@ -202,7 +212,7 @@ whose live field is blank — a dual-nozzle H2D reports no parsable nozzle type.
 |---|---|
 | `machine_compatible` | sliced for another printer, or a nozzle diameter/type the machine does not have |
 | `material_allowed` | the filament is on the machine's forbidden list, or the request's declared material contradicts the sliced one |
-| `material_filament_match` | no loaded AMS tray holds the model's filament |
+| `material_filament_match` | any required material has no matching loaded AMS tray |
 | `nozzle_temp_in_band` | the configured **or commanded** nozzle temperature is outside the machine's limit or the loaded filament's window |
 | `bed_chamber_temp_in_band` | the bed temperature is out of band, or a heated chamber is requested on a machine without one |
 | `build_fits_plate` | the model's XY footprint exceeds the declared plate |
@@ -212,14 +222,18 @@ whose live field is blank — a dual-nozzle H2D reports no parsable nozzle type.
 One failing check rejects the submission, and rejection is terminal.
 
 A check whose inputs do not exist reports **`not_applicable`**, with the reason,
-and is never reported as a pass. That distinction is the point of the shape: the
-live printers currently report no AMS tray inventory, so the filament checks
-honestly say "not compared" instead of quietly approving. Declaring `limits` and
+and is never reported as a pass. Unknown AMS inventory is reported as "not
+compared"; known empty inventory fails the material check. Declaring `limits` and
 `bed_size_mm` in the profile is what turns those checks on — there are no
 built-in defaults, because a guessed limit is a fabricated machine fact.
 
 The gcode scan is explicitly a **heuristic**, and the passing detail says so. It
 is not a proof of safety.
+
+Material matching is not a dispatch mapping: per-filament slot selection,
+per-slot temperature checks, sufficient quantity, and revalidation at dispatch
+remain prerequisites for the future control plane. The current approval flag
+does not establish those guarantees or enable printer execution.
 
 ### What is read from an artifact
 

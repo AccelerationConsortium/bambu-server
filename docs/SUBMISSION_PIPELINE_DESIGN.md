@@ -206,9 +206,10 @@ state-machine preconditions (§6 of the contract) and the approval decision:
 
 ## 10. Data gaps the implementer will hit
 
-- **`ams_trays` is currently `None` on both live printers.** The material/filament
-  checks (#3, #4) are only real once the library parses trays. Either wire a
-  tray parser or mark those checks `info` (non-blocking) until data exists.
+- **AMS parsing is implemented in the gateway.** Optional presence bits,
+  calibration fields and incomplete spool tags no longer suppress inventory.
+  Unknown inventory still makes checks non-blocking at intake; dispatch must
+  require fresh, complete material mapping and validation under its claim.
 - **`nozzle_type` is `None` on H2D** (library enum can't parse a dual-nozzle
   report). The profile should carry nozzle config explicitly so machine checks
   (#1) don't depend on a blank live field.

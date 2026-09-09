@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +32,7 @@ class AmsTrayReading:
     # temperature against this window.
     nozzle_temp_min: int | None = None
     nozzle_temp_max: int | None = None
+    remaining_percent: int | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class PrinterReading:
     print_error_code: int | None = None
     skipped_objects: list[int] | None = None
     ams_trays: list[AmsTrayReading] | None = None
+    ams_unit_ids: list[int] | None = None
 
 
 class AdvancedReading(TypedDict):
@@ -71,6 +74,7 @@ class AdvancedReading(TypedDict):
     print_error_code: int | None
     skipped_objects: list[int] | None
     ams_trays: list[AmsTrayReading] | None
+    ams_unit_ids: list[int] | None
 
 
 class PrinterBackend(Protocol):
@@ -90,7 +94,10 @@ def _optional_int(value: object) -> int | None:
     """
 
     number = _number(value)
-    return int(number) if number is not None else None
+    if number is None or not math.isfinite(number):
+        return None
+    integer = int(number)
+    return integer if integer == number else None
 
 
 def _number(value: object) -> int | float | None:
@@ -186,6 +193,7 @@ class BambuLabsBackend:
             "print_error_code": None,
             "skipped_objects": None,
             "ams_trays": None,
+            "ams_unit_ids": None,
         }
 
         try:
@@ -219,40 +227,67 @@ class BambuLabsBackend:
         except Exception:
             pass
 
-        values["ams_trays"] = self._read_ams_trays()
+        values["ams_unit_ids"], values["ams_trays"] = self._read_ams_inventory()
         return values
 
-    def _read_ams_trays(self) -> list[AmsTrayReading] | None:
-        """Read loaded AMS tray inventory. Returns ``None`` on any failure so a
-        malformed AMS payload cannot take down the poll. Tray UUIDs and tag
-        UIDs are intentionally not surfaced (identifiers, not inventory)."""
+    def _read_ams_inventory(self) -> tuple[list[int] | None, list[AmsTrayReading] | None]:
+        """Decode only allowlisted fields from the MQTT client's local cache.
+
+        The 2.6.6 hub conversion requires ``ams_exist_bits`` and truthy ``n``;
+        these optional fields are absent on some printers. ``n`` is not a slot
+        address. Explicit unit/tray IDs identify inventory, including HT units.
+        No getter that requests a refresh is called here, and no raw payload
+        or spool identifiers escape the adapter.
+        """
         try:
-            hub = self._printer.ams_hub()
-        except Exception:
-            return None
-        trays: list[AmsTrayReading] = []
-        try:
-            for ams_id, ams in hub.ams_hub.items():
-                for tray_id, tray in ams.filament_trays.items():
-                    index = getattr(tray, "n", None)
+            payload = self._printer.mqtt_client.dump().get("print", {}).get("ams")
+            if not isinstance(payload, dict) or not isinstance(payload.get("ams"), list):
+                return None, None
+            unit_ids: list[int] = []
+            trays: list[AmsTrayReading] = []
+            for unit in payload["ams"]:
+                ams_id = _optional_int(unit.get("id"))
+                if ams_id is None or ams_id < 0 or ams_id in unit_ids:
+                    return None, None
+                unit_ids.append(ams_id)
+                unit_trays = unit.get("tray")
+                if not isinstance(unit_trays, list):
+                    return None, None
+                seen: set[int] = set()
+                for tray in unit_trays:
+                    tray_id = _optional_int(tray.get("id"))
+                    if tray_id is None or tray_id < 0 or tray_id in seen:
+                        return None, None
+                    seen.add(tray_id)
+                    material = _tray_text(tray.get("tray_type"))
+                    # An id-only slot is empty; optional calibration/spool-tag
+                    # fields are not evidence that filament is loaded.
+                    if material is None:
+                        continue
+                    remaining = _optional_int(tray.get("remain"))
                     trays.append(
                         AmsTrayReading(
-                            ams_id=int(ams_id),
-                            tray_id=int(tray_id),
-                            tray_index=index if index is not None else None,
-                            tray_type=getattr(tray, "tray_type", None) or None,
-                            tray_color=getattr(tray, "tray_color", None) or None,
-                            tray_weight=getattr(tray, "tray_weight", None) or None,
-                            tray_diameter=getattr(tray, "tray_diameter", None) or None,
-                            tray_temp=getattr(tray, "tray_temp", None) or None,
-                            nozzle_temp_min=_optional_int(
-                                getattr(tray, "nozzle_temp_min", None)
-                            ),
-                            nozzle_temp_max=_optional_int(
-                                getattr(tray, "nozzle_temp_max", None)
+                            ams_id=ams_id,
+                            tray_id=tray_id,
+                            tray_type=material,
+                            tray_color=_tray_text(tray.get("tray_color")),
+                            tray_weight=_tray_text(tray.get("tray_weight")),
+                            tray_diameter=_tray_text(tray.get("tray_diameter")),
+                            tray_temp=_tray_text(tray.get("tray_temp")),
+                            nozzle_temp_min=_optional_int(tray.get("nozzle_temp_min")),
+                            nozzle_temp_max=_optional_int(tray.get("nozzle_temp_max")),
+                            remaining_percent=(
+                                remaining if remaining is not None and 0 <= remaining <= 100
+                                else None
                             ),
                         )
                     )
-        except Exception:
-            return None
-        return trays or None
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None, None
+        return unit_ids, trays
+
+
+def _tray_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None

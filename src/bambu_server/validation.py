@@ -176,10 +176,12 @@ def _check_material_filament_match(
     materials: tuple[str, ...],
     trays: list[LoadedTray],
     matched: list[LoadedTray],
+    *,
+    inventory_known: bool = False,
 ) -> CheckResult:
-    if not trays:
+    if not trays and not inventory_known:
         # STATUS_SPEC-conformant telemetry does not always carry AMS trays, and
-        # both live printers currently report none. Recorded, never assumed.
+        # inventory can be unavailable. Recorded, never assumed.
         return _skipped(
             "material_filament_match",
             "no AMS tray inventory is reported by this printer, so the loaded "
@@ -189,12 +191,15 @@ def _check_material_filament_match(
         return _skipped(
             "material_filament_match", "the model declares no filament type to match"
         )
-    if matched:
+    missing = sorted(set(materials) - {
+        tray.tray_type.strip().upper() for tray in matched if tray.tray_type
+    })
+    if not missing:
         return _passed(
             "material_filament_match",
-            f"{matched[0].label} matches the model's {', '.join(materials)}",
+            f"Loaded trays match all model materials: {', '.join(materials)}",
         )
-    loaded = ", ".join(sorted({tray.tray_type or "unknown" for tray in trays}))
+    loaded = ", ".join(sorted({tray.tray_type or "unknown" for tray in trays})) or "no filament"
     return _failed(
         "material_filament_match",
         f"the model needs {', '.join(materials)} but the loaded trays hold {loaded}",
@@ -400,7 +405,10 @@ def validate_model(
     checks = [
         _check_machine_compatible(facts, profile),
         _check_material_allowed(materials, requested_material, profile),
-        _check_material_filament_match(materials, trays, matched),
+        _check_material_filament_match(
+            materials, trays, matched,
+            inventory_known=profile.observed.ams_unit_ids is not None,
+        ),
         _check_nozzle_temp_in_band(facts, profile, matched),
         _check_bed_chamber_temp_in_band(facts, profile),
         _check_build_fits_plate(facts, profile),

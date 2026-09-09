@@ -198,6 +198,7 @@ def test_status_surfaces_advanced_telemetry(client: TestClient) -> None:
     assert details["wifi_signal"] == "-42"
     assert details["print_error_code"] == 0
     assert details["skipped_objects"] == [3]
+    assert details["ams_unit_ids"] == [0]
     assert details["ams_trays"] == [
         {
             "ams_id": 0,
@@ -210,6 +211,7 @@ def test_status_surfaces_advanced_telemetry(client: TestClient) -> None:
             "tray_temp": "220",
             "nozzle_temp_min": 190,
             "nozzle_temp_max": 240,
+            "remaining_percent": None,
         }
     ]
     # No AMS UUIDs or raw telemetry identifiers leak through.

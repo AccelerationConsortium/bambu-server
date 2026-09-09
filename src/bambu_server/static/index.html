@@ -199,7 +199,26 @@ function renderSpecs(profile) {
   const forbidden = (profile.ams && profile.ams.filament_forbidden) || [];
   if (forbidden.length) chips.push("not runnable: " + forbidden.join(", "));
   const trays = (profile.observed && profile.observed.loaded_trays) || [];
-  chips.push(trays.length ? trays.length + " AMS tray(s) loaded" : "no AMS inventory reported");
+  const units = profile.observed && profile.observed.ams_unit_ids;
+  chips.push(trays.length ? trays.length + " AMS tray(s) loaded" :
+    (units ? "no loaded AMS filament reported" : "no AMS inventory reported"));
+  for (const tray of trays) {
+    const unit = tray.ams_id;
+    const location = unit >= 0 && unit < 26 ?
+      String.fromCharCode(65 + unit) + (tray.tray_id + 1) :
+      (unit >= 128 && unit < 154 ? "HT " + String.fromCharCode(97 + unit - 128) :
+        "AMS " + unit + " tray " + tray.tray_id);
+    const color = tray.tray_color ? " · #" + tray.tray_color.replace(/^#/, "") : "";
+    const remaining = tray.remaining_percent === null || tray.remaining_percent === undefined ?
+      " · remaining unknown" : " · " + tray.remaining_percent + "% remaining";
+    chips.push(location + ": " + (tray.tray_type || "unknown") + color + remaining);
+  }
+  for (const unit of units || []) {
+    if (!trays.some(tray => tray.ams_id === unit)) {
+      const name = unit >= 0 && unit < 26 ? String.fromCharCode(65 + unit) : String(unit);
+      chips.push("AMS " + name + ": no loaded filament reported");
+    }
+  }
   for (const text of chips) specs.append(el("span", text, "chip"));
   for (const warning of profile.warnings || []) specs.append(el("span", "⚠ " + warning, "chip"));
 }

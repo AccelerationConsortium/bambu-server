@@ -45,6 +45,7 @@ class LoadedTray(BaseModel):
     tray_color: str | None = None
     nozzle_temp_min_c: int | None = None
     nozzle_temp_max_c: int | None = None
+    remaining_percent: int | None = None
 
     @property
     def label(self) -> str:
@@ -59,6 +60,7 @@ class ObservedMachineState(BaseModel):
     nozzle_type: str | None = None
     nozzle_diameter_mm: float | None = None
     loaded_trays: list[LoadedTray] = Field(default_factory=list)
+    ams_unit_ids: list[int] | None = None
 
     @classmethod
     def from_reading(cls, reading: PrinterReading | None) -> ObservedMachineState:
@@ -68,6 +70,7 @@ class ObservedMachineState(BaseModel):
             telemetry_ok=True,
             nozzle_type=reading.nozzle_type,
             nozzle_diameter_mm=reading.nozzle_diameter,
+            ams_unit_ids=reading.ams_unit_ids,
             loaded_trays=[
                 LoadedTray(
                     ams_id=tray.ams_id,
@@ -77,6 +80,7 @@ class ObservedMachineState(BaseModel):
                     tray_color=tray.tray_color,
                     nozzle_temp_min_c=tray.nozzle_temp_min,
                     nozzle_temp_max_c=tray.nozzle_temp_max,
+                    remaining_percent=tray.remaining_percent,
                 )
                 for tray in (reading.ams_trays or [])
             ],

@@ -143,6 +143,7 @@ def reading() -> PrinterReading:
         wifi_signal="-42",
         print_error_code=0,
         skipped_objects=[3],
+        ams_unit_ids=[0],
         ams_trays=[
             AmsTrayReading(
                 ams_id=0,

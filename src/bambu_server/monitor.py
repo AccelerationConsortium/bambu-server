@@ -143,6 +143,12 @@ class PrinterMonitor:
         never cause printer I/O.
         """
 
+        if (
+            self._monitor_error_type is not None
+            or self._reading is None
+            or self._is_stale(self._reading, datetime.now(UTC))
+        ):
+            return ObservedMachineState()
         return ObservedMachineState.from_reading(self._reading)
 
     def profile(self) -> MachineProfile:
@@ -223,7 +229,9 @@ class PrinterMonitor:
             for key, value in advanced.items():
                 if value is not None and value != []:
                     details[key] = value
-            if reading.ams_trays:
+            if reading.ams_unit_ids is not None:
+                details["ams_unit_ids"] = reading.ams_unit_ids
+            if reading.ams_trays is not None:
                 details["ams_trays"] = [
                     {
                         "ams_id": tray.ams_id,
@@ -236,6 +244,7 @@ class PrinterMonitor:
                         "tray_temp": tray.tray_temp,
                         "nozzle_temp_min": tray.nozzle_temp_min,
                         "nozzle_temp_max": tray.nozzle_temp_max,
+                        "remaining_percent": tray.remaining_percent,
                     }
                     for tray in reading.ams_trays
                 ]

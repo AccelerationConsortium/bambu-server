@@ -63,10 +63,12 @@ recommendation:
 
 Open, from the design's §10 data gaps and what the build surfaced:
 
-- `ams_trays` is still `None` on both live printers, so `material_filament_match`
-  and the tray half of `nozzle_temp_in_band` report `not_applicable`. The
-  backend now reads each tray's `nozzle_temp_min` / `nozzle_temp_max`, so both
-  checks become real the moment tray data appears — no code change needed.
+- AMS parsing now uses allowlisted cached MQTT fields, without the library's
+  required presence bits / `n` / complete spool-tag assumptions. Empty units,
+  HT IDs, and remaining percentages are preserved. Material matching requires
+  every material; known empty inventory fails rather than skipping the check.
+  Still needed before dispatch: explicit per-filament tray mapping, per-slot
+  temperature and quantity checks, and fresh revalidation under a claim.
 - Machine profiles must be filled in per printer in `printers.local.yaml`
   (`bed_size_mm`, `limits`, `ams.filament_forbidden`). Until they are, the
   checks that need them report `not_applicable` rather than passing.
@@ -157,7 +159,7 @@ until the gateway pushes to `/api/ingest/events`.
 ## Test suite
 
 - `uv run ruff check .` passes.
-- `uv run pytest -q` passes all 161 tests, including the FastAPI API tests and
+- `uv run pytest -q` covers the FastAPI API tests and
   the submission pipeline (artifact inspection, validation, store/state machine,
   queue ETA, HTTP surface). Tests build their own `.3mf` and `.gcode` fixtures
   and use fake backends; nothing touches hardware.

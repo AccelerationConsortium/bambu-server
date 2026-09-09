@@ -145,6 +145,23 @@ def test_a_loaded_tray_that_does_not_match_is_rejected() -> None:
     assert "loaded trays hold PETG" in _check(verdict, "material_filament_match").detail
 
 
+def test_every_requested_material_must_be_loaded() -> None:
+    profile = _profile(observed=ObservedMachineState(
+        telemetry_ok=True,
+        loaded_trays=[LoadedTray(ams_id=0, tray_id=0, tray_type="PLA")],
+    ))
+    verdict = _run(_facts(filament_types=("PLA", "PETG")), profile)
+    assert "material_filament_match" in verdict.reasons
+
+
+def test_known_empty_ams_inventory_cannot_satisfy_material_check() -> None:
+    profile = _profile(observed=ObservedMachineState(
+        telemetry_ok=True, ams_unit_ids=[0], loaded_trays=[],
+    ))
+    assert "material_filament_match" in _run(_facts(), profile).reasons
+
+
+
 def test_nozzle_temperature_is_checked_against_the_loaded_filament() -> None:
     profile = _profile(
         observed=ObservedMachineState(

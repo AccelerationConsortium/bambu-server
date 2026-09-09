@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from bambu_server.backend import PrinterReading
+from bambu_server.backend import AmsTrayReading, PrinterReading
 from bambu_server.config import PrinterDefinition
 from bambu_server.monitor import PrinterMonitor
 
@@ -44,6 +44,26 @@ async def test_activity_since_is_null_until_a_transition_is_observed() -> None:
     assert status.equipment_status == "busy"
     assert status.activity == "running"
     assert status.activity_since is None
+
+
+async def test_profile_withholds_stale_or_failed_inventory() -> None:
+    from dataclasses import replace
+
+    reading = replace(_reading("IDLE"), ams_unit_ids=[0], ams_trays=[
+        AmsTrayReading(ams_id=0, tray_id=0, tray_type="PLA", remaining_percent=37)
+    ])
+    backend = FakeBackend(reading)
+    monitor = _monitor(backend)
+    await monitor._collect_once()
+    assert monitor.observed().loaded_trays[0].remaining_percent == 37
+    assert monitor.observed().ams_unit_ids == [0]
+    monitor._monitor_error_type = "RuntimeError"
+    assert not monitor.observed().telemetry_ok
+    assert not monitor.observed().loaded_trays
+    backend.reading = replace(reading, data_updated_at=datetime.now(UTC) - timedelta(minutes=5))
+    await monitor._collect_once()
+    assert not monitor.observed().telemetry_ok
+    assert not monitor.observed().loaded_trays
 
 
 async def test_activity_since_marks_the_observed_transition() -> None:

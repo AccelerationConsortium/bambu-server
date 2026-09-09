@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from bambu_server import backend as backend_module
 from bambu_server.backend import BambuLabsBackend
 from bambu_server.config import PrinterCredentials, PrinterDefinition
@@ -14,28 +16,11 @@ class FakeMqttClient:
     def firmware_version(self) -> str:
         return "01.08.00.00"
 
-
-class FakeTray:
-    n = 1
-    tray_type = "PLA"
-    tray_color = "#FF0000"
-    tray_weight = "1000"
-    tray_diameter = "1.75"
-    tray_temp = "220"
-    # Firmware types these as ints; the payload has also been seen carrying
-    # numeric strings, which is why the adapter coerces rather than casts.
-    nozzle_temp_min = 190
-    nozzle_temp_max = "240"
-
-
-class FakeAMS:
-    def __init__(self) -> None:
-        self.filament_trays = {1: FakeTray()}
-
-
-class FakeAmSHub:
-    def __init__(self) -> None:
-        self.ams_hub = {0: FakeAMS()}
+    def dump(self) -> dict:
+        return {"print": {"ams": {"ams": [{"id": "0", "tray": [{
+            "id": "1", "n": 7, "tray_type": "PLA", "tray_color": "#FF0000",
+            "nozzle_temp_min": 190, "nozzle_temp_max": "240",
+        }]}]}}}
 
 
 class FakePrinter:
@@ -111,8 +96,8 @@ class FakePrinter:
     def get_skipped_objects(self) -> list[int]:
         return [3]
 
-    def ams_hub(self) -> FakeAmSHub:
-        return FakeAmSHub()
+    def ams_hub(self):
+        raise AssertionError("The incompatible library hub getter must not be used")
 
 
 def test_backend_starts_only_mqtt_and_builds_reading(monkeypatch) -> None:
@@ -148,8 +133,67 @@ def test_backend_starts_only_mqtt_and_builds_reading(monkeypatch) -> None:
     assert reading.skipped_objects == [3]
     assert reading.ams_trays is not None
     assert reading.ams_trays[0].tray_type == "PLA"
-    assert reading.ams_trays[0].tray_index == 1
+    assert reading.ams_trays[0].tray_id == 1
+    assert reading.ams_trays[0].tray_index is None
+    assert reading.ams_unit_ids == [0]
     # The spool's own nozzle window, which the submission validator checks a
     # model's configured temperature against.
     assert reading.ams_trays[0].nozzle_temp_min == 190
     assert reading.ams_trays[0].nozzle_temp_max == 240
+
+
+def _inventory(payload):
+    # Never construct a network client. dump() is the only permitted operation.
+    from types import SimpleNamespace
+
+    backend = object.__new__(BambuLabsBackend)
+    backend._printer = SimpleNamespace(
+        mqtt_client=SimpleNamespace(dump=lambda: {"print": {"ams": payload}})
+    )
+    return backend._read_ams_inventory()
+
+
+@pytest.mark.parametrize("extra", [{}, {"n": 0}, {"n": 1}])
+def test_partial_tray_fields_and_optional_presence_bits(extra):
+    units, trays = _inventory({"ams": [{"id": "0", "tray": [
+        {"id": "0", "tray_type": "PLA", "remain": "42", **extra},
+        {"id": "1"},
+    ]}]})
+    assert units == [0]
+    assert len(trays) == 1
+    assert trays[0].tray_id == 0
+    assert trays[0].remaining_percent == 42
+    assert trays[0].nozzle_temp_min is None
+
+
+def test_empty_units_ht_ids_and_secret_fields():
+    units, trays = _inventory({"ams": [
+        {"id": "1", "tray": [{"id": "0"}, {"id": "1"}]},
+        {"id": "128", "tray": [{
+            "id": "0", "tray_type": "PETG", "remain": -1,
+            "tray_uuid": "secret-uuid", "tag_uid": "secret-tag",
+            "nozzle_temp_min": "nan", "nozzle_temp_max": "inf",
+        }]},
+        {"id": "129", "tray": [{"id": "0", "tray_type": "PLA"}]},
+    ]})
+    assert units == [1, 128, 129]
+    assert [(tray.ams_id, tray.tray_id) for tray in trays] == [(128, 0), (129, 0)]
+    assert trays[0].remaining_percent is None
+    assert trays[0].nozzle_temp_min is None
+    assert trays[0].nozzle_temp_max is None
+    assert "secret" not in repr(trays)
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"ams": None}, {"ams": [None]},
+    {"ams": [{"id": "bad", "tray": []}]},
+    {"ams": [{"id": "0.5", "tray": []}]},
+    {"ams": [{"id": "0", "tray": [{"id": "bad"}]}]},
+    {"ams": [{"id": "0", "tray": [{"id": "0"}, {"id": "0"}]}]},
+])
+def test_unknown_or_malformed_inventory_is_not_reported_as_empty(payload):
+    assert _inventory(payload) == (None, None)
+
+
+def test_known_empty_inventory_is_distinct_from_unknown():
+    assert _inventory({"ams": [{"id": "1", "tray": [{"id": "0"}]}]}) == ([1], [])
+    assert _inventory({"ams": []}) == ([], [])
