@@ -163,6 +163,25 @@ known empty list. The submission page shows each reported tray and remaining
 percentage, including AMS-HT units. Percentages are printer estimates; missing
 estimates are never replaced with a guessed full spool.
 
+Both status trays and profile trays include `tray_color_name` and
+`tray_color_source`. Exact Bambu catalog color matches are display labels,
+not proof of spool manufacturer. An all-zero color is unknown by default.
+An operator can declare a color in a printer's local
+`profile.ams.color_labels` list, using `ams_id`, `tray_id`, `material`,
+`reported_color` (eight hex digits), and `name`. The declaration applies only
+while that slot, material, and reported color match, and its source is
+`operator_declared`. Review it after replacing a spool; identical telemetry
+cannot identify a physical replacement. These local labels never influence
+material validation or printer commands.
+
+See [API reference](docs/API_REFERENCE.md) for field definitions, color source
+values, authenticated browser URLs, and the submission/dispatch boundary.
+
+The submission page supports `?embed=1`, inherits the same-origin dashboard's
+light/dark theme, and accepts theme/selection messages only from that parent.
+Standalone links should use the authenticated `/bambu/ui/` edge path, never
+the gateway's unauthenticated port.
+
 These are best-effort: a failure in any one getter is isolated, and the core
 `activity`/state decision never depends on them.
 

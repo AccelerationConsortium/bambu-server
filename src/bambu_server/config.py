@@ -55,8 +55,19 @@ class MachineLimits(BaseModel):
     chamber_temperature_c: TemperatureBand | None = None
 
 
+class TrayColorLabel(BaseModel):
+    """Local operator color declaration, guarded against a changed spool type/code."""
+
+    ams_id: int = Field(ge=0)
+    tray_id: int = Field(ge=0)
+    material: str = Field(min_length=1, max_length=40)
+    reported_color: str = Field(pattern=r"^#?[0-9a-fA-F]{8}$")
+    name: str = Field(min_length=1, max_length=60)
+
+
 class AmsPolicy(BaseModel):
     filament_forbidden: list[str] = Field(default_factory=list)
+    color_labels: list[TrayColorLabel] = Field(default_factory=list)
 
     @field_validator("filament_forbidden")
     @classmethod

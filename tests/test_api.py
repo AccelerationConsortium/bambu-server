@@ -11,6 +11,29 @@ from bambu_server.main import create_app
 from .conftest import FakeBackend
 
 
+def test_api_schema_describes_color_provenance_and_remaining_filament(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    fields = schema["components"]["schemas"]["LoadedTray"]["properties"]
+    sources = fields["tray_color_source"]["anyOf"][0]["enum"]
+    assert set(sources) == {"bambu_color_match", "operator_declared", "generic", "unknown"}
+    assert fields["remaining_percent"]["anyOf"][0]["minimum"] == 0
+    assert fields["remaining_percent"]["anyOf"][0]["maximum"] == 100
+    assert "manufacturer" in fields["tray_color_name"]["description"]
+    assert schema["servers"][0]["url"] == "."
+
+
+def test_swagger_retains_authenticated_edge_prefix(client: TestClient, backend: FakeBackend) -> None:
+    from urllib.parse import urljoin
+
+    before = backend.read_count
+    for path, relative in [("/docs", "./openapi.json"), ("/docs/", "../openapi.json")]:
+        response = client.get(path)
+        assert response.status_code == 200
+        assert f"url: '{relative}'" in response.text
+        assert urljoin("https://dashboard.invalid/bambu" + path, relative) == "https://dashboard.invalid/bambu/openapi.json"
+    assert backend.read_count == before
+
+
 def test_gateway_and_per_printer_probe(client: TestClient) -> None:
     assert client.get("/").json() == {
         "service": "ac-bambu-server",
@@ -206,6 +229,8 @@ def test_status_surfaces_advanced_telemetry(client: TestClient) -> None:
             "tray_index": 1,
             "tray_type": "PLA",
             "tray_color": "#FF0000",
+            "tray_color_name": "Red",
+            "tray_color_source": "generic",
             "tray_weight": "1000",
             "tray_diameter": "1.75",
             "tray_temp": "220",

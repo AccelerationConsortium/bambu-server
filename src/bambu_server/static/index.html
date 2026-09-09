@@ -6,29 +6,32 @@
 <title>Submit a print — AC Bambu Gateway</title>
 <style>
   :root {
-    color-scheme: light dark;
-    --bg: #f6f6f4; --panel: #fff; --ink: #1a1a18; --muted: #6b6b63;
-    --line: #dcdcd6; --accent: #2f6f4f; --warn: #8a5a00; --bad: #9b2c2c;
-    --chip: #eeeee9;
+    color-scheme: light;
+    --bg: #f8fafc; --panel: #fff; --ink: #0f172a; --muted: #64748b;
+    --line: #e2e8f0; --accent: #0284c7; --warn: #b45309; --bad: #be123c;
+    --chip: #f1f5f9;
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #17181a; --panel: #1f2124; --ink: #e9e9e6; --muted: #9a9a94;
-      --line: #33363a; --accent: #7fc0a0; --warn: #d9a54a; --bad: #e88b8b;
-      --chip: #2a2d31;
-    }
+  :root.dark {
+    color-scheme: dark;
+    --bg: #0b1120; --panel: #0f172a; --ink: #e2e8f0; --muted: #94a3b8;
+    --line: #334155; --accent: #0284c7; --warn: #fbbf24; --bad: #fb7185;
+    --chip: #1e293b;
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 24px 16px 64px; background: var(--bg); color: var(--ink);
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
-  main { max-width: 860px; margin: 0 auto; }
+  main { max-width: 1100px; margin: 0 auto; }
+  html.embedded body { padding: 0 0 16px; background: transparent; }
+  html.embedded main { max-width: none; }
+  html.embedded main > h1, html.embedded main > .sub { display: none; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
   h1 { font-size: 22px; margin: 0 0 4px; }
   h2 { font-size: 15px; margin: 0 0 12px; letter-spacing: .02em; text-transform: uppercase; color: var(--muted); }
   .sub { color: var(--muted); margin: 0 0 20px; }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 18px; }
-  .banner { border-left: 3px solid var(--warn); background: var(--chip); padding: 10px 14px; border-radius: 6px; color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 2px rgb(15 23 42 / 4%); }
+  .banner { border: 1px solid var(--line); background: var(--panel); padding: 12px 16px; border-radius: 12px; color: var(--muted); font-size: 13px; margin-bottom: 16px; }
   label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
   select, input[type=text], input[type=file] {
     width: 100%; padding: 8px 10px; font: inherit; color: var(--ink);
@@ -45,6 +48,9 @@
   button.small { padding: 4px 10px; font-size: 13px; }
   .specs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
   .chip { background: var(--chip); border-radius: 20px; padding: 3px 10px; font-size: 12px; color: var(--muted); }
+  .swatch { display: inline-block; width: 12px; height: 12px; margin-right: 5px; border: 1px solid var(--muted); border-radius: 50%; vertical-align: -1px; }
+  .swatch.transparent { background: repeating-conic-gradient(#cbd5e1 0% 25%, #fff 0% 50%) 0 / 8px 8px; }
+  .table-scroll { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { font-size: 12px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); font-weight: 500; }
@@ -57,6 +63,14 @@
   .err { color: var(--bad); font-size: 14px; }
   .actions { display: flex; gap: 6px; }
 </style>
+<script>
+  document.documentElement.classList.toggle("embedded", new URLSearchParams(location.search).get("embed") === "1");
+  try {
+    const dark = window.parent !== window && window.parent.location.origin === location.origin ?
+      window.parent.document.documentElement.classList.contains("dark") : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.classList.toggle("dark", dark);
+  } catch (_) { /* Cross-origin embeds cannot read the dashboard theme. */ }
+</script>
 </head>
 <body>
 <main>
@@ -102,12 +116,12 @@
   <section class="panel" id="verdict-panel" hidden>
     <h2>Result</h2>
     <div class="verdict-head" id="verdict-head"></div>
-    <table><tbody id="verdict-rows"></tbody></table>
+    <div class="table-scroll"><table><tbody id="verdict-rows"></tbody></table></div>
   </section>
 
   <section class="panel">
     <h2>Queue</h2>
-    <div id="queue"></div>
+    <div id="queue" class="table-scroll"></div>
   </section>
 </main>
 
@@ -179,16 +193,60 @@ async function loadIdentity() {
   banner.append(note, el("span", " — submitting queues a job; dispatch is not implemented."));
 }
 
+// Exact single-color entries from Bambu Studio's official PLA Basic catalog:
+// https://github.com/bambulab/BambuStudio/blob/master/resources/profiles/BBL/filament/filaments_color_codes.json
+// These identify matching colors, not the manufacturer of the loaded spool.
+const PLA_BASIC_COLORS = {
+  FF6A13: "Orange", FF9016: "Pumpkin Orange", "5B6579": "Blue Gray",
+  "0056B8": "Cobalt Blue", "00B1B7": "Turquoise", "0086D6": "Cyan",
+  "0A2989": "Blue", "8E9089": "Gray", A6A9AA: "Silver",
+  D1D3D5: "Light Gray", "545454": "Dark Gray", "3F8E43": "Mistletoe Green",
+  BECF00: "Bright Green", "00AE42": "Bambu Green", "000000": "Black",
+  "9D432C": "Brown", "6F5034": "Cocoa Brown", F7E6DE: "Beige",
+  F55A74: "Pink", "482960": "Indigo Purple", "5E43B7": "Purple",
+  EC008C: "Magenta", C12E1F: "Red", "9D2235": "Maroon Red",
+  F5547C: "Hot Pink", FFFFFF: "Jade White", F4EE2A: "Yellow",
+  FEC600: "Sunflower Yellow", "847D48": "Bronze", E4BD68: "Gold"
+};
+
+function filamentColor(tray) {
+  const code = String(tray.tray_color || "").replace(/^#/, "").toUpperCase();
+  if (tray.tray_color_name) {
+    const hex = /^[0-9A-F]{6}(FF)?$/.test(code) ? "#" + code.slice(0, 6) : null;
+    return {name: tray.tray_color_name, hex,
+      source: tray.tray_color_source === "operator_declared" ? "Color declared by operator" :
+        "Color match from reported telemetry; spool brand unverified"};
+  }
+  if (!/^[0-9A-F]{6}([0-9A-F]{2})?$/.test(code) ||
+      (code.length === 8 && code.slice(6) !== "FF")) {
+    return {name: "Unknown color", hex: null, source: "No usable opaque color reported"};
+  }
+  const rgb = code.slice(0, 6);
+  const material = String(tray.tray_type || "").trim().toUpperCase();
+  let name = material === "PLA" ? PLA_BASIC_COLORS[rgb] : null;
+  let source = name ? "Exact Bambu PLA Basic color match; spool brand unverified" : null;
+  if (!name && rgb === "FFFFFF" && ["PETG", "PC"].includes(material)) {
+    name = "White";
+    source = "Exact Bambu " + material + " color match; spool brand unverified";
+  }
+  if (!name) {
+    name = ({FFFFFF: "White", "000000": "Black", F72323: "Red", FF0000: "Red"})[rgb] || "Custom color";
+    source = "Generic color label; no exact match in the supported Bambu catalog";
+  }
+  return {name, hex: "#" + rgb, source};
+}
+
 function renderSpecs(profile) {
   const specs = $("specs");
   specs.replaceChildren();
   if (!profile) return;
   const chips = [];
+  const trayChips = [];
   if (profile.bed_size_mm) chips.push(profile.bed_size_mm[0] + " × " + profile.bed_size_mm[1] + " mm plate");
   else chips.push("plate size not declared — fit is not checked");
   if (profile.nozzle_diameter_mm) {
     chips.push(profile.nozzle_diameter_mm + " mm nozzle" +
-      (profile.nozzle_type ? " · " + profile.nozzle_type : "") +
+      (profile.nozzle_type ? " · " + profile.nozzle_type.replace(/_/g, " ") : "") +
       " (" + profile.nozzle_diameter_source + ")");
   }
   if (profile.enclosure) chips.push(profile.enclosure);
@@ -208,10 +266,19 @@ function renderSpecs(profile) {
       String.fromCharCode(65 + unit) + (tray.tray_id + 1) :
       (unit >= 128 && unit < 154 ? "HT " + String.fromCharCode(97 + unit - 128) :
         "AMS " + unit + " tray " + tray.tray_id);
-    const color = tray.tray_color ? " · #" + tray.tray_color.replace(/^#/, "") : "";
+    const color = filamentColor(tray);
     const remaining = tray.remaining_percent === null || tray.remaining_percent === undefined ?
       " · remaining unknown" : " · " + tray.remaining_percent + "% remaining";
-    chips.push(location + ": " + (tray.tray_type || "unknown") + color + remaining);
+    const chip = el("span", "", "chip");
+    chip.title = color.source + (color.hex ? " · " + color.hex : "");
+    if (color.hex || color.name.toLowerCase() === "transparent") {
+      const swatch = el("span", "", color.name.toLowerCase() === "transparent" ? "swatch transparent" : "swatch");
+      if (color.hex) swatch.style.backgroundColor = color.hex;
+      swatch.setAttribute("aria-hidden", "true");
+      chip.append(swatch);
+    }
+    chip.append(el("span", location + ": " + (tray.tray_type || "unknown") + " · " + color.name + remaining));
+    trayChips.push(chip);
   }
   for (const unit of units || []) {
     if (!trays.some(tray => tray.ams_id === unit)) {
@@ -220,6 +287,7 @@ function renderSpecs(profile) {
     }
   }
   for (const text of chips) specs.append(el("span", text, "chip"));
+  for (const chip of trayChips) specs.append(chip);
   for (const warning of profile.warnings || []) specs.append(el("span", "⚠ " + warning, "chip"));
 }
 
@@ -354,9 +422,13 @@ async function refreshQueue() {
 
 async function selectMachine(id) {
   state.machine = id;
+  $("verdict-panel").hidden = true;
   try {
-    state.profile = await api("/printers/" + id + "/profile");
+    const profile = await api("/printers/" + id + "/profile");
+    if (state.machine !== id) return;
+    state.profile = profile;
   } catch (_) {
+    if (state.machine !== id) return;
     state.profile = null;
   }
   renderSpecs(state.profile);
@@ -396,6 +468,22 @@ async function submit() {
   }
 }
 
+let requestedMachine = new URLSearchParams(location.search).get("machine");
+window.addEventListener("message", event => {
+  if (event.origin !== location.origin || event.source !== window.parent || !event.data) return;
+  if (event.data.type === "bambu:theme" && ["light", "dark"].includes(event.data.theme)) {
+    document.documentElement.classList.toggle("dark", event.data.theme === "dark");
+  }
+  if (event.data.type === "bambu:select-printer" && typeof event.data.printer === "string") {
+    requestedMachine = event.data.printer;
+    const picker = $("machine");
+    if ([...picker.options].some(option => option.value === requestedMachine)) {
+      picker.value = requestedMachine;
+      selectMachine(requestedMachine).catch(error => $("banner").append(el("p", error.message, "err")));
+    }
+  }
+});
+
 (async function start() {
   await loadIdentity();
   try {
@@ -407,11 +495,18 @@ async function submit() {
       picker.append(option);
     }
     picker.onchange = () => selectMachine(picker.value);
-    if (printers.length) await selectMachine(printers[0].id);
+    if (printers.length) {
+      const selected = printers.some(printer => printer.id === requestedMachine) ? requestedMachine : printers[0].id;
+      picker.value = selected;
+      await selectMachine(selected);
+    }
   } catch (error) {
     $("banner").append(el("div", "Could not load printers: " + error.message, "err"));
   }
   $("submit").onclick = submit;
+  if (window.parent !== window && typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(() => window.parent.postMessage({type: "bambu:height", height: Math.ceil(document.querySelector("main").getBoundingClientRect().height) + 24}, location.origin)).observe(document.querySelector("main"));
+  }
   setInterval(refreshQueue, 10000);
 })();
 </script>

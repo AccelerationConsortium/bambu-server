@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
-from .config import AmsPolicy, MachineLimits, PrinterDefinition
+from .config import AmsPolicy, MachineLimits, PrinterDefinition, TrayColorLabel
+from .filament_colors import ColorSource, tray_color_label
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .backend import PrinterReading
@@ -38,14 +39,16 @@ class LoadedTray(BaseModel):
     inventory, and are never carried here.
     """
 
-    ams_id: int | None = None
-    tray_id: int | None = None
-    tray_index: int | None = None
+    ams_id: int | None = Field(default=None, description="Printer-reported AMS unit ID; HT units retain IDs such as 128/129.")
+    tray_id: int | None = Field(default=None, description="Zero-based slot within the AMS unit. Use (ams_id, tray_id) as the address.")
+    tray_index: int | None = Field(default=None, description="Legacy field, null for decoded inventory. MQTT n is not a slot address.")
     tray_type: str | None = None
-    tray_color: str | None = None
+    tray_color: str | None = Field(default=None, description="Reported RGB/RGBA hex code, preserved independently of its display label.")
+    tray_color_name: str | None = Field(default=None, description="Human-readable color match or operator declaration; not proof of spool manufacturer.")
+    tray_color_source: ColorSource | None = Field(default=None, description="Label provenance. All-zero color is unknown unless an applicable operator declaration supplies its name.")
     nozzle_temp_min_c: int | None = None
     nozzle_temp_max_c: int | None = None
-    remaining_percent: int | None = None
+    remaining_percent: int | None = Field(default=None, ge=0, le=100, description="Printer-estimated remaining filament percentage; null means unavailable, not zero or a full spool.")
 
     @property
     def label(self) -> str:
@@ -60,10 +63,12 @@ class ObservedMachineState(BaseModel):
     nozzle_type: str | None = None
     nozzle_diameter_mm: float | None = None
     loaded_trays: list[LoadedTray] = Field(default_factory=list)
-    ams_unit_ids: list[int] | None = None
+    ams_unit_ids: list[int] | None = Field(default=None, description="Reported units including empty ones; null means inventory unavailable. Stale profile observations are withheld.")
 
     @classmethod
-    def from_reading(cls, reading: PrinterReading | None) -> ObservedMachineState:
+    def from_reading(
+        cls, reading: PrinterReading | None, color_labels: tuple[TrayColorLabel, ...] = (),
+    ) -> ObservedMachineState:
         if reading is None or not (reading.connected and reading.data_ready):
             return cls()
         return cls(
@@ -78,6 +83,8 @@ class ObservedMachineState(BaseModel):
                     tray_index=tray.tray_index,
                     tray_type=tray.tray_type,
                     tray_color=tray.tray_color,
+                    tray_color_name=tray_color_label(tray, color_labels)[0],
+                    tray_color_source=tray_color_label(tray, color_labels)[1],
                     nozzle_temp_min_c=tray.nozzle_temp_min,
                     nozzle_temp_max_c=tray.nozzle_temp_max,
                     remaining_percent=tray.remaining_percent,

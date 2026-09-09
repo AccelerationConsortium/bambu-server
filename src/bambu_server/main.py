@@ -35,6 +35,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -179,10 +180,25 @@ def create_app(
         version=__version__,
         description=(
             "Monitoring-only MQTT gateway for Bambu Lab printers. Each configured "
-            "printer is exposed through the AC lab equipment status spec v1.2."
+            "printer is exposed through the AC lab equipment status spec v1.2. "
+            "Profiles expose typed AMS inventory, color-label provenance, and remaining "
+            "filament estimates. Submission, validation, queuing and approval only store "
+            "gateway records; dispatch is unavailable. Use the authenticated /bambu/ "
+            "edge path for browser access. No credentials or raw MQTT payloads are exposed."
         ),
+        docs_url=None,
+        servers=[{"url": ".", "description": "Same-origin gateway path, including any authenticated edge prefix"}],
         lifespan=lifespan,
     )
+
+    @app.get("/docs", include_in_schema=False, response_class=HTMLResponse)
+    @app.get("/docs/", include_in_schema=False, response_class=HTMLResponse)
+    async def api_docs(request: Request) -> HTMLResponse:
+        # Relative URLs retain the browser's /bambu/ prefix, stripped by Caddy.
+        return get_swagger_ui_html(
+            openapi_url="../openapi.json" if request.url.path.endswith("/") else "./openapi.json",
+            title="Bambu Gateway API",
+        )
 
     configured_origins = settings.cors_origins if settings else ["http://localhost:8000"]
     app.add_middleware(
@@ -334,6 +350,11 @@ def create_app(
     async def printer_status(
         monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
     ) -> EquipmentStatus:
+        """Cached STATUS_SPEC envelope. details.ams_trays includes unit/slot IDs,
+        reported color, tray_color_name, tray_color_source, and remaining_percent.
+        details.ams_unit_ids includes empty units. Use the profile endpoint for
+        typed inventory schemas and freshness-filtered observations.
+        """
         return monitor.status()
 
     @app.get(

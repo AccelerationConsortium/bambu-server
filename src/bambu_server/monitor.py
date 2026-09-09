@@ -12,6 +12,7 @@ from time import monotonic
 from . import __version__
 from .backend import PrinterBackend, PrinterReading
 from .config import PrinterDefinition
+from .filament_colors import tray_color_label
 from .models import (
     PROTOCOL_VERSION,
     Activity,
@@ -149,7 +150,9 @@ class PrinterMonitor:
             or self._is_stale(self._reading, datetime.now(UTC))
         ):
             return ObservedMachineState()
-        return ObservedMachineState.from_reading(self._reading)
+        return ObservedMachineState.from_reading(
+            self._reading, tuple(self.definition.profile.ams.color_labels),
+        )
 
     def profile(self) -> MachineProfile:
         """The submitter-facing machine profile for this printer."""
@@ -239,6 +242,8 @@ class PrinterMonitor:
                         "tray_index": tray.tray_index,
                         "tray_type": tray.tray_type,
                         "tray_color": tray.tray_color,
+                        "tray_color_name": tray_color_label(tray, self.definition.profile.ams.color_labels)[0],
+                        "tray_color_source": tray_color_label(tray, self.definition.profile.ams.color_labels)[1],
                         "tray_weight": tray.tray_weight,
                         "tray_diameter": tray.tray_diameter,
                         "tray_temp": tray.tray_temp,
