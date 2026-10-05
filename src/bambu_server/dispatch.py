@@ -33,7 +33,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .artifacts import ArtifactFacts
+from .artifacts import ArtifactError, ArtifactFacts, inspect_artifact
 from .backend import PrinterBackend, PrinterCommandError, StartPrintCommand
 from .claims import ClaimRegistry
 from .config import DispatchSettings
@@ -391,7 +391,20 @@ class Dispatcher:
             if blockers:
                 raise ControlRefusal(412, {**blockers[0], "blockers": blockers})
 
-            facts = job.facts
+            # Re-read the artifact itself rather than trusting the facts stored
+            # at intake: those may come from an older inspector that did not
+            # record plate or slot details, and the file is what will print.
+            try:
+                facts = await asyncio.to_thread(
+                    inspect_artifact,
+                    self._store.artifact_path(job),
+                    scan_max_bytes=self._store.settings.scan_max_bytes,
+                )
+            except (ArtifactError, OSError) as exc:
+                raise ControlRefusal(
+                    412,
+                    {"detail": f"the stored artifact could not be re-read: {type(exc).__name__}"},
+                ) from exc
             plate = monitor.definition.profile.plate
             missing = []
             if facts is None or not facts.sliced:
@@ -404,7 +417,8 @@ class Dispatcher:
                 raise ControlRefusal(
                     412,
                     {
-                        "detail": "the artifact lacks what a start command needs (a sliced .3mf)",
+                        "detail": "the artifact lacks what a start command needs: "
+                        + ", ".join(missing),
                         "missing": missing,
                     },
                 )

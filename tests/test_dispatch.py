@@ -262,6 +262,27 @@ def test_wrong_tray_is_refused(
     assert control_backend.uploads == []
 
 
+def test_dispatch_rereads_the_artifact_instead_of_trusting_stored_facts(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    """A job whose facts came from an older inspector still gets a fair check."""
+    job_id = _approved_job(control_client, tmp_path)
+    store = control_client.app.state.submissions
+    job = store.get(job_id)
+    legacy = job.facts.model_copy(
+        update={"plate_index": None, "bed_type": None, "bed_type_label": None, "filaments": ()}
+    )
+    store._jobs[job_id] = job.model_copy(update={"facts": legacy})
+
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "running"
+    assert control_backend.start_commands[0].bed_type == "textured_plate"
+
+
 def test_ams_ht_trays_are_not_mapped(
     control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
 ) -> None:
