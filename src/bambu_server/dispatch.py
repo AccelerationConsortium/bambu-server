@@ -95,6 +95,17 @@ class SnapshotResponse(BaseModel):
     image_base64: str
 
 
+class LightRequest(BaseModel):
+    on: bool
+
+
+class LightResponse(BaseModel):
+    printer_id: str
+    on: bool
+    requested_at: datetime
+    note: str = "command delivered; the printer's light_state in /status confirms it"
+
+
 class StopPrintResponse(BaseModel):
     printer_id: str
     stop_requested_at: datetime
@@ -183,10 +194,25 @@ class ControlGate:
             return [{"detail": "no print job is in flight", "activity": status.activity}]
         return []
 
+    def light_blockers(self, monitor: PrinterMonitor) -> list[dict[str, object]]:
+        """The light is on the design's safe whitelist: any observable state."""
+
+        if monitor.status().activity == "unknown":
+            return [
+                {
+                    "detail": "printer state is not determinable (telemetry missing or stale)",
+                    "activity": "unknown",
+                    "retry_after_s": 10,
+                }
+            ]
+        return []
+
     def allowed_actions(self, monitor: PrinterMonitor, *, busy_with_dispatch: bool) -> list[str]:
         if not self.settings.enabled:
             return []
         actions = ["snapshot"]
+        if not self.light_blockers(monitor):
+            actions.append("light")
         if not self.start_print_blockers(monitor, busy_with_dispatch=busy_with_dispatch):
             actions.append("start_print")
         if not self.stop_print_blockers(monitor):
@@ -619,6 +645,21 @@ class Dispatcher:
             submission_id=control.active_job,
             note=note,
         )
+
+    # -- light -------------------------------------------------------------
+
+    async def light(
+        self, printer_id: str, request: LightRequest, *, claim_token: str | None
+    ) -> LightResponse:
+        self.require_claim(printer_id, claim_token)
+        blockers = self.gate.light_blockers(self._monitors[printer_id])
+        if blockers:
+            raise ControlRefusal(412, {**blockers[0], "blockers": blockers})
+        try:
+            await asyncio.to_thread(self._backends[printer_id].set_chamber_light, request.on)
+        except PrinterCommandError as exc:
+            raise ControlRefusal(502, {"detail": f"light command not delivered: {exc}"}) from exc
+        return LightResponse(printer_id=printer_id, on=request.on, requested_at=datetime.now(UTC))
 
     # -- helpers -----------------------------------------------------------
 

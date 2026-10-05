@@ -143,6 +143,8 @@ class PrinterBackend(Protocol):
 
     def stop_print(self) -> None: ...
 
+    def set_chamber_light(self, on: bool) -> None: ...
+
     def current_job_file(self) -> str | None: ...
 
     def snapshot(self, timeout_s: float = 10.0) -> bytes: ...
@@ -278,6 +280,24 @@ class BambuLabsBackend:
     def stop_print(self) -> None:
         self._publish({"print": {"command": "stop"}})
 
+    def set_chamber_light(self, on: bool) -> None:
+        """Switch the chamber LED. No motion and no heat; it only lights the camera."""
+
+        self._publish(
+            {
+                "system": {
+                    "command": "ledctrl",
+                    "led_node": "chamber_light",
+                    "led_mode": "on" if on else "off",
+                    "led_on_time": 500,
+                    "led_off_time": 500,
+                    "loop_times": 0,
+                    "interval_time": 0,
+                    "sequence_id": "10000001",
+                }
+            }
+        )
+
     def current_job_file(self) -> str | None:
         """The file the printer says it is printing, from the cached telemetry."""
 
@@ -354,7 +374,9 @@ class BambuLabsBackend:
             raise PrinterCommandError("MQTT is not connected")
         if not publish(payload):
             raise PrinterCommandError("the MQTT broker did not confirm the command")
-        logger.info("Published %s command", payload["print"]["command"])  # type: ignore[index]
+        section = next(iter(payload.values()))
+        command = section.get("command") if isinstance(section, dict) else None
+        logger.info("Published %s command", command or "unnamed")
 
     def read(self) -> PrinterReading:
         connected = bool(self._printer.mqtt_client_connected())

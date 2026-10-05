@@ -16,8 +16,8 @@ a printer.
 
 By default the service is **monitoring-only** and exposes no control endpoints.
 A deployment that sets `dispatch.enabled` gets a narrow, human-in-the-loop
-control plane: claims plus three verbs (camera snapshot, start an approved job,
-stop), behind the gates described in [Control plane](#control-plane). The
+control plane: claims plus four verbs (camera snapshot, chamber light, start an
+approved job, stop), behind the gates described in [Control plane](#control-plane). The
 third-party library's other command methods remain unreachable. Control is not
 yet exposed as `lab-skills` skills; the only caller is a person on the `/ui`
 page or a direct HTTP client holding a claim.
@@ -242,6 +242,7 @@ v1.1 claims and three verbs under `/printers/{id}/control/`:
 |---|---|
 | `claim` / `heartbeat` / `release` | Cooperative claim (§5); every other control route needs `X-Claim-Token` or returns 423. |
 | `snapshot` | One JPEG frame from the printer's chamber camera, for the plate check. Kept 5 minutes; the frame used to start a job is kept beside the job as `GET /submissions/{id}/plate.jpg`. |
+| `light` | Switch the chamber light (`{"on": true}`), e.g. before a snapshot. No motion, no heat. |
 | `start_print` | Upload an approved job's `.3mf` and start it. |
 | `stop_print` | Stop the job in flight. |
 

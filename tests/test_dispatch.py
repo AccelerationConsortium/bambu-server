@@ -97,7 +97,9 @@ def test_control_routes_exist_only_when_enabled(
 ) -> None:
     assert not any("/control/" in p for p in client.get("/openapi.json").json()["paths"])
     paths = control_client.get("/openapi.json").json()["paths"]
-    for verb in ("claim", "heartbeat", "release", "snapshot", "start_print", "stop_print"):
+    for verb in (
+        "claim", "heartbeat", "release", "snapshot", "light", "start_print", "stop_print"
+    ):
         assert f"/printers/{{printer_id}}/control/{verb}" in paths
     assert control_client.get("/").json()["mode"] == "control"
 
@@ -106,7 +108,7 @@ def test_status_publishes_claim_and_allowed_actions(control_client: TestClient) 
     body = control_client.get(f"{BASE}/status").json()
     assert body["details"]["claimed_by"] is None
     assert body["details"]["monitoring_only"] is False
-    assert set(body["allowed_actions"]) == {"snapshot", "start_print"}
+    assert set(body["allowed_actions"]) == {"snapshot", "light", "start_print"}
 
     _claim(control_client)
     holder = control_client.get(f"{BASE}/status").json()["details"]["claimed_by"]
@@ -147,6 +149,19 @@ def test_claim_conflict_heartbeat_and_release(control_client: TestClient) -> Non
     again = control_client.post(f"{BASE}/control/release", headers={"X-Claim-Token": token})
     assert again.status_code == 204
     _claim(control_client, "session-b")
+
+
+def test_light_needs_a_claim_and_reaches_only_the_light(
+    control_client: TestClient, control_backend: FakeBackend
+) -> None:
+    locked = control_client.post(f"{BASE}/control/light", json={"on": True})
+    assert locked.status_code == 423
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(f"{BASE}/control/light", headers=headers, json={"on": False})
+    assert response.status_code == 200, response.text
+    assert control_backend.light_calls == [False]
+    assert control_backend.uploads == [] and control_backend.start_commands == []
+    assert control_backend.stop_calls == 0
 
 
 def test_control_without_a_claim_is_locked(

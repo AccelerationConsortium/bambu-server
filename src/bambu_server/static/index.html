@@ -147,7 +147,9 @@
             <label><input type="radio" name="plate-method" value="in_person"> In person at the printer</label>
           </div>
           <div id="snapshot-box"><div class="snapshot-empty">Take a snapshot to see the plate through the printer's camera.</div></div>
-          <div style="margin-top:8px"><button class="small" id="snapshot-btn">Take snapshot</button> <span id="snapshot-msg" class="detail"></span></div>
+          <div style="margin-top:8px"><button class="small" id="snapshot-btn">Take snapshot</button>
+            <button class="small" id="light-btn" title="Chamber light; no motion">Light on</button>
+            <span id="snapshot-msg" class="detail"></span></div>
         </fieldset>
       </div>
       <div>
@@ -583,6 +585,7 @@ async function openStart(submissionId) {
       (job.estimated_duration_minutes ? " · about " + Math.round(job.estimated_duration_minutes) + " min" : ""), "detail"),
   );
   renderTrayRows(job);
+  renderLightButton();
   updateStartButton();
   panel.scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -644,6 +647,37 @@ async function takeSnapshot() {
     msg.textContent = error.message + " — check the plate in person instead.";
   } finally {
     updateStartButton();
+  }
+}
+
+function lightIsOn() {
+  return Boolean(state.status && state.status.details && state.status.details.light_state === "on");
+}
+
+function renderLightButton() {
+  $("light-btn").textContent = lightIsOn() ? "Light off" : "Light on";
+}
+
+async function toggleLight() {
+  const msg = $("snapshot-msg");
+  const on = !lightIsOn();
+  $("light-btn").disabled = true;
+  try {
+    await api("/printers/" + state.machine + "/control/light", {
+      method: "POST", headers: controlHeaders(), body: JSON.stringify({ on }),
+    });
+    msg.className = "detail";
+    msg.textContent = "Light " + (on ? "on" : "off") + " requested; take a new snapshot in a moment.";
+    // Reflect what the printer reports once the monitor sees it.
+    setTimeout(async () => {
+      try { state.status = await api("/printers/" + state.machine + "/status"); } catch (_) {}
+      renderLightButton();
+    }, 3000);
+  } catch (error) {
+    msg.className = "err";
+    msg.textContent = error.message;
+  } finally {
+    $("light-btn").disabled = false;
   }
 }
 
@@ -810,6 +844,7 @@ window.addEventListener("message", event => {
   }
   $("submit").onclick = submit;
   $("snapshot-btn").onclick = takeSnapshot;
+  $("light-btn").onclick = toggleLight;
   $("start-btn").onclick = startPrint;
   $("start-cancel").onclick = closeStart;
   $("plate-ok").onchange = updateStartButton;

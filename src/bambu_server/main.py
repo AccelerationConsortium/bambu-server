@@ -59,6 +59,8 @@ from .config import (
 from .dispatch import (
     ControlRefusal,
     Dispatcher,
+    LightRequest,
+    LightResponse,
     SnapshotResponse,
     StartPrintRequest,
     StopPrintRequest,
@@ -936,6 +938,27 @@ def _register_control_routes(
         try:
             return await dispatcher.start_print(
                 monitor.definition.id, request, actor=actor, claim_token=claim_token
+            )
+        except ControlRefusal as exc:
+            return _refusal(exc)
+
+    @app.post(
+        "/printers/{printer_id}/control/light",
+        response_model=LightResponse,
+        responses=control_responses,
+        tags=["control"],
+    )
+    async def control_light(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        request: LightRequest,
+        claim_token: Annotated[str | None, Header(alias=CLAIM_HEADER)] = None,
+    ) -> LightResponse | JSONResponse:
+        """Switch the chamber light, e.g. to see the plate in a snapshot. No motion."""
+
+        try:
+            return await dispatcher.light(
+                monitor.definition.id, request, claim_token=claim_token
             )
         except ControlRefusal as exc:
             return _refusal(exc)

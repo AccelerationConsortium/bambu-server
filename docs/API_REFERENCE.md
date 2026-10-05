@@ -50,7 +50,8 @@ not establish a filament-to-slot mapping or sufficient remaining quantity.
 ## Control (only when the deployment enables dispatch)
 
 Per printer, under `/printers/{id}/control/`: `claim`, `heartbeat`, `release`
-(STATUS_SPEC §5), then `snapshot`, `start_print`, `stop_print`, each requiring
+(STATUS_SPEC §5), then `snapshot`, `light` (`{"on": true|false}`),
+`start_print`, `stop_print`, each requiring
 `X-Claim-Token` (423 without it). `start_print` takes the approved
 `submission_id`, `plate_confirmed_empty: true`, `plate_check_method`
 (`printer_camera` with a `snapshot_token`, or `in_person`), and an

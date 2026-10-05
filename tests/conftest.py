@@ -121,6 +121,7 @@ class FakeBackend:
         self.uploads: list[tuple[str, int]] = []
         self.start_commands: list[StartPrintCommand] = []
         self.stop_calls = 0
+        self.light_calls: list[bool] = []
         self.snapshots = 0
         self.fail_upload = False
         self.fail_snapshot = False
@@ -157,6 +158,10 @@ class FakeBackend:
 
     def stop_print(self) -> None:
         self.stop_calls += 1
+
+    def set_chamber_light(self, on: bool) -> None:
+        self.light_calls.append(on)
+        self.reading = replace(self.reading, light_state="on" if on else "off")
 
     def current_job_file(self) -> str | None:
         return self.job_file

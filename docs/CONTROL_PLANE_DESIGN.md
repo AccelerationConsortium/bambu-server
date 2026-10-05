@@ -4,8 +4,11 @@
 narrow slice of this design: phase 1 (claims, `details.claimed_by`,
 `allowed_actions` from the shared gate), `stop_print` from phase 3, and
 `start_print` with its upload from phase 4, plus a camera `snapshot` verb for
-the plate check (not in the original table). Phase 2, pause/resume,
-temperature, motion, filament, and every excluded verb remain unapproved.
+the plate check (not in the original table), and on 2026-10-05 the phase 2
+`light` verb (chamber light, any observable state, claim required). The rest of
+phase 2, pause/resume, temperature, motion, filament, and every excluded verb
+remain unapproved. Homing to raise the plate into camera view was proposed and
+declined: it drives the nozzle into the plate before anyone knows it is clear.
 `start_print` uses the human-in-the-loop model of §7 with one addition: a
 person must confirm the build plate is empty, by printer camera or in person.
 Departures from this draft, recorded rather than smoothed over:

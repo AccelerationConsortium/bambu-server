@@ -398,7 +398,9 @@ def test_the_ui_page_only_calls_public_endpoints(client: TestClient) -> None:
     # control verbs -- and with dispatch disabled the API serves none of them,
     # so the page's control flow has nothing to reach.
     verbs = set(re.findall(r"/control/([a-z_]+)", body))
-    assert verbs <= {"claim", "heartbeat", "release", "snapshot", "start_print", "stop_print"}
+    assert verbs <= {
+        "claim", "heartbeat", "release", "snapshot", "light", "start_print", "stop_print"
+    }
     assert not any("/control/" in path for path in paths)
 
 

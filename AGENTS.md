@@ -19,9 +19,10 @@ telemetry into one STATUS_SPEC v1.0 HTTP surface per configured printer.
 
 Monitoring is the default. A human approved (2026-10-04) a narrow,
 human-in-the-loop control plane, enabled per deployment by `dispatch.enabled`:
-STATUS_SPEC v1.1 claims plus exactly three verbs -- camera snapshot,
-`start_print` for an approved job after a person confirms the plate is empty,
-and `stop_print`. All printer commands go through `bambu_server.dispatch` and
+STATUS_SPEC v1.1 claims plus exactly four verbs -- camera snapshot, chamber
+light (added 2026-10-05), `start_print` for an approved job after a person
+confirms the plate is empty, and `stop_print`. Homing was considered and
+deliberately not added: it moves the bed into whatever is on the plate. All printer commands go through `bambu_server.dispatch` and
 the backend's control methods; nothing else may call `bambulabs_api` command
 methods. Adding a verb, relaxing a gate, or letting an agent start a print
 without a person needs a new explicitly approved design. Routing control
