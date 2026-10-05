@@ -9,8 +9,10 @@
   Only Mode remains off, preserving cloud control.
 - `/health`, `/printers`, and both `/status` endpoints return HTTP 200 with live
   MQTT telemetry.
-- The live deployment stays monitoring-only until `dispatch.enabled` is set in
-  its config; the control plane below is built but off by default.
+- Since 2026-10-05 the live deployment runs with `dispatch.enabled` for the P1S.
+  Its first start was ignored by the printer (firmware 01.10.00.00 in cloud
+  mode most likely refuses LAN control). The plan to move the P1S to LAN Only
+  + Developer Mode is `docs/LAN_ONLY_MIGRATION.md`.
 
 The printer IP addresses and MAC addresses are intentionally not recorded here;
 they are site-specific configuration and belong in the gitignored local files.
