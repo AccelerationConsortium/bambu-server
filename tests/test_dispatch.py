@@ -262,6 +262,21 @@ def test_wrong_tray_is_refused(
     assert control_backend.uploads == []
 
 
+def test_ams_ht_trays_are_not_mapped(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(job_id, ams_mapping=[{"filament_id": 1, "ams_id": 128, "tray_id": 0}]),
+    )
+    assert response.status_code == 412
+    assert "AMS HT" in response.json()["problems"][0]
+    assert control_backend.uploads == []
+
+
 def test_camera_check_needs_a_snapshot(
     control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
 ) -> None:

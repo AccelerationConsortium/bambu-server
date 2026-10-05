@@ -57,6 +57,8 @@ logger = logging.getLogger(__name__)
 #: A camera frame is evidence of the plate only briefly.
 SNAPSHOT_MAX_AGE_S = 300.0
 _SNAPSHOT_RETENTION_S = 3600.0
+#: Standard AMS units are numbered 0-3; HT units start at 128.
+_STANDARD_AMS_UNITS = 4
 _REMOTE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -711,6 +713,15 @@ def check_tray_mapping(
             problems.append(f"filament {assignment.filament_id} is not used by this plate")
             continue
         where = f"AMS {assignment.ams_id} tray {assignment.tray_id}"
+        if assignment.ams_id >= _STANDARD_AMS_UNITS:
+            # AMS HT units report ids from 128. The print command's flat tray
+            # index (ams_id * 4 + tray) is only known to be right for standard
+            # units 0-3; sending a guessed index would feed the wrong spool.
+            problems.append(
+                f"{where} is an AMS HT unit, which dispatch does not map yet; "
+                "choose a tray in a standard AMS unit"
+            )
+            continue
         tray = trays.get((assignment.ams_id, assignment.tray_id))
         if tray is None:
             problems.append(f"{where} reports no loaded filament")

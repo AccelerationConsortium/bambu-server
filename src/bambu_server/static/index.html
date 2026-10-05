@@ -604,7 +604,9 @@ function renderTrayRows(job) {
     const select = el("select");
     select.id = id;
     select.dataset.filament = use.filament_id;
-    const matching = trays.filter(t => (t.tray_type || "").toUpperCase() === use.filament_type.toUpperCase());
+    // AMS HT units (ids 128+) are not offered: dispatch does not map them yet.
+    const matching = trays.filter(t => t.ams_id < 4 &&
+      (t.tray_type || "").toUpperCase() === use.filament_type.toUpperCase());
     if (!matching.length) select.append(el("option", "No loaded " + use.filament_type + " tray"));
     for (const tray of matching) {
       const option = el("option", "AMS " + tray.ams_id + " tray " + (tray.tray_id + 1) + " · " +
