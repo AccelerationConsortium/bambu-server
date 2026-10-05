@@ -62,6 +62,17 @@
   code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
   .err { color: var(--bad); font-size: 14px; }
   .actions { display: flex; gap: 6px; }
+  button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+  .start-grid { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  @media (max-width: 760px) { .start-grid { grid-template-columns: 1fr; } }
+  .snapshot { width: 100%; max-height: 360px; object-fit: contain; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; display: block; }
+  .snapshot-empty { display: flex; align-items: center; justify-content: center; min-height: 180px; color: var(--muted); background: var(--chip); border-radius: 8px; font-size: 13px; text-align: center; padding: 12px; }
+  .confirm { display: flex; gap: 8px; align-items: flex-start; margin: 12px 0; padding: 10px 12px; border: 1px solid var(--warn); border-radius: 8px; color: var(--ink); }
+  .confirm input { margin-top: 3px; }
+  .method { display: flex; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
+  .method label { display: flex; gap: 6px; align-items: center; color: var(--ink); margin: 0; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; }
+  legend { font-size: 13px; color: var(--muted); padding: 0 4px; }
 </style>
 <script>
   document.documentElement.classList.toggle("embedded", new URLSearchParams(location.search).get("embed") === "1");
@@ -75,11 +86,11 @@
 <body>
 <main>
   <h1>Submit a print</h1>
-  <p class="sub">Upload a sliced <code>.3mf</code> or <code>.gcode</code>. It is checked against the machine you pick before it joins that machine's queue.</p>
+  <p class="sub">Upload a sliced <code>.3mf</code> or <code>.gcode</code>, or an <code>.stl</code> where this gateway slices for the machine. It is checked against the machine you pick before it joins that machine's queue.</p>
 
   <div class="banner" id="banner">
     No sign-in: the name you enter is a label, not an identity, and anyone who can reach this page can submit.
-    Submitting queues a job — <strong>nothing is sent to a printer</strong>. Dispatch is not implemented.
+    Submitting queues a job — <strong>nothing is sent to a printer</strong> until a person approves it and starts it here.
   </div>
 
   <section class="panel">
@@ -101,11 +112,11 @@
     <h2>Artifact</h2>
     <div class="row">
       <div>
-        <label for="file">File (.3mf or .gcode)</label>
-        <input type="file" id="file" accept=".3mf,.gcode">
+        <label for="file">File (.3mf, .gcode, or .stl to slice)</label>
+        <input type="file" id="file" accept=".3mf,.gcode,.stl">
       </div>
       <div>
-        <label for="material">Material (optional — read from the file if blank)</label>
+        <label for="material">Material (required for .stl; otherwise read from the file if blank)</label>
         <input type="text" id="material" placeholder="e.g. PLA">
       </div>
     </div>
@@ -122,6 +133,37 @@
   <section class="panel">
     <h2>Queue</h2>
     <div id="queue" class="table-scroll"></div>
+  </section>
+
+  <section class="panel" id="start-panel" hidden>
+    <h2>Start print</h2>
+    <div class="verdict-head" id="start-head"></div>
+    <div class="start-grid">
+      <div>
+        <fieldset>
+          <legend>Build plate check</legend>
+          <div class="method">
+            <label><input type="radio" name="plate-method" value="printer_camera" checked> Printer camera</label>
+            <label><input type="radio" name="plate-method" value="in_person"> In person at the printer</label>
+          </div>
+          <div id="snapshot-box"><div class="snapshot-empty">Take a snapshot to see the plate through the printer's camera.</div></div>
+          <div style="margin-top:8px"><button class="small" id="snapshot-btn">Take snapshot</button> <span id="snapshot-msg" class="detail"></span></div>
+        </fieldset>
+      </div>
+      <div>
+        <fieldset>
+          <legend>Filament → AMS tray</legend>
+          <div id="tray-rows"></div>
+        </fieldset>
+        <label class="confirm"><input type="checkbox" id="plate-ok">
+          <span>I have checked the build plate: it is <strong>empty and clear</strong>, the correct plate is installed, and nothing is in the print area.</span></label>
+        <div class="actions">
+          <button class="primary" id="start-btn" disabled>Start print</button>
+          <button id="start-cancel">Close</button>
+        </div>
+        <p id="start-msg" class="detail"></p>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -152,12 +194,26 @@ async function api(path, options) {
   try { body = await response.json(); } catch (_) { /* no body */ }
   if (!response.ok) {
     const detail = body && body.detail ? body.detail : response.status + " " + response.statusText;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    let message = typeof detail === "string" ? detail : JSON.stringify(detail);
+    // 412 refusals carry the specifics in named fields; show them.
+    if (body && Array.isArray(body.problems)) message += ": " + body.problems.join("; ");
+    if (body && Array.isArray(body.reasons)) message += " (" + body.reasons.join(", ") + ")";
+    throw new Error(message);
   }
   return body;
 }
 
-const state = { machine: null, profile: null, actor: null };
+// crypto.randomUUID needs a secure context and this page is served over plain
+// HTTP on the tailnet; getRandomValues does not.
+function randomId() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+
+const state = { machine: null, profile: null, actor: null, status: null };
+// One claim session per page load; the token lives only in memory.
+const control = { session: randomId(), token: null, heartbeat: null, job: null, snapshot: null };
 
 /** Show who the edge says you are, or admit that nobody checked. */
 async function loadIdentity() {
@@ -190,7 +246,7 @@ async function loadIdentity() {
     return; // Keep the page's default no-sign-in wording.
   }
   const note = el("strong", "Nothing is sent to a printer");
-  banner.append(note, el("span", " — submitting queues a job; dispatch is not implemented."));
+  banner.append(note, el("span", " until a person approves the job and starts it here."));
 }
 
 // Exact single-color entries from Bambu Studio's official PLA Basic catalog:
@@ -356,10 +412,15 @@ async function refreshQueue() {
   let view;
   try {
     view = await api("/printers/" + state.machine + "/queue");
+    // Cached status only (no printer I/O): tells us which control actions
+    // the gateway would honour right now.
+    state.status = await api("/printers/" + state.machine + "/status");
   } catch (error) {
     box.replaceChildren(el("p", "Could not read the queue: " + error.message, "err"));
     return;
   }
+  const allowed = (state.status && state.status.allowed_actions) || [];
+  const controlMode = Boolean(state.status && state.status.details && state.status.details.monitoring_only === false);
   box.replaceChildren();
 
   if (view.running) {
@@ -372,7 +433,11 @@ async function refreshQueue() {
       parts.push("remaining time unknown");
     }
     box.append(el("p", parts.join(" · "), "detail"));
-    box.append(el("p", "Started outside this service — the gateway only observes it.", "empty"));
+    if (allowed.includes("stop_print")) {
+      const stop = el("button", "Stop print", "small danger");
+      stop.onclick = () => stopPrint();
+      box.append(stop);
+    }
   } else {
     box.append(el("p", "Idle: " + view.activity, "detail"));
   }
@@ -406,6 +471,13 @@ async function refreshQueue() {
       approve.onclick = () => act(job.submission_id, "approve", "approved_by");
       actions.append(approve);
     }
+    if (job.state === "approved" && controlMode) {
+      const start = el("button", "Start…", "small primary");
+      start.disabled = !allowed.includes("start_print");
+      start.title = start.disabled ? "The printer cannot take a job right now (busy, warm, or not observable)." : "";
+      start.onclick = () => openStart(job.submission_id);
+      actions.append(start);
+    }
     const cancel = el("button", "Cancel", "small");
     cancel.onclick = () => act(job.submission_id, "cancel", "cancelled_by");
     actions.append(cancel);
@@ -420,7 +492,234 @@ async function refreshQueue() {
   }
 }
 
+// ---- control: claim, snapshot, start, stop --------------------------------
+
+function whoAmI() {
+  if (state.actor && state.actor.verified && state.actor.user) return state.actor.user;
+  return $("requested_by").value.trim() || window.prompt("Your name, for the record:") || "";
+}
+
+async function claim() {
+  if (control.token) return control.token;
+  const owner = whoAmI();
+  if (!owner) throw new Error("A name is needed to claim the printer.");
+  const response = await api("/printers/" + state.machine + "/control/claim", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ owner, session_id: control.session, ttl_s: 60 }),
+  });
+  control.token = response.claim_token;
+  control.heartbeat = setInterval(async () => {
+    try {
+      await api("/printers/" + state.machine + "/control/heartbeat", {
+        method: "POST", headers: { "X-Claim-Token": control.token },
+      });
+    } catch (_) {
+      // The claim is gone (expired or the service restarted). Say so and stop.
+      dropClaim();
+      $("start-msg").className = "err";
+      $("start-msg").textContent = "Lost the claim on the printer. Close and start again.";
+      $("start-btn").disabled = true;
+    }
+  }, Math.max(5, response.heartbeat_interval_s - 5) * 1000);
+  return control.token;
+}
+
+function dropClaim() {
+  if (control.heartbeat) clearInterval(control.heartbeat);
+  control.heartbeat = null;
+  control.token = null;
+}
+
+async function releaseClaim() {
+  const token = control.token;
+  dropClaim();
+  if (!token || !state.machine) return;
+  try {
+    await api("/printers/" + state.machine + "/control/release", {
+      method: "POST", headers: { "X-Claim-Token": token },
+    });
+  } catch (_) { /* release is idempotent; nothing to do */ }
+}
+
+function controlHeaders() {
+  return { "Content-Type": "application/json", "X-Claim-Token": control.token };
+}
+
+function plateMethod() {
+  return document.querySelector('input[name="plate-method"]:checked').value;
+}
+
+function updateStartButton() {
+  const camera = plateMethod() === "printer_camera";
+  const ready = $("plate-ok").checked && Boolean(control.token) &&
+    (!camera || Boolean(control.snapshot));
+  $("start-btn").disabled = !ready;
+  $("snapshot-btn").disabled = !camera;
+}
+
+async function openStart(submissionId) {
+  const panel = $("start-panel");
+  const msg = $("start-msg");
+  msg.className = "detail";
+  msg.textContent = "";
+  control.snapshot = null;
+  $("plate-ok").checked = false;
+  $("snapshot-box").replaceChildren(el("div", "Take a snapshot to see the plate through the printer's camera.", "snapshot-empty"));
+  $("snapshot-msg").textContent = "";
+  let job;
+  try {
+    job = await api("/submissions/" + submissionId);
+    await claim();
+  } catch (error) {
+    window.alert("Cannot start: " + error.message);
+    return;
+  }
+  control.job = job;
+  panel.hidden = false;
+  $("start-head").replaceChildren(
+    el("span", job.original_filename),
+    el("span", " · " + (job.material || "material from file") +
+      (job.estimated_duration_minutes ? " · about " + Math.round(job.estimated_duration_minutes) + " min" : ""), "detail"),
+  );
+  renderTrayRows(job);
+  updateStartButton();
+  panel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function renderTrayRows(job) {
+  const rows = $("tray-rows");
+  rows.replaceChildren();
+  const facts = job.facts || {};
+  let uses = facts.filaments || [];
+  if (!uses.length && (facts.filament_types || []).length === 1) {
+    uses = [{ filament_id: 1, filament_type: facts.filament_types[0] }];
+  }
+  const trays = (state.profile && state.profile.observed && state.profile.observed.loaded_trays) || [];
+  for (const use of uses) {
+    const wrap = el("div");
+    const id = "tray-" + use.filament_id;
+    const label = el("label", "Filament " + use.filament_id + " · " + use.filament_type);
+    label.htmlFor = id;
+    const select = el("select");
+    select.id = id;
+    select.dataset.filament = use.filament_id;
+    const matching = trays.filter(t => (t.tray_type || "").toUpperCase() === use.filament_type.toUpperCase());
+    if (!matching.length) select.append(el("option", "No loaded " + use.filament_type + " tray"));
+    for (const tray of matching) {
+      const option = el("option", "AMS " + tray.ams_id + " tray " + (tray.tray_id + 1) + " · " +
+        (tray.tray_color_name || tray.tray_color || "unknown color") +
+        (tray.remaining_percent != null ? " · " + tray.remaining_percent + "%" : ""));
+      option.value = tray.ams_id + ":" + tray.tray_id;
+      select.append(option);
+    }
+    select.disabled = !matching.length;
+    wrap.append(label, select);
+    rows.append(wrap);
+  }
+  if (!uses.length) rows.append(el("p", "The file does not say which filaments it uses.", "err"));
+}
+
+async function takeSnapshot() {
+  const msg = $("snapshot-msg");
+  msg.className = "detail";
+  msg.textContent = "Asking the printer's camera…";
+  $("snapshot-btn").disabled = true;
+  try {
+    const snap = await api("/printers/" + state.machine + "/control/snapshot", {
+      method: "POST", headers: controlHeaders(),
+    });
+    control.snapshot = snap;
+    const img = el("img", null, "snapshot");
+    img.src = "data:" + snap.content_type + ";base64," + snap.image_base64;
+    img.alt = "Printer camera frame";
+    $("snapshot-box").replaceChildren(img);
+    msg.textContent = "Captured " + new Date(snap.captured_at).toLocaleTimeString() +
+      ". Valid for 5 minutes.";
+  } catch (error) {
+    control.snapshot = null;
+    msg.className = "err";
+    msg.textContent = error.message + " — check the plate in person instead.";
+  } finally {
+    updateStartButton();
+  }
+}
+
+async function startPrint() {
+  const job = control.job;
+  if (!job) return;
+  const mapping = [];
+  for (const select of $("tray-rows").querySelectorAll("select")) {
+    if (select.disabled || !select.value.includes(":")) {
+      $("start-msg").className = "err";
+      $("start-msg").textContent = "Every filament needs a loaded tray.";
+      return;
+    }
+    const [ams, tray] = select.value.split(":").map(Number);
+    mapping.push({ filament_id: Number(select.dataset.filament), ams_id: ams, tray_id: tray });
+  }
+  const camera = plateMethod() === "printer_camera";
+  const body = {
+    submission_id: job.submission_id,
+    plate_confirmed_empty: true,
+    plate_check_method: camera ? "printer_camera" : "in_person",
+    snapshot_token: camera && control.snapshot ? control.snapshot.token : null,
+    ams_mapping: mapping,
+  };
+  if (!(state.actor && state.actor.verified)) body.dispatched_by = whoAmI();
+  const button = $("start-btn");
+  const msg = $("start-msg");
+  button.disabled = true;
+  msg.className = "detail";
+  msg.textContent = "Uploading to the printer and starting… this waits until the printer reports the job running.";
+  try {
+    const result = await api("/printers/" + state.machine + "/control/start_print", {
+      method: "POST", headers: controlHeaders(), body: JSON.stringify(body),
+    });
+    const last = result.history[result.history.length - 1];
+    msg.className = result.state === "running" ? "pass" : "err";
+    msg.textContent = result.state === "running" ? "Printing: " + (last.note || "started") :
+      "Not started (" + result.state + "): " + (last.note || "");
+    if (result.state === "running") {
+      await releaseClaim();
+      setTimeout(() => { $("start-panel").hidden = true; }, 4000);
+    }
+  } catch (error) {
+    msg.className = "err";
+    msg.textContent = error.message;
+    updateStartButton();
+  }
+  refreshQueue();
+}
+
+async function closeStart() {
+  $("start-panel").hidden = true;
+  control.job = null;
+  control.snapshot = null;
+  await releaseClaim();
+}
+
+async function stopPrint() {
+  if (!window.confirm("Stop the print that is running on this printer? This cannot be undone.")) return;
+  const reason = window.prompt("Reason (optional):") || null;
+  try {
+    await claim();
+    const body = { reason };
+    if (!(state.actor && state.actor.verified)) body.stopped_by = whoAmI();
+    const result = await api("/printers/" + state.machine + "/control/stop_print", {
+      method: "POST", headers: controlHeaders(), body: JSON.stringify(body),
+    });
+    window.alert("Stop sent. " + result.note + ". The job's final state comes from the printer.");
+  } catch (error) {
+    window.alert("Stop failed: " + error.message);
+  } finally {
+    if (!control.job) await releaseClaim();
+    refreshQueue();
+  }
+}
+
 async function selectMachine(id) {
+  if (control.token) await closeStart();
   state.machine = id;
   $("verdict-panel").hidden = true;
   try {
@@ -444,6 +743,10 @@ async function submit() {
   message.className = "detail";
   if (!file) { message.textContent = "Choose a file first."; return; }
   if (!verified && !who) { message.textContent = "Enter your name first."; return; }
+  if (/\.stl$/i.test(file.name) && !$("material").value.trim()) {
+    message.textContent = "An .stl is sliced here, so name the material (e.g. PLA).";
+    return;
+  }
 
   const form = new FormData();
   form.append("file", file);
@@ -504,6 +807,18 @@ window.addEventListener("message", event => {
     $("banner").append(el("div", "Could not load printers: " + error.message, "err"));
   }
   $("submit").onclick = submit;
+  $("snapshot-btn").onclick = takeSnapshot;
+  $("start-btn").onclick = startPrint;
+  $("start-cancel").onclick = closeStart;
+  $("plate-ok").onchange = updateStartButton;
+  for (const radio of document.querySelectorAll('input[name="plate-method"]')) radio.onchange = updateStartButton;
+  // Best effort: give the claim back if the page is closed mid-flow.
+  window.addEventListener("pagehide", () => {
+    if (control.token && state.machine) {
+      fetch(API_BASE + "/printers/" + state.machine + "/control/release",
+        { method: "POST", headers: { "X-Claim-Token": control.token }, keepalive: true });
+    }
+  });
   if (window.parent !== window && typeof ResizeObserver !== "undefined") {
     new ResizeObserver(() => window.parent.postMessage({type: "bambu:height", height: Math.ceil(document.querySelector("main").getBoundingClientRect().height) + 24}, location.origin)).observe(document.querySelector("main"));
   }

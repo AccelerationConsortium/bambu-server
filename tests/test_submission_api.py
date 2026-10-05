@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -393,8 +394,11 @@ def test_the_ui_page_only_calls_public_endpoints(client: TestClient) -> None:
     # The approve/cancel URLs are built by concatenation, so match the verbs.
     for called in ("/printers", "/submissions", "/queue", "/profile", '"approve"', '"cancel"'):
         assert called in body, called
-    # It must not reach for anything that would actuate a printer.
-    assert "/control/" not in body
+    # The only printer-actuating calls the page may make are the approved
+    # control verbs -- and with dispatch disabled the API serves none of them,
+    # so the page's control flow has nothing to reach.
+    verbs = set(re.findall(r"/control/([a-z_]+)", body))
+    assert verbs <= {"claim", "heartbeat", "release", "snapshot", "start_print", "stop_print"}
     assert not any("/control/" in path for path in paths)
 
 

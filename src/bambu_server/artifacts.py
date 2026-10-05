@@ -34,6 +34,8 @@ from xml.etree import ElementTree
 
 from pydantic import BaseModel, Field
 
+from .plates import plate_from_slicer
+
 ArtifactKind = Literal["3mf", "gcode"]
 
 #: Extensions the intake accepts, mapped to the kind the inspector reports.
@@ -110,6 +112,20 @@ class GcodeFinding(BaseModel):
     detail: str
 
 
+class FilamentUse(BaseModel):
+    """One filament the sliced plate calls for, as ``slice_info.config`` lists it.
+
+    ``filament_id`` is the slicer's 1-based extruder/filament index; it is the
+    position a dispatch tray mapping has to fill. The type is what the loaded
+    tray must match.
+    """
+
+    filament_id: int
+    filament_type: str
+    color: str | None = None
+    used_g: float | None = None
+
+
 class ArtifactFacts(BaseModel):
     """Everything the inspector could observe about one submitted file.
 
@@ -121,6 +137,16 @@ class ArtifactFacts(BaseModel):
     sliced: bool = False
     scan_truncated: bool = False
     filament_types: tuple[str, ...] = ()
+    #: Per-filament detail from the 3mf's slice metadata. Empty for a bare
+    #: gcode, which names types but not slots.
+    filaments: tuple[FilamentUse, ...] = ()
+    #: The plate the embedded gcode belongs to (``Metadata/plate_N.gcode``);
+    #: what a start command has to name.
+    plate_index: int | None = None
+    #: The build plate the job was sliced for, in the printer's vocabulary;
+    #: ``None`` when the slicer named none or one this service does not know.
+    bed_type: str | None = None
+    bed_type_label: str | None = None
     nozzle_temperature_c: float | None = None
     bed_temperature_c: float | None = None
     chamber_temperature_c: float | None = None
@@ -402,6 +428,14 @@ def _local_name(tag: str) -> str:
     return tag.rpartition("}")[2]
 
 
+_PLATE_INDEX_RE = re.compile(r"plate_(\d+)\.gcode$", re.IGNORECASE)
+
+
+def _plate_index(member_name: str) -> int | None:
+    match = _PLATE_INDEX_RE.search(member_name)
+    return int(match.group(1)) if match else None
+
+
 def _settings_from_project(data: bytes) -> dict[str, str]:
     """Flatten ``Metadata/project_settings.config`` (JSON) into scalar strings."""
 
@@ -422,30 +456,52 @@ def _settings_from_project(data: bytes) -> dict[str, str]:
     return settings
 
 
-def _slice_info(data: bytes) -> tuple[dict[str, str], tuple[str, ...], float | None]:
+class _SliceInfo:
+    def __init__(self) -> None:
+        self.settings: dict[str, str] = {}
+        self.filament_types: tuple[str, ...] = ()
+        self.filaments: tuple[FilamentUse, ...] = ()
+        self.duration_minutes: float | None = None
+
+
+def _slice_info(data: bytes) -> _SliceInfo:
     """Read ``Metadata/slice_info.config`` for plate metadata and filaments."""
 
+    info = _SliceInfo()
     root = _parse_xml(data)
     if root is None:
-        return {}, (), None
+        return info
 
-    settings: dict[str, str] = {}
-    filaments: list[str] = []
-    duration_minutes: float | None = None
+    types: list[str] = []
+    uses: list[FilamentUse] = []
     for plate in root.iter():
         if _local_name(plate.tag) == "metadata":
             key = (plate.get("key") or "").strip().lower()
             value = (plate.get("value") or "").strip()
             if key and value:
-                settings.setdefault(key, value)
+                info.settings.setdefault(key, value)
         elif _local_name(plate.tag) == "filament":
             filament_type = (plate.get("type") or "").strip().upper()
-            if filament_type and filament_type not in filaments:
-                filaments.append(filament_type)
-    prediction = settings.get("prediction")
+            if not filament_type:
+                continue
+            if filament_type not in types:
+                types.append(filament_type)
+            filament_id = _first_number(plate.get("id"))
+            if filament_id is not None and filament_id == int(filament_id):
+                uses.append(
+                    FilamentUse(
+                        filament_id=int(filament_id),
+                        filament_type=filament_type,
+                        color=(plate.get("color") or "").strip() or None,
+                        used_g=_first_number(plate.get("used_g")),
+                    )
+                )
+    info.filament_types = tuple(types)
+    info.filaments = tuple(sorted(uses, key=lambda use: use.filament_id))
+    prediction = info.settings.get("prediction")
     if prediction:
-        duration_minutes = parse_duration_minutes(prediction)
-    return settings, tuple(filaments), duration_minutes
+        info.duration_minutes = parse_duration_minutes(prediction)
+    return info
 
 
 def _bed_temperature(settings: dict[str, str]) -> float | None:
@@ -487,9 +543,15 @@ def _facts_from_settings(
     extra_duration: float | None,
     extent_source: str | None,
     notes: list[str],
+    filament_uses: tuple[FilamentUse, ...] = (),
+    plate_index: int | None = None,
 ) -> ArtifactFacts:
     settings = scan.settings
     filaments = _split_values(settings.get("filament_type")) or extra_filaments
+    bed_type = plate_from_slicer(settings.get("curr_bed_type"))
+    bed_type_label = (settings.get("curr_bed_type") or "").strip() or None
+    if bed_type_label and bed_type is None:
+        notes.append(f"the sliced plate type {bed_type_label!r} is not one this service knows")
 
     extent = None if truncated else scan.extent()
     if truncated and scan.extent() is not None:
@@ -519,6 +581,10 @@ def _facts_from_settings(
         sliced=sliced,
         scan_truncated=truncated,
         filament_types=filaments,
+        filaments=filament_uses,
+        plate_index=plate_index,
+        bed_type=bed_type,
+        bed_type_label=bed_type_label,
         nozzle_temperature_c=nozzle_temperature,
         bed_temperature_c=_bed_temperature(settings),
         chamber_temperature_c=_first_number(settings.get("chamber_temperature")),
@@ -580,7 +646,9 @@ def _inspect_3mf(path: Path, *, scan_max_bytes: int) -> ArtifactFacts:
         plate_names = sorted(name for name in names if _PLATE_GCODE_RE.match(name))
         scan = _Scan()
         truncated = False
+        plate_index: int | None = None
         if plate_names:
+            plate_index = _plate_index(plate_names[0])
             if len(plate_names) > 1:
                 notes.append(
                     f"the container holds {len(plate_names)} plates; "
@@ -599,13 +667,12 @@ def _inspect_3mf(path: Path, *, scan_max_bytes: int) -> ArtifactFacts:
                 "be run by a printer as submitted"
             )
 
-        slice_settings: dict[str, str] = {}
-        slice_filaments: tuple[str, ...] = ()
-        slice_duration: float | None = None
+        info = _SliceInfo()
         if slice_member is not None:
-            slice_settings, slice_filaments, slice_duration = _slice_info(slice_member)
+            info = _slice_info(slice_member)
         elif "Metadata/slice_info.config" in names:
             notes.append("slice_info.config could not be read")
+        slice_settings = info.settings
 
         project_settings = _settings_from_project(project) if project is not None else {}
 
@@ -621,10 +688,12 @@ def _inspect_3mf(path: Path, *, scan_max_bytes: int) -> ArtifactFacts:
         sliced=bool(plate_names) and scan.command_count > 0,
         scan=scan,
         truncated=truncated,
-        extra_filaments=slice_filaments,
-        extra_duration=slice_duration,
+        extra_filaments=info.filament_types,
+        extra_duration=info.duration_minutes,
         extent_source="embedded_plate_gcode",
         notes=notes,
+        filament_uses=info.filaments,
+        plate_index=plate_index,
     )
 
 

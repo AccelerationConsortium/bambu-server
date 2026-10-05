@@ -1,21 +1,23 @@
-"""FastAPI application for the monitoring-only Bambu printer gateway.
+"""FastAPI application for the Bambu printer gateway.
 
-Two surfaces live here and they are deliberately different in kind:
+Three surfaces live here and they are deliberately different in kind:
 
 * the **status surface** (``/printers/*``) is a pure read of the background
   monitor's cache -- no request on it ever reaches a printer;
 * the **submission surface** (``/submissions``, ``/printers/{id}/queue``) accepts
-  print jobs, validates them against the target machine's profile, and queues
-  them. It is read-and-analysis too: intake writes to the gateway's own disk,
-  and the one step that would touch a printer -- dispatch -- is not implemented
-  here (see :func:`bambu_server.submissions.dispatch`).
-
-There are no ``/control/*`` routes, and the service still issues no printer
-commands.
+  print jobs (a sliced ``.3mf``/``.gcode``, or an ``.stl`` the gateway slices),
+  validates them against the target machine's profile, and queues them. It
+  writes to the gateway's own disk and never reaches a printer;
+* the **control surface** (``/printers/{id}/control/*``) exists only when the
+  local config enables dispatch. Every route on it needs a live claim; it is
+  the only place a request can cause printer I/O, and it does so only through
+  :mod:`bambu_server.dispatch`.
 """
 
 import asyncio
+import hashlib
 import logging
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -28,20 +30,24 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Header,
     HTTPException,
     Path,
     Query,
     Request,
+    Response,
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
+from sdl_lab_contract.claims import ClaimRejection, ClaimRequest, ClaimResponse
 
 from . import __version__
 from .artifacts import ARTIFACT_EXTENSIONS
 from .backend import BambuLabsBackend, PrinterBackend
+from .claims import ClaimConflict, ClaimLost
 from .config import (
     PrinterCredentials,
     PrinterDefinition,
@@ -49,6 +55,14 @@ from .config import (
     load_settings,
     resolve_credentials,
     resolve_edge_secret,
+)
+from .dispatch import (
+    ControlRefusal,
+    Dispatcher,
+    SnapshotResponse,
+    StartPrintRequest,
+    StopPrintRequest,
+    StopPrintResponse,
 )
 from .identity import Actor, actor_for, resolve_actor
 from .models import (
@@ -63,15 +77,21 @@ from .models import (
 from .monitor import PrinterMonitor
 from .profiles import MachineProfile
 from .queueing import QueueView, build_queue_view
+from .slicer import BambuStudioSlicer, SliceRequest, SlicerError, SlicerUnavailable
 from .submissions import (
     ArtifactTooLarge,
     InvalidTransition,
     JobState,
+    SliceProvenance,
     SubmissionError,
     SubmissionJob,
     SubmissionStore,
     run_validation,
+    safe_display_name,
 )
+
+#: Header carrying the claim token on control routes (STATUS_SPEC §5).
+CLAIM_HEADER = "X-Claim-Token"
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +166,11 @@ def create_app(
     # credential, and re-reading the environment per call would let a later
     # change silently alter who the service trusts mid-run.
     secrets: dict[str, str | None] = {"edge": None}
+    # Control-plane objects, present only while the app is running. A one-slot
+    # dict for the same reason as `stores`.
+    dispatchers: dict[str, Dispatcher] = {}
+    slicers: dict[str, BambuStudioSlicer] = {}
+    control_enabled = bool(settings and settings.dispatch.enabled)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -156,24 +181,41 @@ def create_app(
         await asyncio.to_thread(store.load)
         stores["default"] = store
         app.state.submissions = store
+        backends: dict[str, PrinterBackend] = {}
         for definition in active_settings.printers:
             credentials = resolve_credentials(definition)
+            backend = backend_factory(definition, credentials)
+            backends[definition.id] = backend
             monitor = PrinterMonitor(
                 definition,
-                backend_factory(definition, credentials),
+                backend,
                 poll_interval_seconds=active_settings.poll_interval_seconds,
                 stale_after_seconds=active_settings.stale_after_seconds,
             )
             monitors[definition.id] = monitor
+        dispatcher = Dispatcher(
+            settings=active_settings.dispatch,
+            store=store,
+            monitors=monitors,
+            backends=backends,
+            poll_interval_s=active_settings.poll_interval_seconds,
+        )
+        dispatchers["default"] = dispatcher
+        slicers["default"] = BambuStudioSlicer(active_settings.slicer)
         try:
             for monitor in monitors.values():
                 await monitor.start()
+            if active_settings.dispatch.enabled:
+                await dispatcher.start()
             yield
         finally:
+            await dispatcher.stop()
             for monitor in reversed(list(monitors.values())):
                 await monitor.stop()
             monitors.clear()
             stores.clear()
+            dispatchers.clear()
+            slicers.clear()
 
     app = FastAPI(
         title="AC Bambu Printer Gateway",
@@ -228,11 +270,24 @@ def create_app(
             raise HTTPException(status_code=503, detail="submission store unavailable")
         return store
 
+    def get_dispatcher() -> Dispatcher:
+        dispatcher = dispatchers.get("default")
+        if dispatcher is None:  # pragma: no cover - only outside the app lifespan
+            raise HTTPException(status_code=503, detail="control plane unavailable")
+        return dispatcher
+
+    def get_slicer() -> BambuStudioSlicer:
+        slicer = slicers.get("default")
+        if slicer is None:  # pragma: no cover - only outside the app lifespan
+            raise HTTPException(status_code=503, detail="slicer unavailable")
+        return slicer
+
     @app.get("/", response_model=GatewayInfo, tags=["gateway"])
     async def gateway_info() -> GatewayInfo:
         return GatewayInfo(
             service="ac-bambu-server",
             version=__version__,
+            mode="control" if control_enabled else "monitoring_only",
             printer_count=len(monitors),
         )
 
@@ -292,7 +347,7 @@ def create_app(
             device_time=datetime.now(UTC),
             components=components,
             allowed_actions=[],
-            details={"monitoring_only": True, "printer_count": len(monitors)},
+            details={"monitoring_only": not control_enabled, "printer_count": len(monitors)},
         )
 
     @app.get("/whoami", response_model=Whoami, tags=["gateway"])
@@ -354,8 +409,26 @@ def create_app(
         reported color, tray_color_name, tray_color_source, and remaining_percent.
         details.ams_unit_ids includes empty units. Use the profile endpoint for
         typed inventory schemas and freshness-filtered observations.
+
+        With dispatch enabled, ``allowed_actions`` is computed by the same gate
+        the control routes refuse with (STATUS_SPEC §6.2) and
+        ``details.claimed_by`` names the current claim holder.
         """
-        return monitor.status()
+        status = monitor.status()
+        if not control_enabled:
+            return status
+        dispatcher = get_dispatcher()
+        printer_id = monitor.definition.id
+        holder = dispatcher.claims(printer_id).holder()
+        details = {
+            **status.details,
+            "monitoring_only": False,
+            "claimed_by": holder.model_dump(mode="json") if holder else None,
+            "build_plate": monitor.definition.profile.plate,
+        }
+        return status.model_copy(
+            update={"allowed_actions": dispatcher.allowed_actions(printer_id), "details": details}
+        )
 
     @app.get(
         "/printers/{printer_id}/profile",
@@ -401,7 +474,13 @@ def create_app(
     )
     async def create_submission(
         store: Annotated[SubmissionStore, Depends(get_store)],
-        file: Annotated[UploadFile, File(description="A .3mf or .gcode artifact")],
+        file: Annotated[
+            UploadFile,
+            File(
+                description="A sliced .3mf or .gcode, or an .stl the gateway slices "
+                "(when slicing is enabled for the target; requires material)"
+            ),
+        ],
         actor: Annotated[Actor, Depends(get_actor)],
         target_machine: Annotated[str, Form(max_length=120)],
         requested_by: Annotated[str | None, Form(max_length=120)] = None,
@@ -426,6 +505,16 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown target machine")
 
         extension = PurePosixPath(file.filename or "").suffix.lower()
+        if extension == ".stl":
+            return await _slice_and_accept(
+                store=store,
+                slicer=get_slicer(),
+                monitor=monitor,
+                file=file,
+                owner=owner,
+                owner_verified=owner_verified,
+                material=material,
+            )
         kind = ARTIFACT_EXTENSIONS.get(extension)
         if kind is None:
             supported = ", ".join(sorted(ARTIFACT_EXTENSIONS))
@@ -466,6 +555,127 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         return await run_validation(store, job, monitor.profile())
+
+    async def _slice_and_accept(
+        *,
+        store: SubmissionStore,
+        slicer: BambuStudioSlicer,
+        monitor: PrinterMonitor,
+        file: UploadFile,
+        owner: str,
+        owner_verified: bool,
+        material: str | None,
+    ) -> SubmissionJob:
+        """Slice an uploaded mesh for the target machine, then intake the 3mf.
+
+        The mesh and the slicer's scratch files live in a per-request directory
+        under the slicer's work dir and are removed afterwards; what survives
+        is the sliced 3mf (as an ordinary submission) and its provenance.
+        """
+
+        printer_id = monitor.definition.id
+        if not slicer.accepts(printer_id):
+            raise HTTPException(
+                status_code=400,
+                detail=f"this gateway does not slice .stl files for {printer_id}; "
+                "upload a sliced .3mf or .gcode",
+            )
+        if not material or not material.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="material is required to slice an .stl (one of: "
+                + ", ".join(slicer.materials()) + ")",
+            )
+        settings_ = slicer.settings
+        job_dir = settings_.work_dir / uuid.uuid4().hex
+        job_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            mesh = job_dir / "model.stl"
+            digest = hashlib.sha256()
+            size = 0
+            with mesh.open("wb") as handle:
+                while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
+                    size += len(chunk)
+                    if size > settings_.max_stl_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"mesh exceeds the {settings_.max_stl_bytes} byte limit",
+                        )
+                    digest.update(chunk)
+                    await asyncio.to_thread(handle.write, chunk)
+            if size == 0:
+                raise HTTPException(status_code=400, detail="the uploaded mesh is empty")
+
+            request = SliceRequest(
+                printer_id=printer_id,
+                material=material,
+                nozzle_type=monitor.profile().nozzle_type,
+                plate=monitor.definition.profile.plate,
+            )
+            try:
+                machine, process, filament = slicer.resolve_presets(request)
+                result = await slicer.slice(mesh, request, job_dir=job_dir)
+            except SlicerUnavailable as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except SlicerError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+            source_name = safe_display_name(file.filename or "model.stl")
+            provenance = SliceProvenance(
+                source_filename=source_name,
+                source_sha256=digest.hexdigest(),
+                source_byte_size=size,
+                slicer_version=result.slicer_version,
+                machine_preset=machine.stem,
+                process_preset=process.stem,
+                filament_preset=filament.stem,
+                warnings=list(result.warnings),
+            )
+
+            async def sliced_chunks() -> AsyncIterator[bytes]:
+                with result.artifact.open("rb") as artifact:
+                    while chunk := await asyncio.to_thread(artifact.read, _UPLOAD_CHUNK_BYTES):
+                        yield chunk
+
+            try:
+                job = await store.accept(
+                    chunks=sliced_chunks(),
+                    extension=".3mf",
+                    target_machine=printer_id,
+                    requested_by=owner,
+                    requested_by_verified=owner_verified,
+                    material=material,
+                    original_filename=f"{PurePosixPath(source_name).stem}.3mf",
+                    provenance=provenance,
+                )
+            except ArtifactTooLarge as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from exc
+            except SubmissionError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            await asyncio.to_thread(slicer.discard, job_dir)
+        return await run_validation(store, job, monitor.profile())
+
+    @app.get(
+        "/submissions/{submission_id}/plate.jpg",
+        response_class=FileResponse,
+        tags=["submissions"],
+    )
+    async def submission_plate_snapshot(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> FileResponse:
+        """The camera frame a person confirmed the empty plate against.
+
+        Evidence for the dispatch record, read from the gateway's own disk.
+        404 when the plate was confirmed in person or no dispatch happened.
+        """
+
+        job = store.get(submission_id)
+        path = store.root / f"{submission_id}.plate.jpg"
+        if job is None or not path.is_file():
+            raise HTTPException(status_code=404, detail="no plate snapshot for this submission")
+        return FileResponse(path, media_type="image/jpeg")
 
     @app.get("/submissions", response_model=list[SubmissionJob], tags=["submissions"])
     async def list_submissions(
@@ -589,7 +799,168 @@ def create_app(
             " (verified)" if actor.verified else "",
         )
 
+    if control_enabled:
+        _register_control_routes(app, get_monitor, get_actor, get_dispatcher)
+
     return app
+
+
+def _refusal(exc: ControlRefusal) -> JSONResponse:
+    headers = {}
+    retry = exc.body.get("retry_after_s")
+    if isinstance(retry, (int, float)):
+        headers["Retry-After"] = str(int(retry))
+    return JSONResponse(status_code=exc.status, content=exc.body, headers=headers)
+
+
+def _register_control_routes(
+    app: FastAPI,
+    get_monitor: Callable[..., PrinterMonitor],
+    get_actor: Callable[..., Actor],
+    get_dispatcher: Callable[[], Dispatcher],
+) -> None:
+    """STATUS_SPEC §5 claims plus the three control verbs, per printer.
+
+    Only called when the local config enables dispatch, so a deployment that
+    has not opted in exposes no ``/control/`` path at all.
+    """
+
+    control_responses = {
+        412: {"description": "A precondition is not met; the body names which."},
+        423: {"description": "No live claim token was presented."},
+    }
+
+    @app.post(
+        "/printers/{printer_id}/control/claim",
+        response_model=ClaimResponse,
+        responses={409: {"model": ClaimRejection}},
+        tags=["control"],
+    )
+    async def control_claim(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        actor: Annotated[Actor, Depends(get_actor)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        request: ClaimRequest,
+    ) -> ClaimResponse | JSONResponse:
+        """Acquire this printer's claim. A verified identity replaces ``owner``."""
+
+        if actor.verified and actor.user:
+            request = request.model_copy(update={"owner": actor.user})
+        try:
+            return dispatcher.claims(monitor.definition.id).claim(request)
+        except ClaimConflict as exc:
+            retry = max(0.0, (exc.holder.expires_at - datetime.now(UTC)).total_seconds())
+            body = ClaimRejection(
+                detail="this printer is claimed by another session",
+                claimed_by=exc.holder,
+                retry_after_s=round(retry, 1),
+            )
+            return JSONResponse(
+                status_code=409,
+                content=body.model_dump(mode="json"),
+                headers={"Retry-After": str(int(retry) + 1)},
+            )
+
+    @app.post(
+        "/printers/{printer_id}/control/heartbeat",
+        status_code=200,
+        tags=["control"],
+    )
+    async def control_heartbeat(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        claim_token: Annotated[str | None, Header(alias=CLAIM_HEADER)] = None,
+    ) -> dict[str, datetime]:
+        try:
+            expires = dispatcher.claims(monitor.definition.id).heartbeat(claim_token)
+        except ClaimLost as exc:
+            raise HTTPException(status_code=401, detail="claim lost") from exc
+        return {"expires_at": expires}
+
+    @app.post(
+        "/printers/{printer_id}/control/release",
+        status_code=204,
+        tags=["control"],
+    )
+    async def control_release(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        claim_token: Annotated[str | None, Header(alias=CLAIM_HEADER)] = None,
+    ) -> Response:
+        dispatcher.claims(monitor.definition.id).release(claim_token)
+        return Response(status_code=204)
+
+    @app.post(
+        "/printers/{printer_id}/control/snapshot",
+        response_model=SnapshotResponse,
+        responses={423: control_responses[423], 502: {"description": "Camera unreachable."}},
+        tags=["control"],
+    )
+    async def control_snapshot(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        claim_token: Annotated[str | None, Header(alias=CLAIM_HEADER)] = None,
+    ) -> SnapshotResponse | JSONResponse:
+        """One frame from the printer's chamber camera, for the plate check.
+
+        A POST under the claim because it opens a connection to the printer;
+        nothing on a plain page view ever fetches a frame.
+        """
+
+        try:
+            return await dispatcher.snapshot(monitor.definition.id, claim_token=claim_token)
+        except ControlRefusal as exc:
+            return _refusal(exc)
+
+    @app.post(
+        "/printers/{printer_id}/control/start_print",
+        response_model=SubmissionJob,
+        responses={409: {"description": "Job state conflict."}, **control_responses},
+        tags=["control"],
+    )
+    async def control_start_print(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        actor: Annotated[Actor, Depends(get_actor)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        request: StartPrintRequest,
+        claim_token: Annotated[str | None, Header(alias=CLAIM_HEADER)] = None,
+    ) -> SubmissionJob | JSONResponse:
+        """Upload an approved job to the printer and start it.
+
+        Requires the claim, a person's statement that the build plate is
+        empty, an explicit tray for every filament, and every gate in
+        :mod:`bambu_server.dispatch`. Returns once the printer reports the job
+        running, or with the job ``failed`` and the uncertainty recorded.
+        """
+
+        try:
+            return await dispatcher.start_print(
+                monitor.definition.id, request, actor=actor, claim_token=claim_token
+            )
+        except ControlRefusal as exc:
+            return _refusal(exc)
+
+    @app.post(
+        "/printers/{printer_id}/control/stop_print",
+        response_model=StopPrintResponse,
+        responses=control_responses,
+        tags=["control"],
+    )
+    async def control_stop_print(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        actor: Annotated[Actor, Depends(get_actor)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        request: StopPrintRequest,
+        claim_token: Annotated[str | None, Header(alias=CLAIM_HEADER)] = None,
+    ) -> StopPrintResponse | JSONResponse:
+        """Stop the print in flight. The job's final state comes from the printer."""
+
+        try:
+            return await dispatcher.stop_print(
+                monitor.definition.id, request, actor=actor, claim_token=claim_token
+            )
+        except ControlRefusal as exc:
+            return _refusal(exc)
 
 
 def application_factory() -> FastAPI:

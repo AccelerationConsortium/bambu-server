@@ -1,16 +1,67 @@
-"""Narrow monitoring adapter around the command-capable third-party client."""
+"""Narrow adapter around the command-capable third-party client.
+
+Monitoring reads go through :meth:`BambuLabsBackend.read`. The control plane's
+three verbs -- upload a file, start the print it names, stop the running print
+-- are the *only* command methods exposed, and only the dispatch gate
+(:mod:`bambu_server.dispatch`) calls them, under a claim, after the
+preconditions pass. Nothing else in the library's command surface is reachable
+from here.
+"""
 
 from __future__ import annotations
 
+import logging
 import math
+import socket
+import ssl
+import struct
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol, TypedDict
 
 import bambulabs_api as bambu
 
 from .config import PrinterCredentials, PrinterDefinition
+
+logger = logging.getLogger(__name__)
+
+#: The printer's chamber-camera service (P1 series: authenticated JPEG frames).
+_CAMERA_PORT = 6000
+
+
+class PrinterCommandError(RuntimeError):
+    """A command could not be delivered to the printer.
+
+    Raised only when delivery itself failed (no connection, the publish was not
+    confirmed, an upload could not be verified). Delivery is not execution: a
+    command that was delivered may still not have been acted on, which is the
+    dispatch step's job to observe.
+    """
+
+
+@dataclass(frozen=True)
+class UploadResult:
+    remote_name: str
+    byte_size: int
+
+
+@dataclass(frozen=True)
+class StartPrintCommand:
+    """Everything the printer's ``project_file`` command needs, resolved."""
+
+    remote_name: str
+    plate_index: int
+    bed_type: str
+    use_ams: bool
+    #: Per filament (in slicer order), the printer-side tray index.
+    ams_mapping: tuple[int, ...]
+    bed_leveling: bool = True
+    flow_calibration: bool = False
+    vibration_calibration: bool = False
+    timelapse: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,6 +135,18 @@ class PrinterBackend(Protocol):
 
     def read(self) -> PrinterReading: ...
 
+    # -- control plane (dispatch only) ---------------------------------------
+
+    def upload_file(self, path: Path, remote_name: str) -> UploadResult: ...
+
+    def start_print(self, command: StartPrintCommand) -> None: ...
+
+    def stop_print(self) -> None: ...
+
+    def current_job_file(self) -> str | None: ...
+
+    def snapshot(self, timeout_s: float = 10.0) -> bytes: ...
+
 
 def _optional_int(value: object) -> int | None:
     """Coerce a tray field to ``int`` or drop it.
@@ -114,10 +177,13 @@ def _number(value: object) -> int | float | None:
 
 
 class BambuLabsBackend:
-    """MQTT-only use of ``bambulabs_api.Printer``.
+    """``bambulabs_api.Printer`` with MQTT monitoring plus the control verbs.
 
-    Camera and FTP clients are never started. Public command methods remain
-    deliberately unreachable from the HTTP layer.
+    The library's camera thread is never started; a snapshot opens its own
+    short-lived connection. The FTP client is used for exactly one thing --
+    uploading an artifact dispatch is about to start -- and the connection is
+    opened and closed around that single transfer. No command method is
+    reachable from an HTTP handler except through :mod:`bambu_server.dispatch`.
     """
 
     def __init__(
@@ -143,6 +209,152 @@ class BambuLabsBackend:
 
     def stop(self) -> None:
         self._printer.mqtt_stop()
+
+    # -- control plane -----------------------------------------------------
+
+    def upload_file(self, path: Path, remote_name: str) -> UploadResult:
+        """Upload ``path`` to the printer's storage root as ``remote_name``.
+
+        The library's own ``upload_file`` wraps every exception into a log line
+        and returns ``None``, so a failed transfer would look like a success.
+        This drives its FTPS client directly instead: connect, store, then ask
+        the printer for the stored size and refuse to call the upload done
+        unless it matches the local file byte for byte.
+        """
+
+        expected = path.stat().st_size
+        ftp = self._printer.ftp_client
+        ftps = ftp.ftps
+        try:
+            ftps.connect(host=ftp.server_ip, port=ftp.port)
+            ftps.login(ftp.user, ftp.access_code)
+            ftps.prot_p()
+            with path.open("rb") as handle:
+                ftps.storbinary(f"STOR {remote_name}", handle, blocksize=32768)
+            stored = ftps.size(remote_name)
+        except Exception as exc:  # ftplib's error hierarchy is wide and not ours
+            raise PrinterCommandError(f"upload failed: {type(exc).__name__}") from exc
+        finally:
+            try:
+                ftps.close()
+            except Exception:  # noqa: BLE001 - closing a dead socket is not news
+                pass
+        if stored != expected:
+            raise PrinterCommandError(
+                f"upload not verified: printer reports {stored} bytes, expected {expected}"
+            )
+        return UploadResult(remote_name=remote_name, byte_size=expected)
+
+    def start_print(self, command: StartPrintCommand) -> None:
+        """Publish the ``project_file`` command for an uploaded 3mf.
+
+        Built here rather than through the library's ``start_print``, which
+        hard-codes ``bed_type`` to a textured plate: the plate is a machine
+        fact the gateway has already checked, and naming the wrong one makes
+        the printer heat the bed for a surface it does not have. The payload
+        otherwise mirrors the library's (and Bambu Studio's) field set.
+        """
+
+        payload = {
+            "print": {
+                "command": "project_file",
+                "param": f"Metadata/plate_{command.plate_index}.gcode",
+                "file": command.remote_name,
+                "url": f"ftp:///{command.remote_name}",
+                "bed_type": command.bed_type,
+                "bed_leveling": command.bed_leveling,
+                "flow_cali": command.flow_calibration,
+                "vibration_cali": command.vibration_calibration,
+                "timelapse": command.timelapse,
+                "layer_inspect": False,
+                "use_ams": command.use_ams,
+                "ams_mapping": list(command.ams_mapping),
+                "skip_objects": None,
+                "sequence_id": "10000000",
+            }
+        }
+        self._publish(payload)
+
+    def stop_print(self) -> None:
+        self._publish({"print": {"command": "stop"}})
+
+    def current_job_file(self) -> str | None:
+        """The file the printer says it is printing, from the cached telemetry."""
+
+        try:
+            name = self._printer.mqtt_client.gcode_file()
+        except Exception:  # noqa: BLE001 - a missing field is "not reported"
+            return None
+        return str(name).strip() or None
+
+    def snapshot(self, timeout_s: float = 10.0) -> bytes:
+        """One JPEG frame from the printer's chamber camera.
+
+        Opens its own authenticated TLS connection to the camera port, reads
+        until a complete frame arrives, and closes. The library's camera
+        client is a perpetual reconnecting thread; a confirmation step wants
+        one current picture, not a stream, so this does not use it.
+        """
+
+        host = self._printer.ip_address
+        access_code = str(self._printer.access_code)
+        auth = bytearray()
+        auth += struct.pack("<IIII", 0x40, 0x3000, 0, 0)
+        auth += b"bblp".ljust(32, b"\0")
+        auth += access_code.encode("ascii").ljust(32, b"\0")
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE  # the printer presents a self-signed cert
+        deadline = time.monotonic() + timeout_s
+        try:
+            with socket.create_connection((host, _CAMERA_PORT), timeout=timeout_s) as raw:
+                with context.wrap_socket(raw, server_hostname=host) as sock:
+                    sock.settimeout(timeout_s)
+                    sock.sendall(bytes(auth))
+                    frame = bytearray()
+                    expected: int | None = None
+                    while time.monotonic() < deadline:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            raise PrinterCommandError("camera closed the connection (access code?)")
+                        if expected is None:
+                            if len(chunk) < 16:
+                                raise PrinterCommandError("camera sent a malformed frame header")
+                            expected = int.from_bytes(chunk[0:4], "little")
+                            frame += chunk[16:]
+                        else:
+                            frame += chunk
+                        if expected is not None and len(frame) >= expected:
+                            image = bytes(frame[:expected])
+                            if image[:2] != b"\xff\xd8" or image[-2:] != b"\xff\xd9":
+                                raise PrinterCommandError("camera frame is not a JPEG")
+                            return image
+        except PrinterCommandError:
+            raise
+        except (OSError, ssl.SSLError) as exc:
+            raise PrinterCommandError(f"camera unreachable: {type(exc).__name__}") from exc
+        raise PrinterCommandError("camera did not deliver a frame in time")
+
+    def _publish(self, payload: dict[str, object]) -> None:
+        """Publish one command and insist the broker accepted it.
+
+        Uses the library's own publish path (connection check + wait for the
+        broker's acknowledgement) via its name-mangled helper; a library
+        upgrade that renames it fails loudly here rather than silently
+        skipping the command.
+        """
+
+        publish = getattr(
+            self._printer.mqtt_client, "_PrinterMQTTClient__publish_command", None
+        )
+        if publish is None:
+            raise PrinterCommandError("bambulabs_api publish helper not found; library changed")
+        if not self._printer.mqtt_client_connected():
+            raise PrinterCommandError("MQTT is not connected")
+        if not publish(payload):
+            raise PrinterCommandError("the MQTT broker did not confirm the command")
+        logger.info("Published %s command", payload["print"]["command"])  # type: ignore[index]
 
     def read(self) -> PrinterReading:
         connected = bool(self._printer.mqtt_client_connected())

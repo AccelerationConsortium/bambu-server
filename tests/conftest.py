@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import json
 import zipfile
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from bambu_server.backend import AmsTrayReading, PrinterReading
+from bambu_server.backend import (
+    AmsTrayReading,
+    PrinterCommandError,
+    PrinterReading,
+    StartPrintCommand,
+    UploadResult,
+)
 from bambu_server.config import Settings
 from bambu_server.main import create_app
 
@@ -101,11 +108,27 @@ def write_3mf(
 
 
 class FakeBackend:
+    """A printer that never exists. Control calls are recorded, not performed."""
+
     def __init__(self, reading: PrinterReading) -> None:
         self.reading = reading
         self.started = False
         self.stopped = False
         self.read_count = 0
+        # Control-plane bookkeeping. Every call is recorded so a test can
+        # assert exactly what would have reached a printer -- and that nothing
+        # did when a gate closed.
+        self.uploads: list[tuple[str, int]] = []
+        self.start_commands: list[StartPrintCommand] = []
+        self.stop_calls = 0
+        self.snapshots = 0
+        self.fail_upload = False
+        self.fail_snapshot = False
+        #: When True, a start command flips the reading to RUNNING, as a real
+        #: printer would shortly after accepting it.
+        self.start_runs = True
+        self.job_file: str | None = None
+        self.refresh_timestamps = False
 
     def start(self) -> None:
         self.started = True
@@ -115,7 +138,34 @@ class FakeBackend:
 
     def read(self) -> PrinterReading:
         self.read_count += 1
+        if self.refresh_timestamps:
+            self.reading = replace(self.reading, data_updated_at=datetime.now(UTC))
         return self.reading
+
+    def upload_file(self, path: Path, remote_name: str) -> UploadResult:
+        if self.fail_upload:
+            raise PrinterCommandError("upload not verified: printer reports 0 bytes")
+        size = path.stat().st_size
+        self.uploads.append((remote_name, size))
+        return UploadResult(remote_name=remote_name, byte_size=size)
+
+    def start_print(self, command: StartPrintCommand) -> None:
+        self.start_commands.append(command)
+        if self.start_runs:
+            self.job_file = command.remote_name
+            self.reading = replace(self.reading, gcode_state="RUNNING", activity="PRINTING")
+
+    def stop_print(self) -> None:
+        self.stop_calls += 1
+
+    def current_job_file(self) -> str | None:
+        return self.job_file
+
+    def snapshot(self, timeout_s: float = 10.0) -> bytes:
+        if self.fail_snapshot:
+            raise PrinterCommandError("camera unreachable: TimeoutError")
+        self.snapshots += 1
+        return b"\xff\xd8fake-jpeg\xff\xd9"
 
 
 @pytest.fixture

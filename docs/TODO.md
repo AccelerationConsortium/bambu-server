@@ -9,7 +9,8 @@
   Only Mode remains off, preserving cloud control.
 - `/health`, `/printers`, and both `/status` endpoints return HTTP 200 with live
   MQTT telemetry.
-- The gateway remains monitoring-only and exposes no control endpoints.
+- The live deployment stays monitoring-only until `dispatch.enabled` is set in
+  its config; the control plane below is built but off by default.
 
 The printer IP addresses and MAC addresses are intentionally not recorded here;
 they are site-specific configuration and belong in the gitignored local files.
@@ -24,23 +25,37 @@ they are site-specific configuration and belong in the gitignored local files.
 - Each getter is isolated so no single failure can poison a poll; `activity` and
   the top-level state never depend on these.
 
-## Control plane (proposal, awaiting review)
+## Control plane (built 2026-10-04, off by default)
 
-See `docs/CONTROL_PLANE_DESIGN.md`. The gateway stays read-only until that
-design is approved; no `/control/*` route ships without the v1.1 claim protocol,
-per-action preconditions, and human-approval gating it specifies.
+Approved scope and departures are in `docs/CONTROL_PLANE_DESIGN.md` (status
+block). Built: per-printer claims, `snapshot`, `start_print`, `stop_print`,
+`allowed_actions` from the same gate as the 412s, STL slicing via the Bambu
+Studio CLI, the `/ui` start flow with the empty-plate confirmation, restart
+recovery that fails an interrupted dispatch with its uncertainty.
 
-## Submission pipeline (implemented up to the approval gate)
+Still owed:
+
+- **First live run.** Enable on the P1S only, declare `plate`, and start a small
+  PLA cube with a person at the printer. Confirm the printer's `gcode_file`
+  reports the uploaded name (the job is marked running on a state change even
+  if it does not), and that the stored upload is visible on the printer's
+  storage.
+- **Camera on the H2D.** The snapshot speaks the P1-series camera protocol
+  (port 6000). The H2D uses a different one; until it is supported the H2D's
+  plate check is in person only.
+- **Printer storage housekeeping.** Uploaded `gw_*.3mf` files stay on the
+  printer's storage; nothing deletes them yet.
+- **`lab-skills` integration** and the §6.4 human-gated reconcile verb.
+- **Slicing is inline** in `POST /submissions`; a slow slice holds the request.
+
+## Submission pipeline (implemented, including dispatch)
 
 See `docs/SUBMISSION_PIPELINE_DESIGN.md`. Built: submission intake
-(`POST /submissions`), the machine-profile read surface
-(`GET /printers/{id}/profile`), the eight-check validator, the job state
-machine with a durable store, and the per-machine queue with expected finish
-times (`GET /printers/{id}/queue`).
-
-Dispatch is **not** implemented. `submissions.dispatch()` raises
-`DispatchUnavailable`, no HTTP route calls it, and no route can enter
-`dispatching` / `running` / `finished`. No `/control/*` route exists.
+(`POST /submissions`, including `.stl` slicing), the machine-profile read
+surface (`GET /printers/{id}/profile`), the eight-check validator, the job state
+machine with a durable store, the per-machine queue with expected finish times
+(`GET /printers/{id}/queue`), and dispatch through the control plane above.
+The historical notes below describe decisions taken before dispatch existed.
 
 Decisions taken where §12 left them open, all following the design's own
 recommendation:
@@ -49,9 +64,9 @@ recommendation:
    `POST /submissions/{id}/approve` records sign-off and sets
    `verdict.dispatch_ready`. Since dispatch is stubbed, this only shapes the
    gate, and relaxing it per machine stays available.
-2. **Identity — opaque.** `ac_auth` is not wired here, so `requested_by` and
-   `approved_by` are opaque strings recorded in job history. They are **not**
-   authentication; network-layer gating is unchanged.
+2. **Identity — opaque, superseded for control.** Without the edge, names are
+   opaque labels. The control plane requires edge-verified identities for the
+   approver and the person starting a print (`require_verified_identity`).
 3. **Queue — gateway-owned.** Running remaining time comes from printer
    telemetry, queued durations from the artifact's own slicer estimate.
 4. **`.3mf` parsing — standard library.** A sliced plate file embeds

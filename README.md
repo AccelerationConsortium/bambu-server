@@ -1,25 +1,26 @@
 # AC Bambu Server
 
-A monitoring-only FastAPI gateway for the Bambu Lab printers in the lab. It
-uses [`bambulabs_api`](https://github.com/BambuTools/bambulabs_api) for local
-MQTT telemetry and publishes one
+A FastAPI gateway for the Bambu Lab printers in the lab. It uses
+[`bambulabs_api`](https://github.com/BambuTools/bambulabs_api) for local MQTT
+telemetry and publishes one
 [AC lab STATUS_SPEC v1.2](../ac-organic-lab/docs/STATUS_SPEC.md) surface per
 printer. This repo conforms to lab status spec v1.2 on its per-printer
 surfaces; the aggregate gateway envelope stays on v1.0 (it fronts printers and
 has no primary operation of its own).
 
-The service deliberately exposes **no control endpoints**. The third-party
-package supports commands, but those methods are isolated behind a narrow
-monitoring adapter and are not reachable from HTTP. Future control work must go
-through `lab-skills`, claims, preconditions, audited plans, and the
-human-approval rules in the lab contract.
+It runs a **submission pipeline**: remote users upload a print artifact (or an
+`.stl` the gateway slices with Bambu Studio), the gateway validates it against
+the target machine's profile, and valid jobs wait in a per-machine queue with
+expected finish times. That path writes to the gateway's own disk and never to
+a printer.
 
-It also runs a **submission pipeline**: remote users upload a print artifact,
-the gateway validates it against the target machine's profile, and valid jobs
-wait in a per-machine queue with expected finish times. That whole path is
-read-and-analysis — it writes to the gateway's own disk and never to a printer.
-The one printer-touching step, dispatch, is not implemented; see
-[Submission pipeline](#submission-pipeline).
+By default the service is **monitoring-only** and exposes no control endpoints.
+A deployment that sets `dispatch.enabled` gets a narrow, human-in-the-loop
+control plane: claims plus three verbs (camera snapshot, start an approved job,
+stop), behind the gates described in [Control plane](#control-plane). The
+third-party library's other command methods remain unreachable. Control is not
+yet exposed as `lab-skills` skills; the only caller is a person on the `/ui`
+page or a direct HTTP client holding a claim.
 
 ## Architecture
 
@@ -28,19 +29,24 @@ Bambu printers -- local MQTT/TLS --> background monitors --> cached status
                                                               |
 Lab dashboard ---------------- HTTP GET /printers/{id}/status -+
                                                               |
-Remote user -- POST /submissions --> validate against ------- +  (reads the cache)
-                                     the machine profile
+Remote user -- POST /submissions --> (.stl: Bambu Studio CLI slice)
+                                     validate against the ------+  (reads the cache)
+                                     machine profile
                                               |
                                               v
                                      per-machine queue --> GET /printers/{id}/queue
+                                              |  person approves
+                                              v
+Person on /ui -- claim, snapshot, confirm plate, start_print   (dispatch.enabled only)
                                               |
-                                              x  dispatch: not implemented
+                                              v
+                                     FTPS upload (size-verified) + MQTT start
 ```
 
-Dashboard requests only read the cache. They never connect to a printer or
-request a telemetry refresh. The background monitor starts only the MQTT client;
-camera and FTP clients are not started. The submission pipeline reads that same
-cache and writes only to the gateway's own disk.
+Status, profile and queue requests only read the cache. They never connect to a
+printer or request a telemetry refresh. The background monitor starts only the
+MQTT client. The camera and FTP connections are opened only by the claimed
+control routes, one transfer or one frame at a time.
 
 ## Install
 
@@ -205,16 +211,56 @@ wait in a per-machine queue with expected finish times. The design contract is
 [`docs/SUBMISSION_PIPELINE_DESIGN.md`](docs/SUBMISSION_PIPELINE_DESIGN.md).
 
 ```text
-submitted -> validating -> validated -> queued -> approved -> | dispatch
-                       \-> rejected (terminal)                | not implemented
-                                          \--------\-> cancelled (terminal)
+submitted -> validating -> validated -> queued -> approved -> dispatching -> running -> finished
+                       \-> rejected (terminal)        |             \-> failed  \-> failed
+                                          \-----------\-> cancelled (terminal)
 ```
 
 Everything up to and including approval is analysis and bookkeeping. Approval is
 a *record*, not an action: it marks the job `approved` and sets
-`verdict.dispatch_ready`, and moves nothing. `dispatching`, `running` and
-`finished` are declared by the contract but unreachable — no route in this
-service can enter them.
+`verdict.dispatch_ready`, and moves nothing. Only the control plane
+(`dispatch.enabled: true`, see *Control plane* below) moves a job past
+`approved`, and only when a person starts it.
+
+### STL slicing
+
+With `slicer.enabled`, `POST /submissions` also takes an `.stl` for any printer
+listed under `slicer.machine_profiles`, plus a `material` listed under
+`slicer.filament_profiles`. The gateway runs the installed Bambu Studio CLI
+headlessly in a scratch directory, forcing two machine facts the stock presets
+get wrong: the nozzle type the printer reports and the build plate declared in
+its profile. The resulting `.3mf` is then validated and queued like any other
+upload, and the job carries `provenance` (source mesh hash, presets, slicer
+version). Slicing runs inline in the request.
+
+### Control plane
+
+Off unless `dispatch.enabled` is set. When on, each printer gets STATUS_SPEC
+v1.1 claims and three verbs under `/printers/{id}/control/`:
+
+| Route | What it does |
+|---|---|
+| `claim` / `heartbeat` / `release` | Cooperative claim (§5); every other control route needs `X-Claim-Token` or returns 423. |
+| `snapshot` | One JPEG frame from the printer's chamber camera, for the plate check. Kept 5 minutes; the frame used to start a job is kept beside the job as `GET /submissions/{id}/plate.jpg`. |
+| `start_print` | Upload an approved job's `.3mf` and start it. |
+| `stop_print` | Stop the job in flight. |
+
+`start_print` is refused (412, a body naming the failed gate) unless the printer
+is observable, idle, not in a failed state and cold (`safe_bed_c`,
+`safe_nozzle_c`); a build plate is declared and matches the plate the job was
+sliced for; the job revalidates against the printer's current state; every
+filament is mapped to a loaded tray holding that material; and the request says
+`plate_confirmed_empty: true`, by camera snapshot taken under this claim or in
+person. With `require_verified_identity` (the default) both the approver and the
+person starting it must be edge-verified identities (403 otherwise).
+`allowed_actions` on `/status` is computed by the same gate, so the two never
+disagree.
+
+Dispatch is attempted once per job and never retried. The upload is verified by
+size on the printer; the job becomes `running` only when the printer reports
+it. If the printer never does, or the service restarts mid-dispatch, the job is
+`failed` with `dispatch.uncertainty` saying what is not known. Look at the
+printer before resubmitting.
 
 ### Machine profile
 
@@ -287,7 +333,11 @@ observes.
 `GET /ui` serves a submission page: pick a machine (its plate size, nozzle,
 chamber and limits are shown so you know what you are targeting), upload a
 file, and read the per-check verdict. It also lists that machine's queue with
-finish times, and offers Approve / Cancel.
+finish times, and offers Approve / Cancel. With the control plane on, an
+approved job gets **Start…**: the page claims the printer, shows a fresh frame
+from its camera, asks for a tray per filament and for the empty-plate
+confirmation, then starts the job and reports what the printer says. A running
+job gets **Stop print**. The page never fetches a camera frame on its own.
 
 It is one static file with **no build step and no external resources** — no
 CDN, no npm, no bundler — served from the same origin as the API it calls, so

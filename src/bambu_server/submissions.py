@@ -1,21 +1,18 @@
 """Submission intake, job state machine, and durable job store.
 
 A *submission* is a print artifact plus the metadata naming the machine it is
-destined for. This module owns its whole life up to -- and deliberately not
-including -- dispatch:
+destined for. This module owns its whole life:
 
-``submitted -> validating -> validated -> queued -> approved``
+``submitted -> validating -> validated -> queued -> approved -> dispatching -> running -> finished``
 
 with ``rejected`` as the terminal outcome of a failed validation and ``failed``
 reachable from anything that is not already rejected. The three states past
-approval (``dispatching``, ``running``, ``finished``) are declared because the
-contract declares them, but **nothing in this service can enter them**: dispatch
-is the one printer-touching step and it stays behind the approval gate until the
-control-plane design is approved. See :func:`dispatch`.
-
-Nothing in this module performs printer I/O. Files land on the gateway host
-under a configured directory; their paths are internal and never leave the
-process, because a stored path is not something a client has any use for.
+approval are entered only by :mod:`bambu_server.dispatch`, the one
+printer-touching step, which runs under a claim after a human has confirmed
+the plate is clear. This module records what dispatch did; it never performs
+printer I/O itself. Files land on the gateway host under a configured
+directory; their paths are internal and never leave the process, because a
+stored path is not something a client has any use for.
 """
 
 from __future__ import annotations
@@ -29,7 +26,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -108,10 +105,6 @@ class InvalidTransition(RuntimeError):
     """A state change the job's state machine does not permit."""
 
 
-class DispatchUnavailable(RuntimeError):
-    """Dispatch is not implemented in this service."""
-
-
 def clean_text(value: str | None, *, field: str, required: bool) -> str | None:
     """Normalise a client-supplied text field, or refuse it.
 
@@ -162,6 +155,80 @@ class StateTransition(BaseModel):
     note: str | None = None
 
 
+class SliceProvenance(BaseModel):
+    """How a sliced artifact came to exist when the submitter uploaded a mesh."""
+
+    source_filename: str
+    source_sha256: str
+    source_byte_size: int
+    slicer: str = "bambu-studio"
+    slicer_version: str | None = None
+    machine_preset: str
+    process_preset: str
+    filament_preset: str
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TrayAssignment(BaseModel):
+    """One filament slot of the sliced plate mapped to one loaded AMS tray.
+
+    Explicit on purpose: the printer will happily feed whatever tray the
+    mapping names, so the person starting the print chooses, and the gateway
+    checks the choice against what the tray reports holding.
+    """
+
+    filament_id: int = Field(ge=1, le=16)
+    ams_id: int = Field(ge=0)
+    tray_id: int = Field(ge=0, le=3)
+
+    @property
+    def printer_index(self) -> int:
+        """The flat tray index the print command uses (``ams_id * 4 + tray``)."""
+
+        return self.ams_id * 4 + self.tray_id
+
+
+PlateCheckMethod = Literal["printer_camera", "in_person"]
+
+
+class PlateCheck(BaseModel):
+    """The human's confirmation that the build plate is empty.
+
+    Recorded, not inferred: the gateway cannot see the plate, so the person
+    who can says so, and the record keeps how they looked and -- when they
+    looked through the printer's camera -- which frame they looked at.
+    """
+
+    confirmed_by: str
+    confirmed_by_verified: bool
+    method: PlateCheckMethod
+    confirmed_at: datetime
+    #: SHA-256 of the camera frame shown during confirmation, when one was.
+    snapshot_sha256: str | None = None
+    snapshot_captured_at: datetime | None = None
+
+
+class DispatchRecord(BaseModel):
+    """What the dispatch step did and observed. Appended to the job, never edited."""
+
+    dispatched_by: str
+    dispatched_by_verified: bool
+    requested_at: datetime
+    plate_check: PlateCheck
+    ams_mapping: list[TrayAssignment]
+    bed_type: str
+    plate_index: int
+    remote_filename: str
+    #: Bytes the printer reported holding after the upload, once verified.
+    upload_verified_bytes: int | None = None
+    command_published_at: datetime | None = None
+    observed_running_at: datetime | None = None
+    observed_finished_at: datetime | None = None
+    #: Set when the step ended without the printer confirming the outcome; the
+    #: text says what is known and what is not. Software cannot settle it.
+    uncertainty: str | None = None
+
+
 class SubmissionJob(BaseModel):
     """One submitted print job. Safe to return to a client verbatim."""
 
@@ -191,6 +258,10 @@ class SubmissionJob(BaseModel):
     estimated_duration_minutes: float | None = None
     facts: ArtifactFacts | None = None
     verdict: ValidationVerdict | None = None
+    #: Present when the gateway sliced an uploaded mesh into this artifact.
+    provenance: SliceProvenance | None = None
+    #: Present once dispatch has been attempted. One attempt per job.
+    dispatch: DispatchRecord | None = None
     history: list[StateTransition] = Field(default_factory=list)
 
     @field_validator("requested_by", "material")
@@ -247,13 +318,59 @@ class SubmissionStore:
                 logger.warning("Ignoring unreadable submission record %s", path.name)
                 continue
             self._jobs[job.submission_id] = job
+        interrupted = self._recover_interrupted()
         swept = self._sweep_expired()
         logger.info(
-            "Loaded %d submission(s) from %s (%d expired record(s) swept)",
+            "Loaded %d submission(s) from %s (%d expired record(s) swept, "
+            "%d interrupted dispatch(es) failed)",
             len(self._jobs),
             self._root,
             swept,
+            interrupted,
         )
+
+    def _recover_interrupted(self) -> int:
+        """Fail every job the previous process left mid-dispatch.
+
+        A job in ``dispatching`` at startup was between "upload started" and
+        "printer reported the job running" when the service stopped. Nothing
+        in software can establish whether the printer went on to start it, so
+        the record says exactly that and the job is terminal: someone looks at
+        the printer before anything is sent again. A ``running`` job is left
+        alone -- the dispatch watcher re-attaches to it and keeps observing.
+        """
+
+        now = datetime.now(UTC)
+        count = 0
+        for job in list(self._jobs.values()):
+            if job.state != "dispatching":
+                continue
+            note = (
+                "service restarted while dispatching: the start command may or may "
+                "not have reached the printer; check the printer before resubmitting"
+            )
+            dispatch = (
+                job.dispatch.model_copy(update={"uncertainty": note}) if job.dispatch else None
+            )
+            updated = job.model_copy(
+                update={
+                    "state": "failed",
+                    "dispatch": dispatch,
+                    "updated_at": now,
+                    "history": [
+                        *job.history,
+                        StateTransition(
+                            at=now, from_state=job.state, to_state="failed", note=note
+                        ),
+                    ],
+                }
+            )
+            self._jobs[updated.submission_id] = updated
+            (self._root / f"{updated.submission_id}.json").write_text(
+                updated.model_dump_json(indent=2), encoding="utf-8"
+            )
+            count += 1
+        return count
 
     def _sweep_expired(self) -> int:
         """Drop terminal records past the retention window."""
@@ -319,6 +436,7 @@ class SubmissionStore:
         requested_by_verified: bool = False,
         material: str | None,
         original_filename: str,
+        provenance: SliceProvenance | None = None,
     ) -> SubmissionJob:
         """Persist an uploaded artifact and register it as a ``submitted`` job."""
 
@@ -371,6 +489,7 @@ class SubmissionStore:
             state="submitted",
             created_at=now,
             updated_at=now,
+            provenance=provenance,
             history=[StateTransition(at=now, from_state=None, to_state="submitted")],
         )
         async with self._lock:
@@ -495,6 +614,73 @@ class SubmissionStore:
                 current.submission_id, "cancelled", note
             )
 
+    async def begin_dispatch(
+        self, job: SubmissionJob, record: DispatchRecord
+    ) -> SubmissionJob:
+        """Attach the dispatch record and move the job to ``dispatching``.
+
+        Legal only from ``approved`` with ``dispatch_ready`` set, and only once:
+        a second attempt on the same job is refused, because the first one's
+        outcome -- even a failed one -- is a fact about the printer that a
+        retry would paper over.
+        """
+
+        async with self._lock:
+            current = self._require(job.submission_id)
+            if current.state != "approved":
+                raise InvalidTransition(
+                    f"only an approved submission can be dispatched; "
+                    f"{current.submission_id} is {current.state}"
+                )
+            if current.verdict is None or not current.verdict.dispatch_ready:
+                raise InvalidTransition("the submission is not marked dispatch-ready")
+            if current.dispatch is not None:
+                raise InvalidTransition("dispatch has already been attempted for this submission")
+            if current.artifact_removed:
+                raise InvalidTransition("the submission's artifact is no longer stored")
+            self._jobs[current.submission_id] = current.model_copy(update={"dispatch": record})
+            return await self._transition_locked(
+                current.submission_id,
+                "dispatching",
+                f"dispatch requested by {record.dispatched_by}"
+                f"{_verified_suffix(record.dispatched_by_verified)}; plate confirmed "
+                f"empty via {record.plate_check.method.replace('_', ' ')}",
+            )
+
+    async def update_dispatch(
+        self,
+        job: SubmissionJob,
+        *,
+        to_state: JobState | None = None,
+        note: str | None = None,
+        **fields: object,
+    ) -> SubmissionJob:
+        """Record progress of the dispatch step, optionally moving the state.
+
+        ``fields`` are :class:`DispatchRecord` attributes to set. The record is
+        append-only in spirit: callers set a field once when the thing it
+        describes happens, and never clear one.
+        """
+
+        async with self._lock:
+            current = self._require(job.submission_id)
+            if current.dispatch is None:
+                raise InvalidTransition("the submission has no dispatch record to update")
+            if fields:
+                updated = current.model_copy(
+                    update={
+                        "dispatch": current.dispatch.model_copy(update=fields),
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+                self._jobs[current.submission_id] = updated
+                if to_state is None:
+                    await self._persist(updated)
+                    return updated
+            if to_state is None:
+                return current
+            return await self._transition_locked(current.submission_id, to_state, note)
+
     async def forget(self, job: SubmissionJob) -> SubmissionJob:
         """Delete a terminal job's record and artifact.
 
@@ -617,22 +803,3 @@ async def run_validation(
         return await store.transition(job, "rejected", note=", ".join(verdict.reasons))
     job = await store.transition(job, "validated")
     return await store.transition(job, "queued")
-
-
-async def dispatch(job: SubmissionJob) -> NoReturn:
-    """The gated step. Not implemented, and deliberately unreachable.
-
-    Dispatching means uploading the artifact to a printer and starting a print:
-    the single printer-touching action in the whole pipeline. Shipping it
-    requires the approved control-plane design (``docs/CONTROL_PLANE_DESIGN.md``)
-    -- the v1.1 claim protocol, per-action preconditions with structured 412
-    refusals, and the audited approval model -- none of which exists yet.
-
-    No HTTP route calls this function. It exists so the boundary has a name and
-    a test, not as a switch waiting to be flipped.
-    """
-
-    raise DispatchUnavailable(
-        f"dispatch is not implemented: submission {job.submission_id} stops at the "
-        "approval gate until the control-plane design ships"
-    )

@@ -1,10 +1,27 @@
 # Bambu Printer Gateway — Control Plane Design (proposal, for review)
 
-**Status:** DRAFT — no control code may ship until this design is approved.
+**Status:** PARTIALLY APPROVED AND BUILT (2026-10-04). A human approved a
+narrow slice of this design: phase 1 (claims, `details.claimed_by`,
+`allowed_actions` from the shared gate), `stop_print` from phase 3, and
+`start_print` with its upload from phase 4, plus a camera `snapshot` verb for
+the plate check (not in the original table). Phase 2, pause/resume,
+temperature, motion, filament, and every excluded verb remain unapproved.
+`start_print` uses the human-in-the-loop model of §7 with one addition: a
+person must confirm the build plate is empty, by printer camera or in person.
+Departures from this draft, recorded rather than smoothed over:
+
+- Control is reachable over HTTP from the `/ui` page; it is **not** yet routed
+  through `lab-skills` or plan execution.
+- §6.4's reconcile verb is not built. A failed or uncertain dispatch leaves the
+  job `failed` with `dispatch.uncertainty`; a person clears the printer on the
+  printer itself.
+- The one-shot approval ticket of §7 is realised as: job approval (verified
+  identity) + a claim + the start request's own plate confirmation, each
+  recorded on the job.
+
 **Companion:** `docs/SUBMISSION_PIPELINE_DESIGN.md` — the concrete submission →
-validation → queue → dispatch flow. Everything in it up to the approval gate is
-built; its dispatch step is the work this design gates, and
-`submissions.dispatch()` is the named, tested stub waiting on it.
+validation → queue → dispatch flow; its dispatch step is implemented in
+`bambu_server.dispatch`.
 **Binding constraints:** `../ac-organic-lab/docs/AGENT_RULES.md` and
 `../ac-organic-lab/docs/STATUS_SPEC.md` (authoritative). This design must never
 weaken them. Repo-local rules: `AGENT_RULES.md` (this repo) and `docs/TODO.md`.

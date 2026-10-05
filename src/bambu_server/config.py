@@ -88,6 +88,12 @@ class MachineProfileConfig(BaseModel):
     nozzle_type: str | None = Field(default=None, max_length=60)
     nozzle_diameter_mm: float | None = Field(default=None, gt=0, le=2.0)
     bed_size_mm: tuple[float, float] | None = None
+    #: The build plate physically installed, in the printer's own vocabulary
+    #: (the ``bed_type`` a print command names). Declared, never observed: a
+    #: P1S does not detect its plate, so this is the only place the fact
+    #: exists. Dispatch refuses a model sliced for a different plate, and
+    #: refuses outright while it is undeclared.
+    plate: BedPlate | None = None
     chamber_temperature_c: float | None = None
     limits: MachineLimits = Field(default_factory=MachineLimits)
     ams: AmsPolicy = Field(default_factory=AmsPolicy)
@@ -98,6 +104,11 @@ class MachineProfileConfig(BaseModel):
         if value is not None and (value[0] <= 0 or value[1] <= 0):
             raise ValueError("bed_size_mm entries must be positive")
         return value
+
+
+#: Plate names as the printer's print command spells them. The slicer's
+#: ``curr_bed_type`` strings map onto these in :mod:`bambu_server.plates`.
+BedPlate = Literal["cool_plate", "eng_plate", "hot_plate", "textured_plate", "supertack_plate"]
 
 
 class PrinterDefinition(BaseModel):
@@ -133,12 +144,79 @@ class SubmissionSettings(BaseModel):
     retain_terminal_days: float | None = Field(default=30.0, gt=0)
 
 
+class DispatchSettings(BaseModel):
+    """The control plane's switches. Off unless the local config turns it on.
+
+    ``enabled: false`` is the development and test default (AGENT_RULES 5: a
+    default must not be able to contact lab hardware). With it off the gateway
+    behaves exactly as the monitoring-only release did: no claim routes, no
+    control routes, ``allowed_actions`` empty.
+    """
+
+    enabled: bool = False
+    #: Refuse dispatch and stop unless both the approver and the caller are
+    #: edge-verified identities. A direct tailnet caller can still submit,
+    #: but cannot start a printer. Only a test should turn this off.
+    require_verified_identity: bool = True
+    #: A print may only be started on a cold machine. Above either value the
+    #: previous job has not finished cooling (or something is still heating),
+    #: and the plate state is not trustworthy.
+    safe_bed_c: float = Field(default=45.0, gt=0)
+    safe_nozzle_c: float = Field(default=70.0, gt=0)
+    #: How long after publishing the start command the printer has to report
+    #: the job in flight before the dispatch is recorded as failed. Covers the
+    #: P1S's file-prepare phase; a bed-leveling pass happens *after* PREPARE.
+    confirm_timeout_s: float = Field(default=180.0, ge=10, le=1800)
+    #: Printer-side pre-print steps, forwarded in the start command.
+    bed_leveling: bool = True
+    flow_calibration: bool = False
+    vibration_calibration: bool = False
+    timelapse: bool = False
+
+
+class SlicerSettings(BaseModel):
+    """Bambu Studio CLI slicing of an uploaded ``.stl``.
+
+    Off by default: slicing shells out to an installed Bambu Studio, which is a
+    machine-local fact. ``executable`` is the launcher; ``profiles_dir`` is
+    Bambu Studio's bundled ``resources/profiles/BBL`` directory, where the
+    machine, process and filament presets live; ``work_dir`` is where the
+    slicer may write (the service runs with a read-only home).
+    """
+
+    enabled: bool = False
+    executable: Path = Path("bambu-studio")
+    profiles_dir: Path | None = None
+    work_dir: Path = Path("var/slicer")
+    timeout_s: float = Field(default=600.0, ge=30, le=3600)
+    #: The process preset applied to every slice. One, deliberately: the
+    #: submitter picks a material, not a print profile.
+    process_profile: str = "0.20mm Standard @BBL X1C"
+    #: Material name (as the submitter types it, upper-cased) to the filament
+    #: preset to slice with. A material with no entry cannot be sliced here.
+    filament_profiles: dict[str, str] = Field(default_factory=dict)
+    #: Printer id to the machine preset for it (e.g. "Bambu Lab P1S 0.4 nozzle").
+    #: A printer with no entry does not accept ``.stl`` uploads.
+    machine_profiles: dict[str, str] = Field(default_factory=dict)
+    #: Ceiling on an uploaded mesh.
+    max_stl_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
+
+    @field_validator("filament_profiles", mode="before")
+    @classmethod
+    def upper_keys(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key).strip().upper(): preset for key, preset in value.items()}
+        return value
+
+
 class Settings(BaseModel):
     printers: list[PrinterDefinition] = Field(min_length=1)
     poll_interval_seconds: float = Field(default=2.0, ge=0.5, le=60.0)
     stale_after_seconds: float = Field(default=20.0, ge=2.0, le=600.0)
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
     submissions: SubmissionSettings = Field(default_factory=SubmissionSettings)
+    dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
+    slicer: SlicerSettings = Field(default_factory=SlicerSettings)
 
     @model_validator(mode="after")
     def validate_unique_printers(self) -> Settings:
@@ -212,4 +290,6 @@ def load_settings(path: str | Path | None = None) -> Settings:
         settings.submissions.directory = (
             resolved.parent / settings.submissions.directory
         ).resolve()
+    if not settings.slicer.work_dir.is_absolute():
+        settings.slicer.work_dir = (resolved.parent / settings.slicer.work_dir).resolve()
     return settings

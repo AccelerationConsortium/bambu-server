@@ -41,10 +41,24 @@ does not affect validation or establish physical spool identity after a swap.
 
 ## Submission boundary and authentication
 
-`POST /submissions` accepts an artifact and metadata, validates it, and queues
-passing jobs. Approval and cancellation update gateway records only. There is
-no dispatch endpoint, no hardware control route, and approval alone does not
-establish a complete filament-to-slot mapping or sufficient remaining quantity.
+`POST /submissions` accepts an artifact (`.3mf`, `.gcode`, or `.stl` where
+slicing is enabled for the target; `.stl` requires `material`) and metadata,
+validates it, and queues passing jobs. A sliced job carries `provenance`.
+Approval and cancellation update gateway records only, and approval alone does
+not establish a filament-to-slot mapping or sufficient remaining quantity.
+
+## Control (only when the deployment enables dispatch)
+
+Per printer, under `/printers/{id}/control/`: `claim`, `heartbeat`, `release`
+(STATUS_SPEC §5), then `snapshot`, `start_print`, `stop_print`, each requiring
+`X-Claim-Token` (423 without it). `start_print` takes the approved
+`submission_id`, `plate_confirmed_empty: true`, `plate_check_method`
+(`printer_camera` with a `snapshot_token`, or `in_person`), and an
+`ams_mapping` of `{filament_id, ams_id, tray_id}`. Refusals are 412 with a body
+naming the failed gate; `allowed_actions` on `/status` mirrors them, and
+`details.claimed_by` names the holder. `GET /submissions/{id}/plate.jpg` returns
+the camera frame a start was confirmed against. Without dispatch enabled none
+of these paths exist.
 
 The gateway trusts edge identity only with its configured shared edge secret.
 Names supplied directly by clients are unverified labels. Dashboard links use

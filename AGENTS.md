@@ -17,10 +17,15 @@ The following documents take precedence over this file and must not be weakened:
 This service is a multi-printer gateway. It translates Bambu Lab's local MQTT
 telemetry into one STATUS_SPEC v1.0 HTTP surface per configured printer.
 
-The first release is monitoring-only. Do not add control endpoints or invoke
-command methods from `bambulabs_api` without an explicitly approved design that
-routes execution through `lab-skills`, implements claims and interlocks, and
-conforms to STATUS_SPEC v1.1 or later.
+Monitoring is the default. A human approved (2026-10-04) a narrow,
+human-in-the-loop control plane, enabled per deployment by `dispatch.enabled`:
+STATUS_SPEC v1.1 claims plus exactly three verbs -- camera snapshot,
+`start_print` for an approved job after a person confirms the plate is empty,
+and `stop_print`. All printer commands go through `bambu_server.dispatch` and
+the backend's control methods; nothing else may call `bambulabs_api` command
+methods. Adding a verb, relaxing a gate, or letting an agent start a print
+without a person needs a new explicitly approved design. Routing control
+through `lab-skills` is still owed.
 
 ## Working conventions
 
