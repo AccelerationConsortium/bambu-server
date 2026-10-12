@@ -17,6 +17,15 @@
 The printer IP addresses and MAC addresses are intentionally not recorded here;
 they are site-specific configuration and belong in the gitignored local files.
 
+## Remote Bambu Studio through Tailscale (planned)
+
+- Planned for the week of **2026-10-19**; requested 2026-10-12.
+- Use the gateway host as a subnet router for the selected printer's `/32`
+  route, then bind Bambu Studio by local IP and access code.
+- Follow the [setup and rollback checklist](LAN_ONLY_MIGRATION.md#remote-bambu-studio-through-tailscale).
+  Host Tailscale state and end-to-end connectivity still need verification;
+  no network settings were changed. The existing P1S migration gates apply.
+
 ## Rich read-only telemetry (done)
 
 - `details` now enriches a `data_ready` status with read-only observations:

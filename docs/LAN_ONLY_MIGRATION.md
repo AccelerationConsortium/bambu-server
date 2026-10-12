@@ -90,6 +90,96 @@ printer's reply to a command, so the refusal itself was never observed.
 14. Delete the stale `gw_*.3mf` files left on the printer's storage by the
     failed attempts, from the printer's file manager.
 
+## Remote Bambu Studio through Tailscale
+
+**Status:** planned for the week of 2026-10-19, at the user's request on
+2026-10-12. No network or printer settings have been changed for this task.
+The P1S migration gates above still apply; this does not expand the migration
+to the H2D.
+
+The machine hosting the gateway can also act as a Tailscale subnet router if
+it can reach the printer locally and stays online. Bambu Studio then connects
+through that machine to the printer's local IP:
+
+```text
+Remote laptop with Bambu Studio
+  -> Tailscale
+  -> lab server acting as subnet router
+  -> printer in LAN Only Mode
+```
+
+Studio uses the printer's native network services, not the `bambu-server`
+HTTP API. Reaching the dashboard over Tailscale alone does not establish this
+route. Bambu Studio supports binding across subnets by IP and access code;
+use manual binding rather than relying on automatic discovery across the VPN.
+This combination should support remote Studio access, but has not been
+verified end to end in this lab. Bambu Handy remains unavailable in LAN Only
+Mode, and switching cloud/LAN mode remains an on-printer step.
+
+### Starting observations
+
+The shell environment inspected on 2026-10-12 had the Tailscale CLI installed
+and `net.ipv4.ip_forward = 1`. IPv6 forwarding was disabled. The CLI could not
+connect to the local Tailscale daemon. This does not establish whether the
+deployment host's daemon is stopped or merely inaccessible from this execution
+environment. Confirm on the actual host before changing anything. Existing
+advertised routes, tailnet policy, and remote Studio connectivity were not
+verified.
+
+### Setup checklist for the operator
+
+- [ ] Confirm the actual gateway host, its local route to the printer, and
+  the printer's stable address/DHCP reservation. Keep addresses and access
+  codes in gitignored local configuration, never in this document.
+- [ ] On that host, inspect `systemctl status tailscaled` and
+  `tailscale status`. Start/authenticate Tailscale only if needed; preserve
+  its existing identity, advertised routes, and other settings.
+- [ ] Confirm persistent IPv4 forwarding and host firewall forwarding rules
+  using the official subnet-router setup guide below. IPv6 forwarding is
+  needed only if IPv6 routes are part of the chosen setup.
+- [ ] Record the current routing configuration privately for rollback.
+  Advertise the selected printer's IPv4 address as a `/32` host route.
+  Include any existing advertised routes when updating the list; do not
+  replace them accidentally. This task needs no exit node or whole-campus
+  route.
+- [ ] Approve the advertised route in the Tailscale admin console and ensure
+  tailnet access policy permits the intended users/devices to reach the
+  printer's required services. Keep the default subnet-router SNAT unless
+  the network administrator has designed a return route.
+- [ ] Connect the remote laptop to the tailnet and enable acceptance of subnet
+  routes if needed (Linux clients require this explicitly). Check for an
+  overlapping local network and confirm the printer address routes through
+  Tailscale. Verify model-specific service requirements against Bambu's port
+  reference below; successful MQTT alone does not verify upload or camera.
+- [ ] Complete the migration prerequisites above and have a person enable
+  LAN Only Mode at the printer. Developer Mode is for the gateway's
+  third-party control integration, not a requirement added by Tailscale.
+- [ ] In a current Bambu Studio release, manually add/bind the printer using
+  its local IP and access code. Verify connection and telemetry from a laptop
+  outside the lab network. Check camera separately where supported.
+- [ ] Validate printing only as a separate human-operated step with someone
+  checking the physical plate, following the migration verification above.
+  A connection check does not authorize a print or retry an uncertain job.
+- [ ] Confirm gateway monitoring still works. After an agreed server reboot,
+  verify Tailscale and forwarding persist, and record completion in
+  `docs/TODO.md` without credentials or addresses.
+
+### Network rollback
+
+Withdraw only the newly added printer route and its route approval; restore
+the previously recorded advertised-route list and any access-policy changes.
+Restore forwarding/firewall settings only if this task changed them and no
+other service depends on them. This removes remote Studio access without
+changing the printer's mode. Printer-mode rollback is a separate operation
+described below.
+
+### References
+
+- [Tailscale subnet routers](https://tailscale.com/docs/features/subnet-routers)
+- [Tailscale subnet router setup](https://tailscale.com/kb/1019/subnets)
+- [Bambu Studio cross-subnet binding support](https://github.com/bambulab/BambuStudio/releases/tag/v01.10.00.74)
+- [Bambu printer network ports](https://wiki.bambulab.com/en/general/printer-network-ports)
+
 ## Rollback
 
 Turn Developer Mode and LAN Only Mode off on the printer (re-binding to the
