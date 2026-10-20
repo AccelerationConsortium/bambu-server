@@ -37,6 +37,7 @@ from .artifacts import (
     ArtifactKind,
     inspect_artifact,
 )
+from .backend import EXTERNAL_SPOOL_ID
 from .config import SubmissionSettings
 from .profiles import MachineProfile
 from .validation import CheckResult, ValidationVerdict, validate_model
@@ -170,11 +171,12 @@ class SliceProvenance(BaseModel):
 
 
 class TrayAssignment(BaseModel):
-    """One filament slot of the sliced plate mapped to one loaded AMS tray.
+    """One filament slot of the sliced plate mapped to one loaded tray.
 
     Explicit on purpose: the printer will happily feed whatever tray the
     mapping names, so the person starting the print chooses, and the gateway
-    checks the choice against what the tray reports holding.
+    checks the choice against what the tray reports holding. ``ams_id`` 254
+    with ``tray_id`` 0 names the external spool.
     """
 
     filament_id: int = Field(ge=1, le=16)
@@ -182,10 +184,15 @@ class TrayAssignment(BaseModel):
     tray_id: int = Field(ge=0, le=3)
 
     @property
-    def printer_index(self) -> int:
-        """The flat tray index the print command uses (``ams_id * 4 + tray``)."""
+    def external(self) -> bool:
+        return self.ams_id == EXTERNAL_SPOOL_ID
 
-        return self.ams_id * 4 + self.tray_id
+    @property
+    def printer_index(self) -> int:
+        """The flat tray index the print command uses (``ams_id * 4 + tray``),
+        or the external spool's own id."""
+
+        return EXTERNAL_SPOOL_ID if self.external else self.ams_id * 4 + self.tray_id
 
 
 PlateCheckMethod = Literal["printer_camera", "in_person"]

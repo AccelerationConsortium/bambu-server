@@ -229,3 +229,29 @@ def test_unknown_or_malformed_inventory_is_not_reported_as_empty(payload):
 def test_known_empty_inventory_is_distinct_from_unknown():
     assert _inventory({"ams": [{"id": "1", "tray": [{"id": "0"}]}]}) == ([1], [])
     assert _inventory({"ams": []}) == ([], [])
+
+
+def _external(vt_tray):
+    from types import SimpleNamespace
+
+    backend = object.__new__(BambuLabsBackend)
+    backend._printer = SimpleNamespace(
+        mqtt_client=SimpleNamespace(dump=lambda: {"print": {"vt_tray": vt_tray}})
+    )
+    return backend._read_external_spool()
+
+
+def test_external_spool_is_decoded_like_a_tray():
+    spool = _external({
+        "id": "254", "tray_type": "PLA", "tray_color": "8E9089FF",
+        "nozzle_temp_min": "190", "nozzle_temp_max": "230", "tag_uid": "secret-tag",
+    })
+    assert (spool.ams_id, spool.tray_id) == (254, 0)
+    assert spool.tray_type == "PLA"
+    assert spool.tray_color == "8E9089FF"
+    assert (spool.nozzle_temp_min, spool.nozzle_temp_max) == (190, 230)
+
+
+@pytest.mark.parametrize("vt_tray", [None, "bad", {}, {"id": "254", "tray_type": ""}])
+def test_an_external_spool_without_a_selected_filament_is_not_loaded(vt_tray):
+    assert _external(vt_tray) is None

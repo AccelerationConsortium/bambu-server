@@ -21,7 +21,9 @@ Monitoring is the default. A human approved (2026-10-04) a narrow,
 human-in-the-loop control plane, enabled per deployment by `dispatch.enabled`:
 STATUS_SPEC v1.1 claims plus exactly four verbs -- camera snapshot, chamber
 light (added 2026-10-05), `start_print` for an approved job after a person
-confirms the plate is empty, and `stop_print`. Homing was considered and
+confirms the plate is empty, and `stop_print`. On 2026-10-20 a human approved
+the external spool (`vt_tray`) as a `start_print` mapping target for printers
+without an AMS, checked like an AMS tray. Homing was considered and
 deliberately not added: it moves the bed into whatever is on the plate. All printer commands go through `bambu_server.dispatch` and
 the backend's control methods; nothing else may call `bambulabs_api` command
 methods. Adding a verb, relaxing a gate, or letting an agent start a print

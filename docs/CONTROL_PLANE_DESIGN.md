@@ -5,7 +5,14 @@ narrow slice of this design: phase 1 (claims, `details.claimed_by`,
 `allowed_actions` from the shared gate), `stop_print` from phase 3, and
 `start_print` with its upload from phase 4, plus a camera `snapshot` verb for
 the plate check (not in the original table), and on 2026-10-05 the phase 2
-`light` verb (chamber light, any observable state, claim required). The rest of
+`light` verb (chamber light, any observable state, claim required). On
+2026-10-20 the external spool (MQTT `vt_tray`, addressed as AMS 254 tray 0) was
+approved as a `start_print` mapping target, so a printer with no AMS (the A1)
+can be dispatched. It gets the same material and nozzle-window checks as an AMS
+tray, maps a single-filament job only (the command's `use_ams` is all or
+nothing), and is sent as `use_ams: false` with mapping `[254]`, as Bambu Studio
+does. It counts as loaded only when the printer names a filament for it, which
+on the A1 is what the operator selects after feeding the spool. The rest of
 phase 2, pause/resume, temperature, motion, filament, and every excluded verb
 remain unapproved. Homing to raise the plate into camera view was proposed and
 declined: it drives the nozzle into the plate before anyone knows it is clear.

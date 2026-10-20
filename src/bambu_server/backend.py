@@ -38,6 +38,12 @@ _CAMERA_PORT = 6000
 _NO_CHAMBER_SENSOR_MODELS = frozenset({"p1p", "p1s", "a1", "a1 mini"})
 
 
+#: The printer-side id of the external spool holder (MQTT ``vt_tray``). Bambu
+#: Studio addresses it with this id, and a job fed from it is started with
+#: ``use_ams`` off. It is carried through the gateway as AMS unit 254, slot 0.
+EXTERNAL_SPOOL_ID = 254
+
+
 def _has_chamber_sensor(model: str | None) -> bool:
     if not model:
         return True
@@ -125,6 +131,8 @@ class PrinterReading:
     skipped_objects: list[int] | None = None
     ams_trays: list[AmsTrayReading] | None = None
     ams_unit_ids: list[int] | None = None
+    #: The external spool, when the printer reports a filament on it.
+    external_spool: AmsTrayReading | None = None
 
 
 class AdvancedReading(TypedDict):
@@ -139,6 +147,7 @@ class AdvancedReading(TypedDict):
     skipped_objects: list[int] | None
     ams_trays: list[AmsTrayReading] | None
     ams_unit_ids: list[int] | None
+    external_spool: AmsTrayReading | None
 
 
 class PrinterBackend(Protocol):
@@ -446,6 +455,7 @@ class BambuLabsBackend:
             "skipped_objects": None,
             "ams_trays": None,
             "ams_unit_ids": None,
+            "external_spool": None,
         }
 
         try:
@@ -480,7 +490,23 @@ class BambuLabsBackend:
             pass
 
         values["ams_unit_ids"], values["ams_trays"] = self._read_ams_inventory()
+        values["external_spool"] = self._read_external_spool()
         return values
+
+    def _read_external_spool(self) -> AmsTrayReading | None:
+        """The external spool (``vt_tray``), decoded like an AMS tray.
+
+        Reported as loaded only when the printer names a filament for it --
+        on the A1 that is what the operator selects on the screen after
+        feeding a spool by hand. Read from the same local cache as the AMS.
+        """
+        try:
+            tray = self._printer.mqtt_client.dump().get("print", {}).get("vt_tray")
+            if not isinstance(tray, dict):
+                return None
+            return _tray_reading(EXTERNAL_SPOOL_ID, 0, tray)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
 
     def _read_ams_inventory(self) -> tuple[list[int] | None, list[AmsTrayReading] | None]:
         """Decode only allowlisted fields from the MQTT client's local cache.
@@ -511,32 +537,38 @@ class BambuLabsBackend:
                     if tray_id is None or tray_id < 0 or tray_id in seen:
                         return None, None
                     seen.add(tray_id)
-                    material = _tray_text(tray.get("tray_type"))
-                    # An id-only slot is empty; optional calibration/spool-tag
-                    # fields are not evidence that filament is loaded.
-                    if material is None:
-                        continue
-                    remaining = _optional_int(tray.get("remain"))
-                    trays.append(
-                        AmsTrayReading(
-                            ams_id=ams_id,
-                            tray_id=tray_id,
-                            tray_type=material,
-                            tray_color=_tray_text(tray.get("tray_color")),
-                            tray_weight=_tray_text(tray.get("tray_weight")),
-                            tray_diameter=_tray_text(tray.get("tray_diameter")),
-                            tray_temp=_tray_text(tray.get("tray_temp")),
-                            nozzle_temp_min=_optional_int(tray.get("nozzle_temp_min")),
-                            nozzle_temp_max=_optional_int(tray.get("nozzle_temp_max")),
-                            remaining_percent=(
-                                remaining if remaining is not None and 0 <= remaining <= 100
-                                else None
-                            ),
-                        )
-                    )
+                    reading = _tray_reading(ams_id, tray_id, tray)
+                    if reading is not None:
+                        trays.append(reading)
         except (AttributeError, TypeError, ValueError, OverflowError):
             return None, None
         return unit_ids, trays
+
+
+def _tray_reading(ams_id: int, tray_id: int, tray: dict) -> AmsTrayReading | None:
+    """Decode one tray's allowlisted fields, or ``None`` when it holds nothing.
+
+    An id-only slot is empty; optional calibration/spool-tag fields are not
+    evidence that filament is loaded.
+    """
+    material = _tray_text(tray.get("tray_type"))
+    if material is None:
+        return None
+    remaining = _optional_int(tray.get("remain"))
+    return AmsTrayReading(
+        ams_id=ams_id,
+        tray_id=tray_id,
+        tray_type=material,
+        tray_color=_tray_text(tray.get("tray_color")),
+        tray_weight=_tray_text(tray.get("tray_weight")),
+        tray_diameter=_tray_text(tray.get("tray_diameter")),
+        tray_temp=_tray_text(tray.get("tray_temp")),
+        nozzle_temp_min=_optional_int(tray.get("nozzle_temp_min")),
+        nozzle_temp_max=_optional_int(tray.get("nozzle_temp_max")),
+        remaining_percent=(
+            remaining if remaining is not None and 0 <= remaining <= 100 else None
+        ),
+    )
 
 
 def _tray_text(value: object) -> str | None:

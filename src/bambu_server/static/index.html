@@ -154,7 +154,7 @@
       </div>
       <div>
         <fieldset>
-          <legend>Filament → AMS tray</legend>
+          <legend>Filament → tray</legend>
           <div id="tray-rows"></div>
         </fieldset>
         <label class="confirm"><input type="checkbox" id="plate-ok">
@@ -267,6 +267,9 @@ const PLA_BASIC_COLORS = {
   FEC600: "Sunflower Yellow", "847D48": "Bronze", E4BD68: "Gold"
 };
 
+// The external spool holder, as the gateway addresses it (AMS id 254, tray 0).
+const EXTERNAL_SPOOL = 254;
+
 function filamentColor(tray) {
   const code = String(tray.tray_color || "").replace(/^#/, "").toUpperCase();
   if (tray.tray_color_name) {
@@ -316,11 +319,12 @@ function renderSpecs(profile) {
   if (forbidden.length) chips.push("not runnable: " + forbidden.join(", "));
   const trays = (profile.observed && profile.observed.loaded_trays) || [];
   const units = profile.observed && profile.observed.ams_unit_ids;
-  chips.push(trays.length ? trays.length + " AMS tray(s) loaded" :
+  const amsTrays = trays.filter(tray => tray.ams_id !== EXTERNAL_SPOOL);
+  chips.push(amsTrays.length ? amsTrays.length + " AMS tray(s) loaded" :
     (units ? "no loaded AMS filament reported" : "no AMS inventory reported"));
   for (const tray of trays) {
     const unit = tray.ams_id;
-    const location = unit >= 0 && unit < 26 ?
+    const location = unit === EXTERNAL_SPOOL ? "External spool" : unit >= 0 && unit < 26 ?
       String.fromCharCode(65 + unit) + (tray.tray_id + 1) :
       (unit >= 128 && unit < 154 ? "HT " + String.fromCharCode(97 + unit - 128) :
         "AMS " + unit + " tray " + tray.tray_id);
@@ -608,11 +612,14 @@ function renderTrayRows(job) {
     select.id = id;
     select.dataset.filament = use.filament_id;
     // AMS HT units (ids 128+) are not offered: dispatch does not map them yet.
-    const matching = trays.filter(t => t.ams_id < 4 &&
+    // The external spool (254) is, for a single-filament plate.
+    const matching = trays.filter(t => (t.ams_id < 4 || (t.ams_id === EXTERNAL_SPOOL && uses.length === 1)) &&
       (t.tray_type || "").toUpperCase() === use.filament_type.toUpperCase());
     if (!matching.length) select.append(el("option", "No loaded " + use.filament_type + " tray"));
     for (const tray of matching) {
-      const option = el("option", "AMS " + tray.ams_id + " tray " + (tray.tray_id + 1) + " · " +
+      const where = tray.ams_id === EXTERNAL_SPOOL ? "External spool" :
+        "AMS " + tray.ams_id + " tray " + (tray.tray_id + 1);
+      const option = el("option", where + " · " +
         (tray.tray_color_name || tray.tray_color || "unknown color") +
         (tray.remaining_percent != null ? " · " + tray.remaining_percent + "%" : ""));
       option.value = tray.ams_id + ":" + tray.tray_id;

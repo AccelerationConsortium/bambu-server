@@ -513,7 +513,9 @@ class Dispatcher:
                 remote_name=remote_name,
                 plate_index=record.plate_index,
                 bed_type=plate,
-                use_ams=True,
+                # Off for the external spool, as Bambu Studio sends it; the
+                # mapping then names the spool by its own id (254).
+                use_ams=not any(a.external for a in mapping),
                 ams_mapping=tuple(a.printer_index for a in mapping),
                 bed_leveling=self.settings.bed_leveling,
                 flow_calibration=self.settings.flow_calibration,
@@ -755,7 +757,10 @@ def check_tray_mapping(
     if not trays:
         raise ControlRefusal(
             412,
-            {"detail": "no loaded AMS trays are reported, so the mapping cannot be checked"},
+            {
+                "detail": "no loaded AMS trays or external spool are reported, so the "
+                "mapping cannot be checked"
+            },
         )
     problems: list[str] = []
     seen: set[int] = set()
@@ -767,8 +772,14 @@ def check_tray_mapping(
         if needed is None:
             problems.append(f"filament {assignment.filament_id} is not used by this plate")
             continue
-        where = f"AMS {assignment.ams_id} tray {assignment.tray_id}"
-        if assignment.ams_id >= _STANDARD_AMS_UNITS:
+        if assignment.external:
+            where = "the external spool"
+            if assignment.tray_id != 0:
+                problems.append("the external spool is addressed as tray 0")
+                continue
+        else:
+            where = f"AMS {assignment.ams_id} tray {assignment.tray_id}"
+        if assignment.ams_id >= _STANDARD_AMS_UNITS and not assignment.external:
             # AMS HT units report ids from 128. The print command's flat tray
             # index (ams_id * 4 + tray) is only known to be right for standard
             # units 0-3; sending a guessed index would feed the wrong spool.
@@ -801,6 +812,10 @@ def check_tray_mapping(
     unmapped = sorted(set(uses) - seen)
     if unmapped:
         problems.append(f"filament(s) {unmapped} have no tray assigned")
+    if any(a.external for a in assignments) and len(assignments) > 1:
+        # One spool, and the start command's use_ams switch is all or nothing:
+        # a job fed from the external spool can use no other tray.
+        problems.append("the external spool can feed a single-filament job only")
     if problems:
         raise ControlRefusal(
             412,

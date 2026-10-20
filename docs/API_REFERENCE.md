@@ -11,7 +11,9 @@ viewer at `/api/equipment/bambu_gateway/documentation/docs`.
 `GET /printers` discovers configured printers. For each ID:
 
 - `GET /printers/{id}/status` is the STATUS_SPEC v1.2 envelope; inventory is
-  under `details.ams_trays` and `details.ams_unit_ids`.
+  under `details.ams_trays` and `details.ams_unit_ids`, and the external spool,
+  when a filament is selected for it, under `details.external_spool` (same tray
+  fields, `ams_id` 254, `tray_id` 0; never counted in `ams_trays`).
 - `GET /printers/{id}/profile` exposes typed `observed.loaded_trays` and
   `observed.ams_unit_ids`. Stale/unavailable observations are withheld.
 - `GET /printers/{id}/queue` shows the observed running job and waiting jobs.
@@ -21,7 +23,7 @@ monitor's cache and never initiate printer I/O.
 
 | Tray field | Meaning |
 |---|---|
-| `ams_id`, `tray_id` | Printer-reported unit ID and zero-based slot; together they identify a tray. HT unit IDs are preserved. |
+| `ams_id`, `tray_id` | Printer-reported unit ID and zero-based slot; together they identify a tray. HT unit IDs are preserved; 254/0 is the external spool, which `observed.loaded_trays` includes. |
 | `tray_index` | Legacy nullable field. Do not use MQTT `n` as a slot index. |
 | `tray_type` | Reported material, such as PLA, PETG, PP, or PC. |
 | `tray_color` | Reported RGB/RGBA hex, retained even when a display label is declared. |

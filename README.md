@@ -250,7 +250,9 @@ v1.1 claims and three verbs under `/printers/{id}/control/`:
 is observable, idle, not in a failed state and cold (`safe_bed_c`,
 `safe_nozzle_c`); a build plate is declared and matches the plate the job was
 sliced for; the job revalidates against the printer's current state; every
-filament is mapped to a loaded tray holding that material; and the request says
+filament is mapped to a loaded tray holding that material (an AMS tray, or the
+external spool as `ams_id` 254 / `tray_id` 0 for a single-filament job on a
+printer without an AMS); and the request says
 `plate_confirmed_empty: true`, by camera snapshot taken under this claim or in
 person. With `require_verified_identity` (the default) both the approver and the
 person starting it must be edge-verified identities (403 otherwise).
@@ -278,7 +280,7 @@ whose live field is blank — a dual-nozzle H2D reports no parsable nozzle type.
 |---|---|
 | `machine_compatible` | sliced for another printer, or a nozzle diameter/type the machine does not have |
 | `material_allowed` | the filament is on the machine's forbidden list, or the request's declared material contradicts the sliced one |
-| `material_filament_match` | any required material has no matching loaded AMS tray |
+| `material_filament_match` | any required material has no matching loaded AMS tray or external spool |
 | `nozzle_temp_in_band` | the configured **or commanded** nozzle temperature is outside the machine's limit or the loaded filament's window |
 | `bed_chamber_temp_in_band` | the bed temperature is out of band, or a heated chamber is requested on a machine without one |
 | `build_fits_plate` | the model's XY footprint exceeds the declared plate |

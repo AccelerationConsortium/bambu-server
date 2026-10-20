@@ -7,7 +7,8 @@ the Bambu printer gateway.
 
 1. Control is limited to what a human approved on 2026-10-04: cooperative
    claims, a camera snapshot, the chamber light (approved 2026-10-05),
-   `start_print` of an approved job, and
+   `start_print` of an approved job (from an AMS tray or, approved 2026-10-20,
+   the external spool, checked the same way), and
    `stop_print`, all behind `dispatch.enabled` and the gates in
    `bambu_server.dispatch`. Any other verb, a relaxed gate, or integration with
    `lab-skills` plan execution needs a new, explicitly approved design.

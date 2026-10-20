@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from bambu_server.backend import AmsTrayReading
 from bambu_server.config import Settings
 from bambu_server.main import create_app
 
@@ -310,6 +311,114 @@ def test_ams_ht_trays_are_not_mapped(
     )
     assert response.status_code == 412
     assert "AMS HT" in response.json()["problems"][0]
+    assert control_backend.uploads == []
+
+
+# -- external spool (no AMS) -------------------------------------------------------
+
+
+def _spool(tray_type: str = "PLA") -> AmsTrayReading:
+    # The A1 with no AMS: the operator feeds a spool by hand and selects the
+    # filament on the screen, which the printer reports as vt_tray.
+    return AmsTrayReading(
+        ams_id=254, tray_id=0, tray_type=tray_type, tray_color="000000FF",
+        nozzle_temp_min=190, nozzle_temp_max=240,
+    )
+
+
+@pytest.fixture
+def spool_client(
+    settings: Settings, control_backend: FakeBackend
+) -> Iterator[TestClient]:
+    control_backend.reading = replace(
+        control_backend.reading, ams_unit_ids=[], ams_trays=[], external_spool=_spool()
+    )
+    app = create_app(
+        settings=_control_settings(settings),
+        backend_factory=lambda _d, _c: control_backend,
+    )
+    with TestClient(app) as client:
+        yield client
+
+
+EXTERNAL = [{"filament_id": 1, "ams_id": 254, "tray_id": 0}]
+
+
+def test_a_printer_without_an_ams_prints_from_the_external_spool(
+    spool_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    status = spool_client.get(f"{BASE}/status").json()["details"]
+    assert status["external_spool"]["tray_type"] == "PLA"
+    assert status["external_spool"]["tray_color_name"] == "Black"
+    assert status["ams_trays"] == []  # not counted as an AMS slot
+
+    job_id = _approved_job(spool_client, tmp_path)  # intake matches the spool
+    headers = {"X-Claim-Token": _claim(spool_client)}
+    response = spool_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id, ams_mapping=EXTERNAL)
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "running"
+    (command,) = control_backend.start_commands
+    assert command.use_ams is False
+    assert command.ams_mapping == (254,)
+
+
+def test_the_external_spool_is_checked_like_a_tray(
+    spool_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(spool_client, tmp_path)
+    # Someone swaps the spool for PETG after the job was approved.
+    control_backend.reading = replace(control_backend.reading, external_spool=_spool("PETG"))
+    time.sleep(0.7)  # let the monitor observe it
+    headers = {"X-Claim-Token": _claim(spool_client)}
+    response = spool_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id, ams_mapping=EXTERNAL)
+    )
+    # Revalidation against the current state refuses before the mapping is
+    # even read: the spool no longer holds the job's material.
+    assert response.status_code == 412
+    assert "material_filament_match" in response.json()["reasons"]
+    assert control_backend.uploads == [] and control_backend.start_commands == []
+
+
+def test_an_unloaded_external_spool_cannot_be_mapped(
+    spool_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(spool_client, tmp_path)
+    control_backend.reading = replace(control_backend.reading, external_spool=None)
+    time.sleep(0.7)
+    headers = {"X-Claim-Token": _claim(spool_client)}
+    response = spool_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id, ams_mapping=EXTERNAL)
+    )
+    assert response.status_code == 412
+    assert "material_filament_match" in response.json()["reasons"]
+    assert control_backend.uploads == []
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        # The external spool alongside an AMS tray: use_ams cannot be both.
+        [*EXTERNAL, {"filament_id": 2, "ams_id": 0, "tray_id": 1}],
+        # The spool has one slot.
+        [{"filament_id": 1, "ams_id": 254, "tray_id": 1}],
+    ],
+)
+def test_the_external_spool_is_single_filament_and_single_slot(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path, mapping
+) -> None:
+    control_backend.reading = replace(control_backend.reading, external_spool=_spool())
+    time.sleep(0.7)
+    job_id = _approved_job(control_client, tmp_path)
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id, ams_mapping=mapping)
+    )
+    assert response.status_code == 412
+    problems = " ".join(response.json()["problems"])
+    assert "single-filament job only" in problems or "addressed as tray 0" in problems
     assert control_backend.uploads == []
 
 
