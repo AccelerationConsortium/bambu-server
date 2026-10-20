@@ -140,6 +140,38 @@ def test_backend_starts_only_mqtt_and_builds_reading(monkeypatch) -> None:
     # model's configured temperature against.
     assert reading.ams_trays[0].nozzle_temp_min == 190
     assert reading.ams_trays[0].nozzle_temp_max == 240
+    # No model declared: the printer's chamber value is passed through.
+    assert reading.chamber_temperature_c == 35.0
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("P1S", None),
+        ("A1", None),
+        ("A1 mini", None),
+        ("Bambu Lab  P1P", None),
+        ("X1 Carbon", 35.0),
+        ("H2D", 35.0),
+        (None, 35.0),
+    ],
+)
+def test_chamber_placeholder_is_dropped_on_models_without_a_sensor(
+    monkeypatch, model, expected
+) -> None:
+    # The P1 and A1 series report a fixed 5 C chamber; a value from them is
+    # never a reading, so it must not surface as one.
+    fake = FakePrinter("printer.invalid", "access-secret", "serial-secret")
+    monkeypatch.setattr(backend_module.bambu, "Printer", lambda *_args: fake)
+    backend = BambuLabsBackend(
+        PrinterDefinition(id="bambu_one", name="One", model=model, env_prefix="BAMBU_ONE"),
+        PrinterCredentials(
+            host="printer.invalid",
+            access_code="access-secret",
+            serial="serial-secret",
+        ),
+    )
+    assert backend.read().chamber_temperature_c == expected
 
 
 def _inventory(payload):

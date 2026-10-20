@@ -31,6 +31,19 @@ logger = logging.getLogger(__name__)
 #: The printer's chamber-camera service (P1 series: authenticated JPEG frames).
 _CAMERA_PORT = 6000
 
+#: Models with no chamber temperature sensor. Their firmware still reports a
+#: fixed ``chamber_temper`` (5 C on the P1S and A1), which is a placeholder, not
+#: a reading. Matched exactly against the operator-declared ``model``; an
+#: undeclared or unlisted model keeps whatever the printer reports.
+_NO_CHAMBER_SENSOR_MODELS = frozenset({"p1p", "p1s", "a1", "a1 mini"})
+
+
+def _has_chamber_sensor(model: str | None) -> bool:
+    if not model:
+        return True
+    name = " ".join(model.lower().split()).removeprefix("bambu lab ")
+    return name not in _NO_CHAMBER_SENSOR_MODELS
+
 
 class PrinterCommandError(RuntimeError):
     """A command could not be delivered to the printer.
@@ -200,6 +213,7 @@ class BambuLabsBackend:
         )
         self._lock = threading.Lock()
         self._data_updated_at: datetime | None = None
+        self._has_chamber_sensor = _has_chamber_sensor(definition.model)
         self._printer.mqtt_client.on_message_handler = self._on_message
 
     def _on_message(self, *_args: object) -> None:
@@ -399,7 +413,11 @@ class BambuLabsBackend:
             activity=str(self._printer.get_current_state()),
             bed_temperature_c=_number(self._printer.get_bed_temperature()),
             nozzle_temperature_c=_number(self._printer.get_nozzle_temperature()),
-            chamber_temperature_c=_number(self._printer.get_chamber_temperature()),
+            chamber_temperature_c=(
+                _number(self._printer.get_chamber_temperature())
+                if self._has_chamber_sensor
+                else None
+            ),
             progress_percent=_number(self._printer.get_percentage()),
             remaining_time_minutes=_number(self._printer.get_time()),
             current_layer=int(self._printer.current_layer_num()),
