@@ -81,6 +81,13 @@ _FORBIDDEN_COMMANDS: dict[str, str] = {
     "M999": "resets the controller after a halt",
 }
 
+# The one M500 accepted (approved 2026-10-20): Bambu's stock machine start
+# gcode saves the bed mesh right after probing it ("G29 ... M400 / M500 ; save
+# cali data"). It is allowed only directly after a G29, with nothing but M400
+# between, and only inside the start gcode -- confirmed by the slicer's end
+# marker appearing afterwards. Any other M500 is refused as before.
+_START_GCODE_END_MARKER = "MACHINE_START_GCODE_END"
+
 _NOZZLE_TEMP_COMMANDS = {"M104", "M109"}
 _BED_TEMP_COMMANDS = {"M140", "M190"}
 
@@ -170,12 +177,17 @@ class ArtifactFacts(BaseModel):
 class _Scan:
     """Accumulates observations over one pass of a gcode stream."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, from_start: bool = False) -> None:
         self.settings: dict[str, str] = {}
         self.total_minutes: float | None = None
         self.fallback_minutes: float | None = None
         self.command_count = 0
-        self.findings: list[GcodeFinding] = []
+        self._findings: list[GcodeFinding] = []
+        # Only a scan that begins at the top of the file can be inside the
+        # machine start gcode; a tail scan never is.
+        self._in_start_gcode = from_start
+        self._last_word: str | None = None
+        self._unconfirmed_mesh_saves = 0
         self.relative_positioning_seen = False
         self._min = [None, None, None]  # type: list[float | None]
         self._max = [None, None, None]  # type: list[float | None]
@@ -197,9 +209,20 @@ class _Scan:
             round(high_z - low_z, 3),  # type: ignore[operator]
         )
 
+    @property
+    def findings(self) -> list[GcodeFinding]:
+        findings = list(self._findings)
+        if self._unconfirmed_mesh_saves and len(findings) < _MAX_FINDINGS:
+            # A G29-then-M500 the scan never saw close the start gcode.
+            findings.append(GcodeFinding(
+                code="forbidden_command",
+                detail=f"M500 {_FORBIDDEN_COMMANDS['M500']}; refused in a submitted job",
+            ))
+        return findings
+
     def add_finding(self, code: str, detail: str) -> None:
-        if len(self.findings) < _MAX_FINDINGS:
-            self.findings.append(GcodeFinding(code=code, detail=detail))
+        if len(self._findings) < _MAX_FINDINGS:
+            self._findings.append(GcodeFinding(code=code, detail=detail))
 
     def observe_line(self, line: str) -> None:
         stripped = line.strip()
@@ -211,6 +234,9 @@ class _Scan:
         self._observe_command(stripped)
 
     def _observe_comment(self, comment: str) -> None:
+        if self._in_start_gcode and comment.lstrip(";").strip().upper() == _START_GCODE_END_MARKER:
+            self._in_start_gcode = False
+            self._unconfirmed_mesh_saves = 0  # they were in the start gcode
         match = _COMMENT_SETTING_RE.match(comment)
         if match:
             key, raw = match.group(1).lower(), match.group(2).strip()
@@ -234,6 +260,13 @@ class _Scan:
         if not _COMMAND_WORD_RE.match(word):
             return
         self.command_count += 1
+        previous = self._last_word
+        if word != "M400":  # a wait between the probe and the save is fine
+            self._last_word = word
+
+        if word == "M500" and self._in_start_gcode and previous == "G29":
+            self._unconfirmed_mesh_saves += 1
+            return
 
         if word == "G90":
             self._absolute = True
@@ -346,7 +379,7 @@ def _scan_stream(stream: IO[bytes], *, budget: int) -> tuple[_Scan, bool]:
     file) but its motion extents are incomplete, so the caller discards them.
     """
 
-    scan = _Scan()
+    scan = _Scan(from_start=True)
     consumed = 0
     remainder = b""
     exhausted = False

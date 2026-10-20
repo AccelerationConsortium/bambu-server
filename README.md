@@ -284,7 +284,7 @@ whose live field is blank — a dual-nozzle H2D reports no parsable nozzle type.
 | `nozzle_temp_in_band` | the configured **or commanded** nozzle temperature is outside the machine's limit or the loaded filament's window |
 | `bed_chamber_temp_in_band` | the bed temperature is out of band, or a heated chamber is requested on a machine without one |
 | `build_fits_plate` | the model's XY footprint exceeds the declared plate |
-| `gcode_sanity` | the toolpath contains a refused command (firmware update, EEPROM write, PID retune, cold-extrude override, …) |
+| `gcode_sanity` | the toolpath contains a refused command (firmware update, EEPROM write, PID retune, cold-extrude override, …). One `M500` is accepted: Bambu's stock bed-mesh save directly after `G29` in the machine start gcode (approved 2026-10-20) |
 | `params_present` | filament type, nozzle temperature or bed temperature is missing — or a `.3mf` carries no sliced plate, so no printer could run it |
 
 One failing check rejects the submission, and rejection is terminal.

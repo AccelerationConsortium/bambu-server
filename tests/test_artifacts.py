@@ -87,6 +87,46 @@ def test_forbidden_command_is_reported(tmp_path: Path) -> None:
     assert "M997" in details and "M502" in details
 
 
+# Bambu's stock A1 machine start gcode, cut down to the bed-leveling step.
+STOCK_MESH_SAVE = """M622 J1
+    M1002 gcode_claim_action : 1
+    G29 A1 X117.7 Y38.9 I43.2 J10.2
+    M400
+    M500 ; save cali data
+M623
+"""
+START_END = "; MACHINE_START_GCODE_END\n"
+
+
+def _forbidden(facts) -> list[str]:
+    return [f.detail for f in facts.gcode_findings if f.code == "forbidden_command"]
+
+
+def test_the_stock_bed_mesh_save_in_the_start_gcode_is_accepted(tmp_path: Path) -> None:
+    body = STOCK_MESH_SAVE + START_END + SAMPLE_GCODE
+    facts = _inspect(write_gcode(tmp_path / "a1.gcode", body))
+    assert _forbidden(facts) == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # No probe right before it.
+        "G28\nM500\n" + START_END + SAMPLE_GCODE,
+        # Something other than a wait between the probe and the save.
+        "G29 A1\nG1 Z5\nM500\n" + START_END + SAMPLE_GCODE,
+        # After the start gcode has ended.
+        START_END + "G29 A1\nM400\nM500\n" + SAMPLE_GCODE,
+        # The start gcode's end marker never appears.
+        STOCK_MESH_SAVE + SAMPLE_GCODE,
+    ],
+    ids=["no-probe", "not-adjacent", "after-start", "no-end-marker"],
+)
+def test_any_other_m500_is_still_refused(tmp_path: Path, body: str) -> None:
+    facts = _inspect(write_gcode(tmp_path / "risky.gcode", body))
+    assert any("M500" in detail for detail in _forbidden(facts))
+
+
 def test_relative_positioning_withholds_the_footprint(tmp_path: Path) -> None:
     body = SAMPLE_GCODE + "G91\nG1 X5 Y5\n"
     facts = _inspect(write_gcode(tmp_path / "relative.gcode", body))

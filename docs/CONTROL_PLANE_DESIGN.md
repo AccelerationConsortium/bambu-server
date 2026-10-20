@@ -12,7 +12,12 @@ can be dispatched. It gets the same material and nozzle-window checks as an AMS
 tray, maps a single-filament job only (the command's `use_ams` is all or
 nothing), and is sent as `use_ams: false` with mapping `[254]`, as Bambu Studio
 does. It counts as loaded only when the printer names a filament for it, which
-on the A1 is what the operator selects after feeding the spool. The rest of
+on the A1 is what the operator selects after feeding the spool. The same day
+the gcode check was narrowed for one case: current Bambu Studio start gcode
+saves the bed mesh with `M500` right after probing (`G29`, optionally `M400`),
+so that `M500` is accepted when it sits inside the machine start gcode, as
+confirmed by the `; MACHINE_START_GCODE_END` marker after it. Every other
+`M500`, and every other refused command, is still refused. The rest of
 phase 2, pause/resume, temperature, motion, filament, and every excluded verb
 remain unapproved. Homing to raise the plate into camera view was proposed and
 declined: it drives the nozzle into the plate before anyone knows it is clear.
