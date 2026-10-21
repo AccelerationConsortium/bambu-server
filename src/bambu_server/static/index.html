@@ -4,6 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Submit a print — AC Bambu Gateway</title>
+<script>
+  // Behind the edge this page lives inside the dashboard's 3D Printers panel.
+  // Opened on its own there (an old bookmark, a copied link), send the visitor
+  // to that panel rather than keep a second, full-page copy of it. Run first,
+  // before any style or theme is applied, so nothing of this page is drawn on
+  // the way (it used to flash in the OS theme). Direct gateway access (no
+  // prefix) still serves the page for local operation.
+  if (window.location.pathname.replace(/\/ui\/?$/, "") && window.top === window.self) {
+    window.location.replace("/utils/printers");
+  }
+</script>
 <style>
   :root {
     color-scheme: light;
@@ -74,11 +85,11 @@
   .machine-grid .specs { margin-top: 0; }
   .machine-grid .camera-frame { max-width: 480px; }
   /* Submission: the form and a file preview on the left, the checklist on the right. */
-  .submit-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 20px; align-items: start; }
+  .submit-grid { display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.45fr); gap: 20px; align-items: start; }
   @media (max-width: 760px) { .submit-grid { grid-template-columns: 1fr; } }
   .submit-form { display: grid; gap: 12px; }
   .submit-form [hidden] { display: none; }
-  .preview { width: 100%; max-width: 180px; aspect-ratio: 1; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .preview { width: 100%; max-width: 220px; aspect-ratio: 1; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
   .preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .preview-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
   tr.pending td { color: var(--muted); }
@@ -136,6 +147,14 @@
         <div>
           <label for="file">File (.3mf, .gcode, or .stl to slice)</label>
           <input type="file" id="file" accept=".3mf,.gcode,.stl">
+        </div>
+        <div>
+          <!-- Standard lab holders, printable without uploading a file. No
+               catalog yet: the list is a placeholder until one is defined. -->
+          <label for="standard-part">Or print a standard holder</label>
+          <select id="standard-part" disabled>
+            <option value="">None available yet</option>
+          </select>
         </div>
         <div>
           <label for="material">Material (required for .stl; otherwise read from the file if blank)</label>
@@ -213,13 +232,6 @@ const el = (tag, text, cls) => {
 // and no build-time configuration.
 const API_BASE = window.location.pathname.replace(/\/ui\/?$/, "");
 
-// Behind the edge this page lives inside the dashboard's 3D Printers panel.
-// Opened on its own there (an old bookmark, a copied link), send the visitor
-// to that panel rather than keep a second, full-page copy of it. Direct
-// gateway access (no prefix) still serves the page for local operation.
-if (API_BASE && window.top === window.self) {
-  window.location.replace("/utils/printers");
-}
 
 async function api(path, options) {
   const response = await fetch(API_BASE + path, options);
