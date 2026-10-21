@@ -67,10 +67,10 @@
   @media (max-width: 760px) { .start-grid { grid-template-columns: 1fr; } }
   .snapshot { width: 100%; max-height: 360px; object-fit: contain; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; display: block; }
   /* Camera on the left at a fixed size, the machine's detail tiles beside it. */
-  .machine-grid { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 10px; }
+  .machine-grid { display: grid; grid-template-columns: 420px minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 10px; }
   @media (max-width: 620px) { .machine-grid { grid-template-columns: 1fr; } }
   .machine-grid .specs { margin-top: 0; }
-  .machine-grid .camera { max-width: 320px; }
+  .machine-grid .camera { max-width: 480px; }
   .camera-frame { width: 100%; aspect-ratio: 4 / 3; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
   .camera-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .camera-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
@@ -257,15 +257,16 @@ async function loadIdentity() {
   }
   state.actor = who;
   const field = $("requested_by");
-  const label = document.querySelector('label[for="requested_by"]');
   const banner = $("banner");
 
   if (who.verified && who.user) {
+    // The edge identity is what gets recorded; a visible "Signed in as"
+    // field and banner would only restate the dashboard's own sign-in. The
+    // value stays set for the approve/stop prompts that read it.
     field.value = who.user;
     field.readOnly = true;
     field.disabled = true;
-    if (label) label.textContent = "Signed in as";
-    // The field already shows who is signed in; the banner only repeats it.
+    field.parentElement.hidden = true;
     banner.hidden = true;
     return;
   } else if (who.identity_available) {
