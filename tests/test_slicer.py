@@ -43,17 +43,25 @@ shutil.copy({template!r}, out / value("--export-3mf"))
 """
 
 
+def _write(root: Path, kind: str, body: dict[str, object]) -> None:
+    (root / kind).mkdir(parents=True, exist_ok=True)
+    (root / kind / f"{body['name']}.json").write_text(json.dumps(body))
+
+
 def _profiles(root: Path) -> Path:
-    for kind, name in (
-        ("machine", "Bambu Lab Test 0.4 nozzle"),
-        ("process", "0.20mm Standard @BBL X1C"),
-        ("filament", "Bambu PLA Basic @BBL Test"),
-    ):
-        (root / kind).mkdir(parents=True, exist_ok=True)
-        body = {"name": name}
-        if kind == "machine":
-            body["nozzle_type"] = ["stainless_steel"]
-        (root / kind / f"{name}.json").write_text(json.dumps(body))
+    # Shaped like the bundled BBL tree: the instantiable preset holds only its
+    # own keys; the bed, gcode and temperatures live in parents and includes.
+    _write(root, "machine", {"name": "fdm_machine_test_common", "printable_area": ["0x0", "256x0", "256x256", "0x256"], "retraction_length": ["0.8"]})
+    _write(root, "machine", {"name": "Bambu Lab Test 0.4 nozzle template machine_start_gcode", "instantiation": "false", "machine_start_gcode": ";===== machine: Test ====="})
+    _write(root, "machine", {
+        "name": "Bambu Lab Test 0.4 nozzle", "inherits": "fdm_machine_test_common",
+        "include": ["Bambu Lab Test 0.4 nozzle template machine_start_gcode"],
+        "nozzle_type": ["stainless_steel"], "retraction_length": ["0.5"],
+    })
+    _write(root, "process", {"name": "fdm_process_test_common", "layer_height": "0.2", "wall_loops": "2"})
+    _write(root, "process", {"name": "0.20mm Standard @BBL X1C", "inherits": "fdm_process_test_common", "wall_loops": "3"})
+    _write(root, "filament", {"name": "fdm_filament_test_pla", "nozzle_temperature": ["220"]})
+    _write(root, "filament", {"name": "Bambu PLA Basic @BBL Test", "inherits": "fdm_filament_test_pla"})
     return root
 
 
@@ -101,6 +109,42 @@ async def test_slice_forces_the_machines_nozzle_and_plate(
     assert machine["curr_bed_type"] == "Textured PEI Plate"
     seen = json.loads((job_dir / "seen_settings.json").read_text())
     assert seen[0].endswith("machine.json")
+    assert seen[1].endswith("process.json")
+
+
+async def test_presets_are_flattened_before_the_cli_sees_them(
+    slicer_settings: SlicerSettings, tmp_path: Path
+) -> None:
+    """The CLI ignores ``inherits``/``include`` it cannot resolve; until this was
+    fixed an A1 slice silently got a 200 x 200 bed and a generic G28 start."""
+
+    mesh = tmp_path / "cube.stl"
+    mesh.write_text("solid cube\nendsolid cube\n")
+    job_dir = slicer_settings.work_dir / "job"
+    await BambuStudioSlicer(slicer_settings).slice(mesh, _request(), job_dir=job_dir)
+
+    machine = json.loads((job_dir / "machine.json").read_text())
+    assert "inherits" not in machine and "include" not in machine
+    assert machine["printable_area"] == ["0x0", "256x0", "256x256", "0x256"]  # from the parent
+    assert machine["machine_start_gcode"].startswith(";===== machine: Test")  # from the include
+    assert machine["retraction_length"] == ["0.5"]  # the child's own value wins
+    assert machine["name"] == "Bambu Lab Test 0.4 nozzle"
+    process = json.loads((job_dir / "process.json").read_text())
+    assert (process["layer_height"], process["wall_loops"]) == ("0.2", "3")
+    filament = json.loads((job_dir / "filament.json").read_text())
+    assert filament["nozzle_temperature"] == ["220"]
+
+
+async def test_an_inherits_loop_is_refused(slicer_settings: SlicerSettings, tmp_path: Path) -> None:
+    root = slicer_settings.profiles_dir
+    _write(root, "process", {"name": "0.20mm Standard @BBL X1C", "inherits": "loop_b"})
+    _write(root, "process", {"name": "loop_b", "inherits": "0.20mm Standard @BBL X1C"})
+    mesh = tmp_path / "cube.stl"
+    mesh.write_text("solid cube\nendsolid cube\n")
+    with pytest.raises(SlicerUnavailable, match="inherits loop"):
+        await BambuStudioSlicer(slicer_settings).slice(
+            mesh, _request(), job_dir=slicer_settings.work_dir / "job"
+        )
 
 
 async def test_a_slicer_failure_is_reported(slicer_settings: SlicerSettings, tmp_path: Path) -> None:

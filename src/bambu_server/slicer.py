@@ -6,6 +6,14 @@ is written into a per-job scratch directory under the configured work dir --
 the mesh, an override settings file, Bambu Studio's own ``--datadir`` -- and
 the one thing read back is the ``.3mf`` it exports plus its ``result.json``.
 
+Every preset is written out **flattened**: its whole ``inherits`` chain folded
+into one self-contained file. The CLI does not resolve ``inherits`` for a file
+outside its bundled profiles, so a copy carrying only the child's own keys
+silently loses what the parents define -- the bed size, the machine start gcode,
+the filament temperatures. Until 2026-10-21 that is exactly what happened: an A1
+slice came out with a 200 x 200 bed, a two-line ``G28`` start instead of the
+A1's (no wipe, no leveling, no purge) and generic 200 C PLA.
+
 Two facts the gateway knows and the bundled presets do not are forced through
 the override file:
 
@@ -35,6 +43,10 @@ from .plates import PRINTER_TO_SLICER
 logger = logging.getLogger(__name__)
 
 _PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9 ._@+()-]+$")
+#: Bundled chains are 3-5 deep; anything near this is a loop or a bad file.
+_MAX_INHERITS_DEPTH = 16
+#: A preset's identity, not settings: never copied from an included template.
+_PRESET_META_KEYS = {"name", "inherits", "include", "instantiation", "setting_id", "from", "type"}
 #: Result codes Bambu Studio's CLI writes to ``result.json``; 0 is success.
 _SUCCESS_RETURN_CODE = 0
 
@@ -131,15 +143,10 @@ class BambuStudioSlicer:
                 "target the right surface"
             )
         job_dir.mkdir(parents=True, exist_ok=True)
-        # The machine preset is copied whole and amended, rather than layered
-        # with an `inherits` stub: the CLI resolves `inherits` only against its
-        # bundled presets, and a stub it cannot resolve is silently ignored.
-        try:
-            machine_body = json.loads(machine.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise SlicerUnavailable(f"machine preset {machine.name} could not be read") from exc
-        if not isinstance(machine_body, dict):
-            raise SlicerUnavailable(f"machine preset {machine.name} is not a settings object")
+        root = machine.parent.parent
+        machine_body = _flatten_preset(root, "machine", machine.stem)
+        process_body = _flatten_preset(root, "process", process.stem)
+        filament_body = _flatten_preset(root, "filament", filament.stem)
         if request.nozzle_type:
             # The stock preset carries the value as a one-element list.
             machine_body["nozzle_type"] = [request.nozzle_type]
@@ -148,6 +155,10 @@ class BambuStudioSlicer:
         machine_body["curr_bed_type"] = PRINTER_TO_SLICER[request.plate]
         override = job_dir / "machine.json"
         override.write_text(json.dumps(machine_body, indent=2), encoding="utf-8")
+        process = job_dir / "process.json"
+        process.write_text(json.dumps(process_body, indent=2), encoding="utf-8")
+        filament = job_dir / "filament.json"
+        filament.write_text(json.dumps(filament_body, indent=2), encoding="utf-8")
         datadir = job_dir / "datadir"
         datadir.mkdir(exist_ok=True)
         output = job_dir / "plate.3mf"
@@ -228,6 +239,54 @@ class BambuStudioSlicer:
         if root not in target.parents:
             raise ValueError("refusing to remove a directory outside the slicer work dir")
         shutil.rmtree(target, ignore_errors=True)
+
+
+def _flatten_preset(
+    root: Path, kind: str, name: str, _depth: int = 0
+) -> dict[str, object]:
+    """``root/kind/name.json`` with its ``inherits`` chain folded in, child winning.
+
+    Each level's ``include`` list (newer presets keep their gcode in separate
+    "template" presets, e.g. the A1's machine start gcode) is merged just
+    before that level's own keys, so a preset's own value still wins.
+    """
+
+    chain: list[dict[str, object]] = []
+    visited: set[str] = set()
+    current = name
+    while current:
+        if current in visited or len(chain) >= _MAX_INHERITS_DEPTH:
+            raise SlicerUnavailable(f"{kind} preset {name!r} has an inherits loop")
+        visited.add(current)
+        if not _PRESET_NAME_RE.match(current):
+            raise SlicerUnavailable(f"preset name {current!r} contains characters not allowed")
+        path = root / kind / f"{current}.json"
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise SlicerUnavailable(f"slicer preset not found: {kind}/{path.name}") from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SlicerUnavailable(f"{kind} preset {path.name} could not be read") from exc
+        if not isinstance(body, dict):
+            raise SlicerUnavailable(f"{kind} preset {path.name} is not a settings object")
+        body.setdefault("name", current)
+        chain.append(body)
+        parent = body.get("inherits")
+        current = parent.strip() if isinstance(parent, str) else ""
+    if _depth > _MAX_INHERITS_DEPTH:
+        raise SlicerUnavailable(f"{kind} preset {name!r} includes too deeply")
+    merged: dict[str, object] = {}
+    for body in reversed(chain):
+        includes = body.get("include") or []
+        if not isinstance(includes, list):
+            raise SlicerUnavailable(f"{kind} preset {body.get('name')!r} has a malformed include")
+        for included in includes:
+            fragment = _flatten_preset(root, kind, str(included).strip(), _depth + 1)
+            merged.update({k: v for k, v in fragment.items() if k not in _PRESET_META_KEYS})
+        merged.update(body)
+    merged.pop("inherits", None)
+    merged.pop("include", None)
+    return merged
 
 
 _VERSION_RE = re.compile(r"BambuStudio Version (\S+)")
