@@ -242,10 +242,9 @@ async function loadIdentity() {
     field.readOnly = true;
     field.disabled = true;
     if (label) label.textContent = "Signed in as";
-    banner.replaceChildren(
-      el("span", "Signed in as " + who.user + (who.role ? " (" + who.role + ")" : "") +
-        " — submissions are recorded against this account. "),
-    );
+    // The field already shows who is signed in; the banner only repeats it.
+    banner.hidden = true;
+    return;
   } else if (who.identity_available) {
     banner.replaceChildren(
       el("span", "Not signed in: the name you enter is a label, not an identity. " +
