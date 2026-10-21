@@ -197,6 +197,14 @@ const el = (tag, text, cls) => {
 // and no build-time configuration.
 const API_BASE = window.location.pathname.replace(/\/ui\/?$/, "");
 
+// Behind the edge this page lives inside the dashboard's 3D Printers panel.
+// Opened on its own there (an old bookmark, a copied link), send the visitor
+// to that panel rather than keep a second, full-page copy of it. Direct
+// gateway access (no prefix) still serves the page for local operation.
+if (API_BASE && window.top === window.self) {
+  window.location.replace("/utils/printers");
+}
+
 async function api(path, options) {
   const response = await fetch(API_BASE + path, options);
   let body = null;
