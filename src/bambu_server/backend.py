@@ -221,6 +221,9 @@ class BambuLabsBackend:
             credentials.serial.get_secret_value(),
         )
         self._lock = threading.Lock()
+        # One camera connection at a time: the viewer and the plate-check
+        # snapshot share the printer's camera service.
+        self._camera_lock = threading.Lock()
         self._data_updated_at: datetime | None = None
         self._has_chamber_sensor = _has_chamber_sensor(definition.model)
         self._printer.mqtt_client.on_message_handler = self._on_message
@@ -331,6 +334,12 @@ class BambuLabsBackend:
         return str(name).strip() or None
 
     def snapshot(self, timeout_s: float = 10.0) -> bytes:
+        """One JPEG frame from the printer's chamber camera, one reader at a time."""
+
+        with self._camera_lock:
+            return self._read_camera_frame(timeout_s)
+
+    def _read_camera_frame(self, timeout_s: float) -> bytes:
         """One JPEG frame from the printer's chamber camera.
 
         Opens its own authenticated TLS connection to the camera port, reads

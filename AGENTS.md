@@ -25,7 +25,9 @@ confirms the plate is empty, and `stop_print`. On 2026-10-20 a human approved
 the external spool (`vt_tray`) as a `start_print` mapping target for printers
 without an AMS, checked like an AMS tray, and the one `M500` in Bambu's stock
 start gcode (saving the bed mesh right after `G29`) as accepted by the gcode
-check. Homing was considered and
+check. On 2026-10-21 a view-only camera (`GET /printers/{id}/camera.jpg`, no
+claim, one shared read per printer every 2 s, off on the page until a person
+turns it on, never plate-check evidence) was approved. Homing was considered and
 deliberately not added: it moves the bed into whatever is on the plate. All printer commands go through `bambu_server.dispatch` and
 the backend's control methods; nothing else may call `bambulabs_api` command
 methods. Adding a verb, relaxing a gate, or letting an agent start a print

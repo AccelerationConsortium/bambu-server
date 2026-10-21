@@ -103,6 +103,9 @@ def test_control_routes_exist_only_when_enabled(
     ):
         assert f"/printers/{{printer_id}}/control/{verb}" in paths
     assert control_client.get("/").json()["mode"] == "control"
+    # The view-only camera follows the same switch.
+    assert "/printers/{printer_id}/camera.jpg" not in client.get("/openapi.json").json()["paths"]
+    assert "/printers/{printer_id}/camera.jpg" in paths
 
 
 def test_status_publishes_claim_and_allowed_actions(control_client: TestClient) -> None:
@@ -125,6 +128,52 @@ def test_status_reads_never_cause_printer_commands(
     assert control_backend.uploads == []
     assert control_backend.start_commands == []
     assert control_backend.snapshots == 0
+
+
+# -- view-only camera --------------------------------------------------------------
+
+
+def test_the_camera_view_needs_no_claim_and_is_shared(
+    control_client: TestClient, control_backend: FakeBackend
+) -> None:
+    first = control_client.get(f"{BASE}/camera.jpg")
+    assert first.status_code == 200
+    assert first.headers["content-type"] == "image/jpeg"
+    assert first.content.startswith(b"\xff\xd8")
+    assert first.headers["cache-control"] == "no-store"
+    # Several viewers within the interval share one camera read.
+    for _ in range(3):
+        assert control_client.get(f"{BASE}/camera.jpg").content == first.content
+    assert control_backend.snapshots == 1
+    # Watching sends the printer nothing and takes no claim.
+    assert control_backend.uploads == [] and control_backend.start_commands == []
+    assert control_backend.light_calls == []
+    assert control_client.get(f"{BASE}/status").json()["details"]["claimed_by"] is None
+
+
+def test_an_unreachable_camera_is_a_503(
+    control_client: TestClient, control_backend: FakeBackend
+) -> None:
+    control_backend.fail_snapshot = True
+    response = control_client.get(f"{BASE}/camera.jpg")
+    assert response.status_code == 503
+    assert "camera unavailable" in response.json()["detail"]
+
+
+def test_a_viewer_frame_is_not_a_plate_check(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    assert control_client.get(f"{BASE}/camera.jpg").status_code == 200
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(job_id, plate_check_method="printer_camera"),
+    )
+    assert response.status_code == 412
+    assert response.json()["snapshot_missing"] is True
+    assert control_backend.uploads == []
 
 
 # -- claims ----------------------------------------------------------------------

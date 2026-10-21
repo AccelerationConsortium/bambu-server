@@ -21,6 +21,14 @@ viewer at `/api/equipment/bambu_gateway/documentation/docs`.
 All paths above are relative to the gateway prefix. Reads use the background
 monitor's cache and never initiate printer I/O.
 
+With `dispatch.enabled`, `GET /printers/{id}/camera.jpg` returns the latest
+chamber camera frame (`image/jpeg`, `Cache-Control: no-store`, capture time in
+`X-Captured-At`) without a claim. It is the one read that touches the printer:
+the camera is read at most once per printer every 2 s and the frame is shared by
+all callers; 503 when the camera does not deliver one. A frame from here is
+never plate-check evidence; `start_print` needs a `/control/snapshot` taken
+under the claim.
+
 | Tray field | Meaning |
 |---|---|
 | `ams_id`, `tray_id` | Printer-reported unit ID and zero-based slot; together they identify a tray. HT unit IDs are preserved; 254/0 is the external spool, which `observed.loaded_trays` includes. |

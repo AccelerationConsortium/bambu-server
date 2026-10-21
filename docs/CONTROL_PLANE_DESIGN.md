@@ -17,7 +17,15 @@ the gcode check was narrowed for one case: current Bambu Studio start gcode
 saves the bed mesh with `M500` right after probing (`G29`, optionally `M400`),
 so that `M500` is accepted when it sits inside the machine start gcode, as
 confirmed by the `; MACHINE_START_GCODE_END` marker after it. Every other
-`M500`, and every other refused command, is still refused. The rest of
+`M500`, and every other refused command, is still refused. On 2026-10-21 a
+view-only camera was approved so a person can watch a printer before submitting
+and while its job runs: `GET /printers/{id}/camera.jpg`, only with
+`dispatch.enabled`, no claim, no command published, at most one camera read per
+printer every 2 s shared by every viewer (failures cached the same way), and
+camera reads serialized with the plate-check snapshot. Its frames carry no
+snapshot token, so they can never satisfy the plate check. The submission page
+shows it under Machine, off until a person presses Show camera, and pauses it
+while the tab is hidden. The rest of
 phase 2, pause/resume, temperature, motion, filament, and every excluded verb
 remain unapproved. Homing to raise the plate into camera view was proposed and
 declined: it drives the nozzle into the plate before anyone knows it is clear.

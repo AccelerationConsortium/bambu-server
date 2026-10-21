@@ -66,6 +66,8 @@
   .start-grid { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   @media (max-width: 760px) { .start-grid { grid-template-columns: 1fr; } }
   .snapshot { width: 100%; max-height: 360px; object-fit: contain; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; display: block; }
+  .camera { margin-top: 12px; }
+  .camera .snapshot { margin-top: 8px; }
   .snapshot-empty { display: flex; align-items: center; justify-content: center; min-height: 180px; color: var(--muted); background: var(--chip); border-radius: 8px; font-size: 13px; text-align: center; padding: 12px; }
   .confirm { display: flex; gap: 8px; align-items: flex-start; margin: 12px 0; padding: 10px 12px; border: 1px solid var(--warn); border-radius: 8px; color: var(--ink); }
   .confirm input { margin-top: 3px; }
@@ -106,6 +108,11 @@
       </div>
     </div>
     <div class="specs" id="specs"></div>
+    <div class="camera">
+      <button class="small" id="camera-btn">Show camera</button>
+      <span id="camera-msg" class="detail"></span>
+      <img id="camera-img" class="snapshot" alt="View from the selected printer's camera" hidden>
+    </div>
   </section>
 
   <section class="panel">
@@ -761,9 +768,62 @@ async function stopPrint() {
   }
 }
 
+// ---- camera: view only, off until someone asks for it ----------------------
+// Not the plate check: a frame from here carries no snapshot token, and
+// starting a print still needs a snapshot taken under the claim.
+const camera = { on: false, timer: null, url: null };
+
+function setCamera(on) {
+  camera.on = on;
+  clearTimeout(camera.timer);
+  camera.timer = null;
+  $("camera-btn").textContent = on ? "Hide camera" : "Show camera";
+  $("camera-img").hidden = !on;
+  $("camera-msg").textContent = "";
+  if (on) { refreshCamera(); return; }
+  $("camera-img").removeAttribute("src");
+  if (camera.url) { URL.revokeObjectURL(camera.url); camera.url = null; }
+}
+
+async function refreshCamera() {
+  clearTimeout(camera.timer);
+  camera.timer = null;
+  if (!camera.on || !state.machine) return;
+  // Hidden tabs do not poll: the gateway reads the camera only for viewers.
+  if (document.visibilityState === "visible") {
+    const machine = state.machine;
+    try {
+      const response = await fetch(API_BASE + "/printers/" + machine + "/camera.jpg", { cache: "no-store" });
+      if (!camera.on || state.machine !== machine) return;
+      if (response.status === 404) {
+        setCamera(false);
+        $("camera-msg").textContent = "This gateway does not offer a camera view.";
+        return;
+      }
+      if (!response.ok) {
+        let detail = null;
+        try { detail = (await response.json()).detail; } catch (_) { /* no body */ }
+        $("camera-msg").textContent = detail || "Camera unavailable.";
+      } else {
+        const url = URL.createObjectURL(await response.blob());
+        $("camera-img").src = url;
+        if (camera.url) URL.revokeObjectURL(camera.url);
+        camera.url = url;
+        const at = response.headers.get("X-Captured-At");
+        $("camera-msg").textContent = "View only, not the plate check" +
+          (at ? " · frame from " + new Date(at).toLocaleTimeString() : "");
+      }
+    } catch (_) {
+      $("camera-msg").textContent = "Camera unavailable.";
+    }
+  }
+  if (camera.on) camera.timer = setTimeout(refreshCamera, 2000);
+}
+
 async function selectMachine(id) {
   if (control.token) await closeStart();
   state.machine = id;
+  if (camera.on) { $("camera-img").removeAttribute("src"); refreshCamera(); }
   $("verdict-panel").hidden = true;
   try {
     const profile = await api("/printers/" + id + "/profile");
@@ -852,6 +912,10 @@ window.addEventListener("message", event => {
   $("submit").onclick = submit;
   $("snapshot-btn").onclick = takeSnapshot;
   $("light-btn").onclick = toggleLight;
+  $("camera-btn").onclick = () => setCamera(!camera.on);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && camera.on) refreshCamera();
+  });
   $("start-btn").onclick = startPrint;
   $("start-cancel").onclick = closeStart;
   $("plate-ok").onchange = updateStartButton;

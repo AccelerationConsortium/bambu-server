@@ -18,7 +18,12 @@ the Bambu printer gateway.
    upload to, or otherwise control a printer.
 3. The service may request MQTT state refreshes in its background monitoring
    loop. A status, profile, or queue request must never cause printer I/O; only
-   a claimed `/control/*` request may.
+   a claimed `/control/*` request may, with one exception approved 2026-10-21:
+   the view-only `GET /printers/{id}/camera.jpg`, present only with
+   `dispatch.enabled`, which reads the camera port (never publishes a command),
+   at most once per printer every 2 s shared by all viewers, and whose frames
+   are never plate-check evidence. The page loads with it off; a person turns
+   it on.
 4. A print is started only by a person who has confirmed the build plate is
    empty. An agent must never set `plate_confirmed_empty`, start a print, or
    approve a job on its own initiative, and must never retry a failed or

@@ -47,6 +47,7 @@ from sdl_lab_contract.claims import ClaimRejection, ClaimRequest, ClaimResponse
 from . import __version__
 from .artifacts import ARTIFACT_EXTENSIONS
 from .backend import BambuLabsBackend, PrinterBackend
+from .camera import CameraUnavailable, CameraViewer
 from .claims import ClaimConflict, ClaimLost
 from .config import (
     PrinterCredentials,
@@ -172,6 +173,7 @@ def create_app(
     # dict for the same reason as `stores`.
     dispatchers: dict[str, Dispatcher] = {}
     slicers: dict[str, BambuStudioSlicer] = {}
+    cameras: dict[str, CameraViewer] = {}
     control_enabled = bool(settings and settings.dispatch.enabled)
 
     @asynccontextmanager
@@ -203,6 +205,7 @@ def create_app(
             poll_interval_s=active_settings.poll_interval_seconds,
         )
         dispatchers["default"] = dispatcher
+        cameras["default"] = CameraViewer(backends)
         slicers["default"] = BambuStudioSlicer(active_settings.slicer)
         try:
             for monitor in monitors.values():
@@ -801,10 +804,58 @@ def create_app(
             " (verified)" if actor.verified else "",
         )
 
+    def get_camera() -> CameraViewer:
+        camera = cameras.get("default")
+        if camera is None:  # pragma: no cover - only outside the app lifespan
+            raise HTTPException(status_code=503, detail="camera unavailable")
+        return camera
+
     if control_enabled:
         _register_control_routes(app, get_monitor, get_actor, get_dispatcher)
+        _register_camera_route(app, get_monitor, get_camera)
 
     return app
+
+
+def _register_camera_route(
+    app: FastAPI,
+    get_monitor: Callable[..., PrinterMonitor],
+    get_camera: Callable[[], CameraViewer],
+) -> None:
+    """The view-only camera (approved 2026-10-21). Control deployments only."""
+
+    @app.get(
+        "/printers/{printer_id}/camera.jpg",
+        response_class=Response,
+        responses={
+            200: {"content": {"image/jpeg": {}}, "description": "The latest shared frame."},
+            503: {"description": "The camera did not deliver a frame."},
+        },
+        tags=["camera"],
+    )
+    async def camera_frame(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        camera: Annotated[CameraViewer, Depends(get_camera)],
+    ) -> Response:
+        """The printer's chamber camera, for watching -- not for the plate check.
+
+        No claim, no command: one camera read per printer every 2 s at most,
+        shared by every viewer. A frame from here is never evidence that the
+        plate is empty; ``start_print`` needs a snapshot taken under the claim.
+        """
+
+        try:
+            frame = await camera.frame(monitor.definition.id)
+        except CameraUnavailable as exc:
+            return JSONResponse(status_code=503, content={"detail": str(exc)})
+        return Response(
+            content=frame.image,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Captured-At": frame.captured_at.isoformat(),
+            },
+        )
 
 
 def _refusal(exc: ControlRefusal) -> JSONResponse:
