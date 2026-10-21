@@ -252,6 +252,11 @@ def test_external_spool_is_decoded_like_a_tray():
     assert (spool.nozzle_temp_min, spool.nozzle_temp_max) == (190, 230)
 
 
+def test_the_external_spool_has_no_remaining_estimate():
+    # The A1 reports remain 0 for a hand-fed spool; that is not "empty".
+    assert _external({"id": "254", "tray_type": "PLA", "remain": 0}).remaining_percent is None
+
+
 @pytest.mark.parametrize("vt_tray", [None, "bad", {}, {"id": "254", "tray_type": ""}])
 def test_an_external_spool_without_a_selected_filament_is_not_loaded(vt_tray):
     assert _external(vt_tray) is None

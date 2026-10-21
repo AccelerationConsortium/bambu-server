@@ -65,11 +65,23 @@
   button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
   .start-grid { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   @media (max-width: 760px) { .start-grid { grid-template-columns: 1fr; } }
-  /* Camera on the left at a fixed size, the machine's detail tiles beside it. */
-  .machine-grid { display: grid; grid-template-columns: 420px minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 10px; }
+  /* Printer picker and camera controls on one line; camera at a fixed size
+     on the left, the machine's detail tiles beside it. */
+  .machine-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .machine-bar select { flex: 0 1 420px; width: auto; }
+  .machine-grid { display: grid; grid-template-columns: 420px minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 12px; }
   @media (max-width: 620px) { .machine-grid { grid-template-columns: 1fr; } }
   .machine-grid .specs { margin-top: 0; }
-  .machine-grid .camera { max-width: 480px; }
+  .machine-grid .camera-frame { max-width: 480px; }
+  /* Submission: the form and a file preview on the left, the checklist on the right. */
+  .submit-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 20px; align-items: start; }
+  @media (max-width: 760px) { .submit-grid { grid-template-columns: 1fr; } }
+  .submit-form { display: grid; gap: 12px; }
+  .submit-form [hidden] { display: none; }
+  .preview { width: 100%; max-width: 180px; aspect-ratio: 1; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .preview-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
+  tr.pending td { color: var(--muted); }
   .camera-frame { width: 100%; aspect-ratio: 4 / 3; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
   .camera-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .camera-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
@@ -102,52 +114,46 @@
   </div>
 
   <section class="panel">
-    <h2>Machine</h2>
-    <div class="row">
-      <div>
-        <label for="machine">Target</label>
-        <select id="machine"></select>
-      </div>
-      <div>
-        <label for="requested_by">Your name</label>
-        <input type="text" id="requested_by" placeholder="e.g. alice" autocomplete="name">
-      </div>
+    <div class="machine-bar">
+      <select id="machine" aria-label="Printer"></select>
+      <button class="small" id="camera-btn">Start camera</button>
+      <button class="small" id="light-btn" title="Chamber light; no motion" hidden>Light on</button>
+      <span id="machine-msg" class="detail"></span>
     </div>
     <div class="machine-grid">
-      <div class="camera">
-        <div class="camera-frame">
-          <img id="camera-img" alt="View from the selected printer's camera" hidden>
-          <div class="camera-empty" id="camera-empty">Camera off</div>
-        </div>
-        <div class="camera-bar">
-          <button class="small" id="camera-btn">Start camera</button>
-          <span id="camera-msg" class="detail"></span>
-        </div>
+      <div class="camera-frame">
+        <img id="camera-img" alt="View from the selected printer's camera" hidden>
+        <div class="camera-empty" id="camera-empty">Camera off</div>
       </div>
       <div class="specs" id="specs"></div>
     </div>
   </section>
 
   <section class="panel">
-    <h2>Artifact</h2>
-    <div class="row">
-      <div>
-        <label for="file">File (.3mf, .gcode, or .stl to slice)</label>
-        <input type="file" id="file" accept=".3mf,.gcode,.stl">
+    <h2>Submission</h2>
+    <div class="submit-grid">
+      <div class="submit-form">
+        <div>
+          <label for="file">File (.3mf, .gcode, or .stl to slice)</label>
+          <input type="file" id="file" accept=".3mf,.gcode,.stl">
+        </div>
+        <div>
+          <label for="material">Material (required for .stl; otherwise read from the file if blank)</label>
+          <input type="text" id="material" placeholder="e.g. PLA">
+        </div>
+        <div>
+          <label for="requested_by">Your name</label>
+          <input type="text" id="requested_by" placeholder="e.g. alice" autocomplete="name">
+        </div>
+        <div><button class="primary" id="submit">Submit</button>
+          <span id="submit-msg" class="detail"></span></div>
+        <div class="preview" id="preview"><div class="preview-empty">No file chosen</div></div>
       </div>
-      <div>
-        <label for="material">Material (required for .stl; otherwise read from the file if blank)</label>
-        <input type="text" id="material" placeholder="e.g. PLA">
+      <div class="checklist">
+        <div class="verdict-head" id="verdict-head"></div>
+        <div class="table-scroll"><table><tbody id="verdict-rows"></tbody></table></div>
       </div>
     </div>
-    <button class="primary" id="submit">Submit</button>
-    <span id="submit-msg" class="detail"></span>
-  </section>
-
-  <section class="panel" id="verdict-panel" hidden>
-    <h2>Result</h2>
-    <div class="verdict-head" id="verdict-head"></div>
-    <div class="table-scroll"><table><tbody id="verdict-rows"></tbody></table></div>
   </section>
 
   <section class="panel">
@@ -166,10 +172,7 @@
             <label><input type="radio" name="plate-method" value="printer_camera" checked> Printer camera</label>
             <label><input type="radio" name="plate-method" value="in_person"> In person at the printer</label>
           </div>
-          <p class="detail">Check the plate in the camera view above (<strong>Start camera</strong>). When you press Start print, the gateway records a camera frame with the job.</p>
-          <div style="margin-top:8px">
-            <button class="small" id="light-btn" title="Chamber light; no motion">Light on</button>
-            <span id="plate-msg" class="detail"></span></div>
+          <p class="detail">Check the plate in the camera view at the top (<strong>Start camera</strong>, and <strong>Light on</strong> if it is dark). When you press Start print, the gateway records a camera frame with the job.</p>
         </fieldset>
       </div>
       <div>
@@ -383,8 +386,32 @@ function renderSpecs(profile) {
 
 const MARKS = { pass: ["✓", "pass"], fail: ["✗", "fail"], not_applicable: ["–", "na"] };
 
+// The checks every submission runs, in the validator's order (CHECK_ORDER),
+// shown before anything is submitted so the person knows what will be checked.
+const CHECKS = [
+  ["machine_compatible", "Sliced for this printer and nozzle"],
+  ["material_allowed", "Material is permitted on this printer"],
+  ["material_filament_match", "A loaded tray or spool holds the material"],
+  ["nozzle_temp_in_band", "Nozzle temperature within the machine and spool limits"],
+  ["bed_chamber_temp_in_band", "Bed and chamber temperatures within limits"],
+  ["build_fits_plate", "The print fits the build plate"],
+  ["gcode_sanity", "No refused G-code commands"],
+  ["params_present", "Sliced, with material and temperatures declared"],
+];
+
+function renderPendingChecklist() {
+  $("verdict-head").replaceChildren(el("span", "Checked when you submit", "detail"));
+  const rows = $("verdict-rows");
+  rows.replaceChildren();
+  for (const [name, meaning] of CHECKS) {
+    const tr = document.createElement("tr");
+    tr.className = "pending";
+    tr.append(el("td", "·", "mark na"), el("td", name), el("td", meaning, "detail"));
+    rows.append(tr);
+  }
+}
+
 function renderVerdict(job) {
-  $("verdict-panel").hidden = false;
   const verdict = job.verdict || { verdict: "?", checks: [] };
   const head = $("verdict-head");
   head.replaceChildren();
@@ -455,6 +482,8 @@ async function refreshQueue() {
   }
   const allowed = (state.status && state.status.allowed_actions) || [];
   const controlMode = Boolean(state.status && state.status.details && state.status.details.monitoring_only === false);
+  $("light-btn").hidden = !controlMode;
+  renderLightButton();
   box.replaceChildren();
 
   if (view.running) {
@@ -596,7 +625,6 @@ async function openStart(submissionId) {
   msg.className = "detail";
   msg.textContent = "";
   $("plate-ok").checked = false;
-  $("plate-msg").textContent = "";
   let job;
   try {
     job = await api("/submissions/" + submissionId);
@@ -664,14 +692,33 @@ function renderLightButton() {
   $("light-btn").textContent = lightIsOn() ? "Light off" : "Light on";
 }
 
+// The light needs the claim. Inside the start panel the page already holds
+// it; from the printer bar it takes one just for this switch and gives it
+// back, so it never blocks anyone for longer than the command.
+async function withClaim(action) {
+  if (control.token) return action({ "Content-Type": "application/json", "X-Claim-Token": control.token });
+  const owner = whoAmI();
+  if (!owner) throw new Error("A name is needed to use the printer.");
+  const claimed = await api("/printers/" + state.machine + "/control/claim", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ owner, session_id: control.session, ttl_s: 30 }),
+  });
+  try {
+    return await action({ "Content-Type": "application/json", "X-Claim-Token": claimed.claim_token });
+  } finally {
+    fetch(API_BASE + "/printers/" + state.machine + "/control/release",
+      { method: "POST", headers: { "X-Claim-Token": claimed.claim_token } }).catch(() => {});
+  }
+}
+
 async function toggleLight() {
-  const msg = $("plate-msg");
+  const msg = $("machine-msg");
   const on = !lightIsOn();
   $("light-btn").disabled = true;
   try {
-    await api("/printers/" + state.machine + "/control/light", {
-      method: "POST", headers: controlHeaders(), body: JSON.stringify({ on }),
-    });
+    await withClaim(headers => api("/printers/" + state.machine + "/control/light", {
+      method: "POST", headers, body: JSON.stringify({ on }),
+    }));
     msg.className = "detail";
     msg.textContent = "Light " + (on ? "on" : "off") + " requested; the camera view shows it in a moment.";
     // Reflect what the printer reports once the monitor sees it.
@@ -768,7 +815,7 @@ function setCamera(on) {
   clearTimeout(camera.timer);
   camera.timer = null;
   $("camera-btn").textContent = on ? "Stop camera" : "Start camera";
-  $("camera-msg").textContent = "";
+  $("machine-msg").textContent = "";
   clearCameraFrame(on ? "Connecting…" : "Camera off");
   if (on) refreshCamera();
 }
@@ -794,13 +841,13 @@ async function refreshCamera() {
       if (!camera.on || state.machine !== machine) return;
       if (response.status === 404) {
         setCamera(false);
-        $("camera-msg").textContent = "This gateway does not offer a camera view.";
+        $("machine-msg").textContent = "This gateway does not offer a camera view.";
         return;
       }
       if (!response.ok) {
         let detail = null;
         try { detail = (await response.json()).detail; } catch (_) { /* no body */ }
-        $("camera-msg").textContent = detail || "Camera unavailable.";
+        $("machine-msg").textContent = detail || "Camera unavailable.";
       } else {
         const url = URL.createObjectURL(await response.blob());
         $("camera-img").src = url;
@@ -809,11 +856,11 @@ async function refreshCamera() {
         if (camera.url) URL.revokeObjectURL(camera.url);
         camera.url = url;
         const at = response.headers.get("X-Captured-At");
-        $("camera-msg").textContent = "View only, not the plate check" +
+        $("machine-msg").textContent = "View only, not the plate check" +
           (at ? " · frame from " + new Date(at).toLocaleTimeString() : "");
       }
     } catch (_) {
-      $("camera-msg").textContent = "Camera unavailable.";
+      $("machine-msg").textContent = "Camera unavailable.";
     }
   }
   if (camera.on) camera.timer = setTimeout(refreshCamera, 2000);
@@ -823,7 +870,7 @@ async function selectMachine(id) {
   if (control.token) await closeStart();
   state.machine = id;
   if (camera.on) { clearCameraFrame("Connecting…"); refreshCamera(); }
-  $("verdict-panel").hidden = true;
+  renderPendingChecklist();
   try {
     const profile = await api("/printers/" + id + "/profile");
     if (state.machine !== id) return;
@@ -834,6 +881,87 @@ async function selectMachine(id) {
   }
   renderSpecs(state.profile);
   refreshQueue();
+}
+
+// Bambu Studio embeds a plate thumbnail in a sliced .3mf (Metadata/plate_N.png)
+// and in .gcode (a base64 "thumbnail" comment block). Read locally; nothing is
+// uploaded until Submit.
+const PREVIEW_MAX_BYTES = 8 * 1024 * 1024;
+
+function showPreview(content) {
+  const box = $("preview");
+  if (box.dataset.url) { URL.revokeObjectURL(box.dataset.url); delete box.dataset.url; }
+  if (typeof content === "string") {
+    box.replaceChildren(el("div", content, "preview-empty"));
+    return;
+  }
+  const url = URL.createObjectURL(content);
+  box.dataset.url = url;
+  const img = el("img");
+  img.alt = "Preview of the chosen file";
+  img.src = url;
+  box.replaceChildren(img);
+}
+
+async function zipEntry(file, wanted) {
+  // Minimal ZIP reader: the central directory at the end names each member.
+  const tailSize = Math.min(file.size, 65557);
+  const tail = new DataView(await file.slice(file.size - tailSize).arrayBuffer());
+  let eocd = -1;
+  for (let i = tailSize - 22; i >= 0; i--) {
+    if (tail.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+  const count = tail.getUint16(eocd + 10, true);
+  const dirSize = tail.getUint32(eocd + 12, true);
+  const dirOffset = tail.getUint32(eocd + 16, true);
+  const dir = new DataView(await file.slice(dirOffset, dirOffset + dirSize).arrayBuffer());
+  const decoder = new TextDecoder();
+  const entries = [];
+  for (let at = 0, n = 0; n < count && at + 46 <= dir.byteLength; n++) {
+    if (dir.getUint32(at, true) !== 0x02014b50) break;
+    const nameLength = dir.getUint16(at + 28, true);
+    const name = decoder.decode(new Uint8Array(dir.buffer, at + 46, nameLength));
+    entries.push({
+      name,
+      method: dir.getUint16(at + 10, true),
+      compressed: dir.getUint32(at + 20, true),
+      offset: dir.getUint32(at + 42, true),
+    });
+    at += 46 + nameLength + dir.getUint16(at + 30, true) + dir.getUint16(at + 32, true);
+  }
+  const entry = wanted.map(test => entries.find(e => test.test(e.name))).find(Boolean);
+  if (!entry || entry.compressed > PREVIEW_MAX_BYTES) return null;
+  const header = new DataView(await file.slice(entry.offset, entry.offset + 30).arrayBuffer());
+  const start = entry.offset + 30 + header.getUint16(26, true) + header.getUint16(28, true);
+  const raw = file.slice(start, start + entry.compressed);
+  if (entry.method === 0) return new Blob([raw], { type: "image/png" });
+  if (entry.method !== 8 || typeof DecompressionStream === "undefined") return null;
+  const stream = raw.stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Blob([await new Response(stream).arrayBuffer()], { type: "image/png" });
+}
+
+async function gcodeThumbnail(file) {
+  const text = await file.slice(0, Math.min(file.size, 2 * 1024 * 1024)).text();
+  const match = /; thumbnail begin \d+x\d+ \d+\r?\n([\s\S]*?); thumbnail end/.exec(text);
+  if (!match) return null;
+  const binary = atob(match[1].replace(/^;\s?/gm, "").replace(/\s+/g, ""));
+  return new Blob([Uint8Array.from(binary, c => c.charCodeAt(0))], { type: "image/png" });
+}
+
+async function renderPreview(file) {
+  if (!file) { showPreview("No file chosen"); return; }
+  if (/\.stl$/i.test(file.name)) { showPreview("No preview for .stl"); return; }
+  showPreview("Reading the preview…");
+  try {
+    const image = /\.3mf$/i.test(file.name)
+      ? await zipEntry(file, [/^Metadata\/plate_1\.png$/, /^Metadata\/plate_\d+\.png$/, /^Metadata\/[^/]+\.png$/])
+      : await gcodeThumbnail(file);
+    if ($("file").files[0] !== file) return;  // a different file was chosen meanwhile
+    showPreview(image || "No preview in this file");
+  } catch (_) {
+    showPreview("No preview in this file");
+  }
 }
 
 async function submit() {
@@ -910,6 +1038,7 @@ window.addEventListener("message", event => {
   }
   $("submit").onclick = submit;
   $("light-btn").onclick = toggleLight;
+  $("file").onchange = () => renderPreview($("file").files[0]);
   $("camera-btn").onclick = () => setCamera(!camera.on);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && camera.on) refreshCamera();

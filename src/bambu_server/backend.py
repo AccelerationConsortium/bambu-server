@@ -17,7 +17,7 @@ import ssl
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, TypedDict
@@ -513,7 +513,10 @@ class BambuLabsBackend:
             tray = self._printer.mqtt_client.dump().get("print", {}).get("vt_tray")
             if not isinstance(tray, dict):
                 return None
-            return _tray_reading(EXTERNAL_SPOOL_ID, 0, tray)
+            reading = _tray_reading(EXTERNAL_SPOOL_ID, 0, tray)
+            # A hand-fed spool has no remaining-filament sensor; the A1 reports
+            # 0, which is a placeholder, not "empty".
+            return replace(reading, remaining_percent=None) if reading else None
         except (AttributeError, TypeError, ValueError, OverflowError):
             return None
 
