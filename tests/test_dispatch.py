@@ -1,0 +1,608 @@
+"""Control plane: claims, the dispatch gate, and what reaches the (fake) printer.
+
+Every test runs against :class:`FakeBackend`; nothing here can contact a
+printer. The assertions that matter most are the negative ones -- when a gate
+closes, the fake records no upload and no start command.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Iterator
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from bambu_server.backend import AmsTrayReading
+from bambu_server.config import Settings
+from bambu_server.main import create_app
+
+from .conftest import FakeBackend, write_3mf
+
+PRINTER = "bambu_test_01"
+BASE = f"/printers/{PRINTER}"
+
+
+def _control_settings(settings: Settings, **dispatch: object) -> Settings:
+    payload = settings.model_dump(mode="json")
+    payload["poll_interval_seconds"] = 0.5
+    payload["stale_after_seconds"] = 5.0
+    payload["printers"][0]["profile"]["plate"] = "textured_plate"
+    payload["dispatch"] = {"enabled": True, "require_verified_identity": False, **dispatch}
+    built = Settings.model_validate(payload)
+    # Below the config floor on purpose: a test should not wait 10 s.
+    built.dispatch = built.dispatch.model_copy(update={"confirm_timeout_s": 2.0})
+    return built
+
+
+@pytest.fixture
+def control_backend(backend: FakeBackend) -> FakeBackend:
+    backend.refresh_timestamps = True
+    return backend
+
+
+@pytest.fixture
+def control_client(settings: Settings, control_backend: FakeBackend) -> Iterator[TestClient]:
+    app = create_app(
+        settings=_control_settings(settings),
+        backend_factory=lambda _d, _c: control_backend,
+    )
+    with TestClient(app) as client:
+        yield client
+
+
+def _approved_job(client: TestClient, tmp_path: Path) -> str:
+    artifact = write_3mf(tmp_path / "cube.3mf")
+    response = client.post(
+        "/submissions",
+        files={"file": ("cube.3mf", artifact.read_bytes(), "application/octet-stream")},
+        data={"target_machine": PRINTER, "requested_by": "submitter"},
+    )
+    assert response.status_code == 201, response.text
+    job = response.json()
+    assert job["state"] == "queued", job["verdict"]
+    approved = client.post(
+        f"/submissions/{job['submission_id']}/approve", json={"approved_by": "approver"}
+    )
+    assert approved.status_code == 200, approved.text
+    return job["submission_id"]
+
+
+def _claim(client: TestClient, session: str = "session-a") -> str:
+    response = client.post(
+        f"{BASE}/control/claim", json={"owner": "operator", "session_id": session}
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["claim_token"]
+
+
+def _start_body(submission_id: str, **overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "submission_id": submission_id,
+        "plate_confirmed_empty": True,
+        "plate_check_method": "in_person",
+        "ams_mapping": [{"filament_id": 1, "ams_id": 0, "tray_id": 1}],
+        "dispatched_by": "operator",
+    }
+    body.update(overrides)
+    return body
+
+
+# -- surface ---------------------------------------------------------------------
+
+
+def test_control_routes_exist_only_when_enabled(
+    client: TestClient, control_client: TestClient
+) -> None:
+    assert not any("/control/" in p for p in client.get("/openapi.json").json()["paths"])
+    paths = control_client.get("/openapi.json").json()["paths"]
+    for verb in (
+        "claim", "heartbeat", "release", "snapshot", "light", "start_print", "stop_print"
+    ):
+        assert f"/printers/{{printer_id}}/control/{verb}" in paths
+    assert control_client.get("/").json()["mode"] == "control"
+    # The view-only camera follows the same switch.
+    assert "/printers/{printer_id}/camera.jpg" not in client.get("/openapi.json").json()["paths"]
+    assert "/printers/{printer_id}/camera.jpg" in paths
+
+
+def test_status_publishes_claim_and_allowed_actions(control_client: TestClient) -> None:
+    body = control_client.get(f"{BASE}/status").json()
+    assert body["details"]["claimed_by"] is None
+    assert body["details"]["monitoring_only"] is False
+    assert set(body["allowed_actions"]) == {"snapshot", "light", "start_print"}
+
+    _claim(control_client)
+    holder = control_client.get(f"{BASE}/status").json()["details"]["claimed_by"]
+    assert holder["owner"] == "operator"
+
+
+def test_status_reads_never_cause_printer_commands(
+    control_client: TestClient, control_backend: FakeBackend
+) -> None:
+    for _ in range(3):
+        control_client.get(f"{BASE}/status")
+        control_client.get(f"{BASE}/queue")
+    assert control_backend.uploads == []
+    assert control_backend.start_commands == []
+    assert control_backend.snapshots == 0
+
+
+# -- view-only camera --------------------------------------------------------------
+
+
+def test_the_camera_view_needs_no_claim_and_is_shared(
+    control_client: TestClient, control_backend: FakeBackend
+) -> None:
+    first = control_client.get(f"{BASE}/camera.jpg")
+    assert first.status_code == 200
+    assert first.headers["content-type"] == "image/jpeg"
+    assert first.content.startswith(b"\xff\xd8")
+    assert first.headers["cache-control"] == "no-store"
+    # Several viewers within the interval share one camera read.
+    for _ in range(3):
+        assert control_client.get(f"{BASE}/camera.jpg").content == first.content
+    assert control_backend.snapshots == 1
+    # Watching sends the printer nothing and takes no claim.
+    assert control_backend.uploads == [] and control_backend.start_commands == []
+    assert control_backend.light_calls == []
+    assert control_client.get(f"{BASE}/status").json()["details"]["claimed_by"] is None
+
+
+def test_an_unreachable_camera_is_a_503(
+    control_client: TestClient, control_backend: FakeBackend
+) -> None:
+    control_backend.fail_snapshot = True
+    response = control_client.get(f"{BASE}/camera.jpg")
+    assert response.status_code == 503
+    assert "camera unavailable" in response.json()["detail"]
+
+
+def test_a_camera_start_records_a_fresh_frame_of_its_own(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    """No snapshot step: the gateway captures the plate frame when start is pressed."""
+    job_id = _approved_job(control_client, tmp_path)
+    assert control_client.get(f"{BASE}/camera.jpg").status_code == 200  # watching
+    assert control_backend.snapshots == 1
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(job_id, plate_check_method="printer_camera"),
+    )
+    assert response.status_code == 200, response.text
+    check = response.json()["dispatch"]["plate_check"]
+    assert check["method"] == "printer_camera"
+    assert check["snapshot_sha256"] and check["snapshot_captured_at"]
+    # A fresh read under the claim, not the shared viewer frame.
+    assert control_backend.snapshots == 2
+    plate = control_client.get(f"/submissions/{job_id}/plate.jpg")
+    assert plate.status_code == 200 and plate.content.startswith(b"\xff\xd8")
+
+
+def test_a_camera_start_without_a_camera_starts_nothing(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    control_backend.fail_snapshot = True
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(job_id, plate_check_method="printer_camera"),
+    )
+    assert response.status_code == 502
+    assert response.json()["camera_unavailable"] is True
+    assert "in person" in response.json()["detail"]
+    assert control_backend.uploads == [] and control_backend.start_commands == []
+
+
+# -- claims ----------------------------------------------------------------------
+
+
+def test_claim_conflict_heartbeat_and_release(control_client: TestClient) -> None:
+    token = _claim(control_client, "session-a")
+
+    taken = control_client.post(
+        f"{BASE}/control/claim", json={"owner": "someone", "session_id": "session-b"}
+    )
+    assert taken.status_code == 409
+    assert taken.json()["claimed_by"]["session_id"] == "session-a"
+
+    beat = control_client.post(f"{BASE}/control/heartbeat", headers={"X-Claim-Token": token})
+    assert beat.status_code == 200
+    lost = control_client.post(f"{BASE}/control/heartbeat", headers={"X-Claim-Token": "nope"})
+    assert lost.status_code == 401
+
+    released = control_client.post(f"{BASE}/control/release", headers={"X-Claim-Token": token})
+    assert released.status_code == 204
+    # Idempotent.
+    again = control_client.post(f"{BASE}/control/release", headers={"X-Claim-Token": token})
+    assert again.status_code == 204
+    _claim(control_client, "session-b")
+
+
+def test_light_needs_a_claim_and_reaches_only_the_light(
+    control_client: TestClient, control_backend: FakeBackend
+) -> None:
+    locked = control_client.post(f"{BASE}/control/light", json={"on": True})
+    assert locked.status_code == 423
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(f"{BASE}/control/light", headers=headers, json={"on": False})
+    assert response.status_code == 200, response.text
+    assert control_backend.light_calls == [False]
+    assert control_backend.uploads == [] and control_backend.start_commands == []
+    assert control_backend.stop_calls == 0
+
+
+def test_control_without_a_claim_is_locked(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    response = control_client.post(f"{BASE}/control/start_print", json=_start_body(job_id))
+    assert response.status_code == 423
+    snap = control_client.post(f"{BASE}/control/snapshot")
+    assert snap.status_code == 423
+    assert control_backend.uploads == [] and control_backend.snapshots == 0
+
+
+# -- the happy path --------------------------------------------------------------
+
+
+def test_camera_confirmed_dispatch_runs_and_finishes(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    token = _claim(control_client)
+    headers = {"X-Claim-Token": token}
+
+    snap = control_client.post(f"{BASE}/control/snapshot", headers=headers)
+    assert snap.status_code == 200, snap.text
+    snapshot = snap.json()
+
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(
+            job_id, plate_check_method="printer_camera", snapshot_token=snapshot["token"]
+        ),
+    )
+    assert response.status_code == 200, response.text
+    job = response.json()
+    assert job["state"] == "running"
+    record = job["dispatch"]
+    assert record["plate_check"]["method"] == "printer_camera"
+    assert record["plate_check"]["snapshot_sha256"] == snapshot["sha256"]
+    assert record["upload_verified_bytes"] > 0
+    assert record["observed_running_at"] is not None
+
+    (command,) = control_backend.start_commands
+    assert command.bed_type == "textured_plate"
+    assert command.plate_index == 1
+    assert command.ams_mapping == (1,)  # AMS 0, tray 1
+    assert control_backend.uploads[0][0] == command.remote_name
+
+    plate = control_client.get(f"/submissions/{job_id}/plate.jpg")
+    assert plate.status_code == 200 and plate.content.startswith(b"\xff\xd8")
+
+    # The printer finishes; the watcher records it.
+    control_backend.reading = replace(control_backend.reading, gcode_state="FINISH")
+    for _ in range(40):
+        state = control_client.get(f"/submissions/{job_id}").json()["state"]
+        if state == "finished":
+            break
+        time.sleep(0.1)
+    assert state == "finished"
+
+
+def test_a_job_is_dispatched_at_most_once(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    headers = {"X-Claim-Token": _claim(control_client)}
+    first = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+    )
+    assert first.json()["state"] == "running"
+    second = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+    )
+    assert second.status_code == 409
+    assert len(control_backend.start_commands) == 1
+
+
+# -- gates -----------------------------------------------------------------------
+
+
+def test_hot_printer_is_refused_and_not_advertised(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    """allowed_actions and the 412 come from one predicate (STATUS_SPEC §6.2)."""
+    job_id = _approved_job(control_client, tmp_path)
+    control_backend.reading = replace(control_backend.reading, bed_temperature_c=60.0)
+    time.sleep(0.7)  # let the monitor observe it
+    assert "start_print" not in control_client.get(f"{BASE}/status").json()["allowed_actions"]
+
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+    )
+    assert response.status_code == 412
+    assert response.json()["limit_bed_c"] == 45.0
+    assert response.headers["Retry-After"] == "60"
+    assert control_backend.uploads == [] and control_backend.start_commands == []
+
+
+def test_wrong_tray_is_refused(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(job_id, ams_mapping=[{"filament_id": 1, "ams_id": 0, "tray_id": 3}]),
+    )
+    assert response.status_code == 412
+    assert "reports no loaded filament" in response.json()["problems"][0]
+    assert control_backend.uploads == []
+
+
+def test_dispatch_rereads_the_artifact_instead_of_trusting_stored_facts(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    """A job whose facts came from an older inspector still gets a fair check."""
+    job_id = _approved_job(control_client, tmp_path)
+    store = control_client.app.state.submissions
+    job = store.get(job_id)
+    legacy = job.facts.model_copy(
+        update={"plate_index": None, "bed_type": None, "bed_type_label": None, "filaments": ()}
+    )
+    store._jobs[job_id] = job.model_copy(update={"facts": legacy})
+
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "running"
+    assert control_backend.start_commands[0].bed_type == "textured_plate"
+
+
+def test_ams_ht_trays_are_not_mapped(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(job_id, ams_mapping=[{"filament_id": 1, "ams_id": 128, "tray_id": 0}]),
+    )
+    assert response.status_code == 412
+    assert "AMS HT" in response.json()["problems"][0]
+    assert control_backend.uploads == []
+
+
+# -- external spool (no AMS) -------------------------------------------------------
+
+
+def _spool(tray_type: str = "PLA") -> AmsTrayReading:
+    # The A1 with no AMS: the operator feeds a spool by hand and selects the
+    # filament on the screen, which the printer reports as vt_tray.
+    return AmsTrayReading(
+        ams_id=254, tray_id=0, tray_type=tray_type, tray_color="000000FF",
+        nozzle_temp_min=190, nozzle_temp_max=240,
+    )
+
+
+@pytest.fixture
+def spool_client(
+    settings: Settings, control_backend: FakeBackend
+) -> Iterator[TestClient]:
+    control_backend.reading = replace(
+        control_backend.reading, ams_unit_ids=[], ams_trays=[], external_spool=_spool()
+    )
+    app = create_app(
+        settings=_control_settings(settings),
+        backend_factory=lambda _d, _c: control_backend,
+    )
+    with TestClient(app) as client:
+        yield client
+
+
+EXTERNAL = [{"filament_id": 1, "ams_id": 254, "tray_id": 0}]
+
+
+def test_a_printer_without_an_ams_prints_from_the_external_spool(
+    spool_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    status = spool_client.get(f"{BASE}/status").json()["details"]
+    assert status["external_spool"]["tray_type"] == "PLA"
+    assert status["external_spool"]["tray_color_name"] == "Black"
+    assert status["ams_trays"] == []  # not counted as an AMS slot
+
+    job_id = _approved_job(spool_client, tmp_path)  # intake matches the spool
+    headers = {"X-Claim-Token": _claim(spool_client)}
+    response = spool_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id, ams_mapping=EXTERNAL)
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "running"
+    (command,) = control_backend.start_commands
+    assert command.use_ams is False
+    assert command.ams_mapping == (254,)
+
+
+def test_the_external_spool_is_checked_like_a_tray(
+    spool_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(spool_client, tmp_path)
+    # Someone swaps the spool for PETG after the job was approved.
+    control_backend.reading = replace(control_backend.reading, external_spool=_spool("PETG"))
+    time.sleep(0.7)  # let the monitor observe it
+    headers = {"X-Claim-Token": _claim(spool_client)}
+    response = spool_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id, ams_mapping=EXTERNAL)
+    )
+    # Revalidation against the current state refuses before the mapping is
+    # even read: the spool no longer holds the job's material.
+    assert response.status_code == 412
+    assert "material_filament_match" in response.json()["reasons"]
+    assert control_backend.uploads == [] and control_backend.start_commands == []
+
+
+def test_an_unloaded_external_spool_cannot_be_mapped(
+    spool_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(spool_client, tmp_path)
+    control_backend.reading = replace(control_backend.reading, external_spool=None)
+    time.sleep(0.7)
+    headers = {"X-Claim-Token": _claim(spool_client)}
+    response = spool_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id, ams_mapping=EXTERNAL)
+    )
+    assert response.status_code == 412
+    assert "material_filament_match" in response.json()["reasons"]
+    assert control_backend.uploads == []
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        # The external spool alongside an AMS tray: use_ams cannot be both.
+        [*EXTERNAL, {"filament_id": 2, "ams_id": 0, "tray_id": 1}],
+        # The spool has one slot.
+        [{"filament_id": 1, "ams_id": 254, "tray_id": 1}],
+    ],
+)
+def test_the_external_spool_is_single_filament_and_single_slot(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path, mapping
+) -> None:
+    control_backend.reading = replace(control_backend.reading, external_spool=_spool())
+    time.sleep(0.7)
+    job_id = _approved_job(control_client, tmp_path)
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id, ams_mapping=mapping)
+    )
+    assert response.status_code == 412
+    problems = " ".join(response.json()["problems"])
+    assert "single-filament job only" in problems or "addressed as tray 0" in problems
+    assert control_backend.uploads == []
+
+
+def test_camera_check_needs_a_snapshot(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(job_id, plate_check_method="printer_camera", snapshot_token="made-up"),
+    )
+    assert response.status_code == 412
+    assert response.json()["snapshot_missing"] is True
+    assert control_backend.uploads == []
+
+
+def test_plate_confirmation_must_be_affirmative(
+    control_client: TestClient, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(job_id, plate_confirmed_empty=False),
+    )
+    assert response.status_code == 422
+
+
+def test_a_job_sliced_for_another_plate_is_refused(
+    settings: Settings, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    built = _control_settings(settings)
+    built.printers[0].profile.plate = "cool_plate"
+    app = create_app(settings=built, backend_factory=lambda _d, _c: control_backend)
+    with TestClient(app) as client:
+        job_id = _approved_job(client, tmp_path)
+        headers = {"X-Claim-Token": _claim(client)}
+        response = client.post(
+            f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+        )
+    assert response.status_code == 412
+    assert response.json()["machine_plate"] == "cool_plate"
+    assert control_backend.uploads == []
+
+
+def test_verified_identities_are_required_by_default(
+    settings: Settings, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    built = _control_settings(settings, require_verified_identity=True)
+    app = create_app(settings=built, backend_factory=lambda _d, _c: control_backend)
+    with TestClient(app) as client:
+        job_id = _approved_job(client, tmp_path)
+        headers = {"X-Claim-Token": _claim(client)}
+        response = client.post(
+            f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+        )
+    assert response.status_code == 403
+    assert control_backend.uploads == []
+
+
+# -- honest failures -------------------------------------------------------------
+
+
+def test_a_failed_upload_starts_nothing(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    control_backend.fail_upload = True
+    headers = {"X-Claim-Token": _claim(control_client)}
+    job = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+    ).json()
+    assert job["state"] == "failed"
+    assert control_backend.start_commands == []
+    assert "nothing was started" in job["history"][-1]["note"]
+
+
+def test_a_start_the_printer_never_acts_on_fails_with_uncertainty(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    control_backend.start_runs = False
+    headers = {"X-Claim-Token": _claim(control_client)}
+    job = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+    ).json()
+    assert job["state"] == "failed"
+    assert "real state is unknown" in job["dispatch"]["uncertainty"]
+    assert len(control_backend.start_commands) == 1  # never retried
+
+
+def test_stop_requires_a_running_job_and_a_claim(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    headers = {"X-Claim-Token": _claim(control_client)}
+    idle = control_client.post(
+        f"{BASE}/control/stop_print", headers=headers, json={"stopped_by": "op"}
+    )
+    assert idle.status_code == 412
+    assert control_backend.stop_calls == 0
+
+    job_id = _approved_job(control_client, tmp_path)
+    control_client.post(f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id))
+    locked = control_client.post(f"{BASE}/control/stop_print", json={"stopped_by": "op"})
+    assert locked.status_code == 423
+    stopped = control_client.post(
+        f"{BASE}/control/stop_print", headers=headers, json={"stopped_by": "op", "reason": "test"}
+    )
+    assert stopped.status_code == 200, stopped.text
+    assert stopped.json()["submission_id"] == job_id
+    assert control_backend.stop_calls == 1

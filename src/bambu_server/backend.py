@@ -1,16 +1,86 @@
-"""Narrow monitoring adapter around the command-capable third-party client."""
+"""Narrow adapter around the command-capable third-party client.
+
+Monitoring reads go through :meth:`BambuLabsBackend.read`. The control plane's
+three verbs -- upload a file, start the print it names, stop the running print
+-- are the *only* command methods exposed, and only the dispatch gate
+(:mod:`bambu_server.dispatch`) calls them, under a claim, after the
+preconditions pass. Nothing else in the library's command surface is reachable
+from here.
+"""
 
 from __future__ import annotations
 
+import logging
 import math
+import socket
+import ssl
+import struct
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol, TypedDict
 
 import bambulabs_api as bambu
 
 from .config import PrinterCredentials, PrinterDefinition
+
+logger = logging.getLogger(__name__)
+
+#: The printer's chamber-camera service (P1 series: authenticated JPEG frames).
+_CAMERA_PORT = 6000
+
+#: Models with no chamber temperature sensor. Their firmware still reports a
+#: fixed ``chamber_temper`` (5 C on the P1S and A1), which is a placeholder, not
+#: a reading. Matched exactly against the operator-declared ``model``; an
+#: undeclared or unlisted model keeps whatever the printer reports.
+_NO_CHAMBER_SENSOR_MODELS = frozenset({"p1p", "p1s", "a1", "a1 mini"})
+
+
+#: The printer-side id of the external spool holder (MQTT ``vt_tray``). Bambu
+#: Studio addresses it with this id, and a job fed from it is started with
+#: ``use_ams`` off. It is carried through the gateway as AMS unit 254, slot 0.
+EXTERNAL_SPOOL_ID = 254
+
+
+def _has_chamber_sensor(model: str | None) -> bool:
+    if not model:
+        return True
+    name = " ".join(model.lower().split()).removeprefix("bambu lab ")
+    return name not in _NO_CHAMBER_SENSOR_MODELS
+
+
+class PrinterCommandError(RuntimeError):
+    """A command could not be delivered to the printer.
+
+    Raised only when delivery itself failed (no connection, the publish was not
+    confirmed, an upload could not be verified). Delivery is not execution: a
+    command that was delivered may still not have been acted on, which is the
+    dispatch step's job to observe.
+    """
+
+
+@dataclass(frozen=True)
+class UploadResult:
+    remote_name: str
+    byte_size: int
+
+
+@dataclass(frozen=True)
+class StartPrintCommand:
+    """Everything the printer's ``project_file`` command needs, resolved."""
+
+    remote_name: str
+    plate_index: int
+    bed_type: str
+    use_ams: bool
+    #: Per filament (in slicer order), the printer-side tray index.
+    ams_mapping: tuple[int, ...]
+    bed_leveling: bool = True
+    flow_calibration: bool = False
+    vibration_calibration: bool = False
+    timelapse: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,6 +131,8 @@ class PrinterReading:
     skipped_objects: list[int] | None = None
     ams_trays: list[AmsTrayReading] | None = None
     ams_unit_ids: list[int] | None = None
+    #: The external spool, when the printer reports a filament on it.
+    external_spool: AmsTrayReading | None = None
 
 
 class AdvancedReading(TypedDict):
@@ -75,6 +147,7 @@ class AdvancedReading(TypedDict):
     skipped_objects: list[int] | None
     ams_trays: list[AmsTrayReading] | None
     ams_unit_ids: list[int] | None
+    external_spool: AmsTrayReading | None
 
 
 class PrinterBackend(Protocol):
@@ -83,6 +156,20 @@ class PrinterBackend(Protocol):
     def stop(self) -> None: ...
 
     def read(self) -> PrinterReading: ...
+
+    # -- control plane (dispatch only) ---------------------------------------
+
+    def upload_file(self, path: Path, remote_name: str) -> UploadResult: ...
+
+    def start_print(self, command: StartPrintCommand) -> None: ...
+
+    def stop_print(self) -> None: ...
+
+    def set_chamber_light(self, on: bool) -> None: ...
+
+    def current_job_file(self) -> str | None: ...
+
+    def snapshot(self, timeout_s: float = 10.0) -> bytes: ...
 
 
 def _optional_int(value: object) -> int | None:
@@ -114,10 +201,13 @@ def _number(value: object) -> int | float | None:
 
 
 class BambuLabsBackend:
-    """MQTT-only use of ``bambulabs_api.Printer``.
+    """``bambulabs_api.Printer`` with MQTT monitoring plus the control verbs.
 
-    Camera and FTP clients are never started. Public command methods remain
-    deliberately unreachable from the HTTP layer.
+    The library's camera thread is never started; a snapshot opens its own
+    short-lived connection. The FTP client is used for exactly one thing --
+    uploading an artifact dispatch is about to start -- and the connection is
+    opened and closed around that single transfer. No command method is
+    reachable from an HTTP handler except through :mod:`bambu_server.dispatch`.
     """
 
     def __init__(
@@ -131,7 +221,11 @@ class BambuLabsBackend:
             credentials.serial.get_secret_value(),
         )
         self._lock = threading.Lock()
+        # One camera connection at a time: the viewer and the plate-check
+        # snapshot share the printer's camera service.
+        self._camera_lock = threading.Lock()
         self._data_updated_at: datetime | None = None
+        self._has_chamber_sensor = _has_chamber_sensor(definition.model)
         self._printer.mqtt_client.on_message_handler = self._on_message
 
     def _on_message(self, *_args: object) -> None:
@@ -143,6 +237,178 @@ class BambuLabsBackend:
 
     def stop(self) -> None:
         self._printer.mqtt_stop()
+
+    # -- control plane -----------------------------------------------------
+
+    def upload_file(self, path: Path, remote_name: str) -> UploadResult:
+        """Upload ``path`` to the printer's storage root as ``remote_name``.
+
+        The library's own ``upload_file`` wraps every exception into a log line
+        and returns ``None``, so a failed transfer would look like a success.
+        This drives its FTPS client directly instead: connect, store, then ask
+        the printer for the stored size and refuse to call the upload done
+        unless it matches the local file byte for byte.
+        """
+
+        expected = path.stat().st_size
+        ftp = self._printer.ftp_client
+        ftps = ftp.ftps
+        try:
+            ftps.connect(host=ftp.server_ip, port=ftp.port)
+            ftps.login(ftp.user, ftp.access_code)
+            ftps.prot_p()
+            with path.open("rb") as handle:
+                ftps.storbinary(f"STOR {remote_name}", handle, blocksize=32768)
+            stored = ftps.size(remote_name)
+        except Exception as exc:  # ftplib's error hierarchy is wide and not ours
+            raise PrinterCommandError(f"upload failed: {type(exc).__name__}") from exc
+        finally:
+            try:
+                ftps.close()
+            except Exception:  # noqa: BLE001 - closing a dead socket is not news
+                pass
+        if stored != expected:
+            raise PrinterCommandError(
+                f"upload not verified: printer reports {stored} bytes, expected {expected}"
+            )
+        return UploadResult(remote_name=remote_name, byte_size=expected)
+
+    def start_print(self, command: StartPrintCommand) -> None:
+        """Publish the ``project_file`` command for an uploaded 3mf.
+
+        Built here rather than through the library's ``start_print``, which
+        hard-codes ``bed_type`` to a textured plate: the plate is a machine
+        fact the gateway has already checked, and naming the wrong one makes
+        the printer heat the bed for a surface it does not have. The payload
+        otherwise mirrors the library's (and Bambu Studio's) field set.
+        """
+
+        payload = {
+            "print": {
+                "command": "project_file",
+                "param": f"Metadata/plate_{command.plate_index}.gcode",
+                "file": command.remote_name,
+                "url": f"ftp:///{command.remote_name}",
+                "bed_type": command.bed_type,
+                "bed_leveling": command.bed_leveling,
+                "flow_cali": command.flow_calibration,
+                "vibration_cali": command.vibration_calibration,
+                "timelapse": command.timelapse,
+                "layer_inspect": False,
+                "use_ams": command.use_ams,
+                "ams_mapping": list(command.ams_mapping),
+                "skip_objects": None,
+                "sequence_id": "10000000",
+            }
+        }
+        self._publish(payload)
+
+    def stop_print(self) -> None:
+        self._publish({"print": {"command": "stop"}})
+
+    def set_chamber_light(self, on: bool) -> None:
+        """Switch the chamber LED. No motion and no heat; it only lights the camera."""
+
+        self._publish(
+            {
+                "system": {
+                    "command": "ledctrl",
+                    "led_node": "chamber_light",
+                    "led_mode": "on" if on else "off",
+                    "led_on_time": 500,
+                    "led_off_time": 500,
+                    "loop_times": 0,
+                    "interval_time": 0,
+                    "sequence_id": "10000001",
+                }
+            }
+        )
+
+    def current_job_file(self) -> str | None:
+        """The file the printer says it is printing, from the cached telemetry."""
+
+        try:
+            name = self._printer.mqtt_client.gcode_file()
+        except Exception:  # noqa: BLE001 - a missing field is "not reported"
+            return None
+        return str(name).strip() or None
+
+    def snapshot(self, timeout_s: float = 10.0) -> bytes:
+        """One JPEG frame from the printer's chamber camera, one reader at a time."""
+
+        with self._camera_lock:
+            return self._read_camera_frame(timeout_s)
+
+    def _read_camera_frame(self, timeout_s: float) -> bytes:
+        """One JPEG frame from the printer's chamber camera.
+
+        Opens its own authenticated TLS connection to the camera port, reads
+        until a complete frame arrives, and closes. The library's camera
+        client is a perpetual reconnecting thread; a confirmation step wants
+        one current picture, not a stream, so this does not use it.
+        """
+
+        host = self._printer.ip_address
+        access_code = str(self._printer.access_code)
+        auth = bytearray()
+        auth += struct.pack("<IIII", 0x40, 0x3000, 0, 0)
+        auth += b"bblp".ljust(32, b"\0")
+        auth += access_code.encode("ascii").ljust(32, b"\0")
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE  # the printer presents a self-signed cert
+        deadline = time.monotonic() + timeout_s
+        try:
+            with socket.create_connection((host, _CAMERA_PORT), timeout=timeout_s) as raw:
+                with context.wrap_socket(raw, server_hostname=host) as sock:
+                    sock.settimeout(timeout_s)
+                    sock.sendall(bytes(auth))
+                    frame = bytearray()
+                    expected: int | None = None
+                    while time.monotonic() < deadline:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            raise PrinterCommandError("camera closed the connection (access code?)")
+                        if expected is None:
+                            if len(chunk) < 16:
+                                raise PrinterCommandError("camera sent a malformed frame header")
+                            expected = int.from_bytes(chunk[0:4], "little")
+                            frame += chunk[16:]
+                        else:
+                            frame += chunk
+                        if expected is not None and len(frame) >= expected:
+                            image = bytes(frame[:expected])
+                            if image[:2] != b"\xff\xd8" or image[-2:] != b"\xff\xd9":
+                                raise PrinterCommandError("camera frame is not a JPEG")
+                            return image
+        except PrinterCommandError:
+            raise
+        except (OSError, ssl.SSLError) as exc:
+            raise PrinterCommandError(f"camera unreachable: {type(exc).__name__}") from exc
+        raise PrinterCommandError("camera did not deliver a frame in time")
+
+    def _publish(self, payload: dict[str, object]) -> None:
+        """Publish one command and insist the broker accepted it.
+
+        Uses the library's own publish path (connection check + wait for the
+        broker's acknowledgement) via its name-mangled helper; a library
+        upgrade that renames it fails loudly here rather than silently
+        skipping the command.
+        """
+
+        publish = getattr(
+            self._printer.mqtt_client, "_PrinterMQTTClient__publish_command", None
+        )
+        if publish is None:
+            raise PrinterCommandError("bambulabs_api publish helper not found; library changed")
+        if not self._printer.mqtt_client_connected():
+            raise PrinterCommandError("MQTT is not connected")
+        if not publish(payload):
+            raise PrinterCommandError("the MQTT broker did not confirm the command")
+        section = next(iter(payload.values()))
+        command = section.get("command") if isinstance(section, dict) else None
+        logger.info("Published %s command", command or "unnamed")
 
     def read(self) -> PrinterReading:
         connected = bool(self._printer.mqtt_client_connected())
@@ -165,7 +431,11 @@ class BambuLabsBackend:
             activity=str(self._printer.get_current_state()),
             bed_temperature_c=_number(self._printer.get_bed_temperature()),
             nozzle_temperature_c=_number(self._printer.get_nozzle_temperature()),
-            chamber_temperature_c=_number(self._printer.get_chamber_temperature()),
+            chamber_temperature_c=(
+                _number(self._printer.get_chamber_temperature())
+                if self._has_chamber_sensor
+                else None
+            ),
             progress_percent=_number(self._printer.get_percentage()),
             remaining_time_minutes=_number(self._printer.get_time()),
             current_layer=int(self._printer.current_layer_num()),
@@ -194,6 +464,7 @@ class BambuLabsBackend:
             "skipped_objects": None,
             "ams_trays": None,
             "ams_unit_ids": None,
+            "external_spool": None,
         }
 
         try:
@@ -228,7 +499,26 @@ class BambuLabsBackend:
             pass
 
         values["ams_unit_ids"], values["ams_trays"] = self._read_ams_inventory()
+        values["external_spool"] = self._read_external_spool()
         return values
+
+    def _read_external_spool(self) -> AmsTrayReading | None:
+        """The external spool (``vt_tray``), decoded like an AMS tray.
+
+        Reported as loaded only when the printer names a filament for it --
+        on the A1 that is what the operator selects on the screen after
+        feeding a spool by hand. Read from the same local cache as the AMS.
+        """
+        try:
+            tray = self._printer.mqtt_client.dump().get("print", {}).get("vt_tray")
+            if not isinstance(tray, dict):
+                return None
+            reading = _tray_reading(EXTERNAL_SPOOL_ID, 0, tray)
+            # A hand-fed spool has no remaining-filament sensor; the A1 reports
+            # 0, which is a placeholder, not "empty".
+            return replace(reading, remaining_percent=None) if reading else None
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
 
     def _read_ams_inventory(self) -> tuple[list[int] | None, list[AmsTrayReading] | None]:
         """Decode only allowlisted fields from the MQTT client's local cache.
@@ -259,32 +549,38 @@ class BambuLabsBackend:
                     if tray_id is None or tray_id < 0 or tray_id in seen:
                         return None, None
                     seen.add(tray_id)
-                    material = _tray_text(tray.get("tray_type"))
-                    # An id-only slot is empty; optional calibration/spool-tag
-                    # fields are not evidence that filament is loaded.
-                    if material is None:
-                        continue
-                    remaining = _optional_int(tray.get("remain"))
-                    trays.append(
-                        AmsTrayReading(
-                            ams_id=ams_id,
-                            tray_id=tray_id,
-                            tray_type=material,
-                            tray_color=_tray_text(tray.get("tray_color")),
-                            tray_weight=_tray_text(tray.get("tray_weight")),
-                            tray_diameter=_tray_text(tray.get("tray_diameter")),
-                            tray_temp=_tray_text(tray.get("tray_temp")),
-                            nozzle_temp_min=_optional_int(tray.get("nozzle_temp_min")),
-                            nozzle_temp_max=_optional_int(tray.get("nozzle_temp_max")),
-                            remaining_percent=(
-                                remaining if remaining is not None and 0 <= remaining <= 100
-                                else None
-                            ),
-                        )
-                    )
+                    reading = _tray_reading(ams_id, tray_id, tray)
+                    if reading is not None:
+                        trays.append(reading)
         except (AttributeError, TypeError, ValueError, OverflowError):
             return None, None
         return unit_ids, trays
+
+
+def _tray_reading(ams_id: int, tray_id: int, tray: dict) -> AmsTrayReading | None:
+    """Decode one tray's allowlisted fields, or ``None`` when it holds nothing.
+
+    An id-only slot is empty; optional calibration/spool-tag fields are not
+    evidence that filament is loaded.
+    """
+    material = _tray_text(tray.get("tray_type"))
+    if material is None:
+        return None
+    remaining = _optional_int(tray.get("remain"))
+    return AmsTrayReading(
+        ams_id=ams_id,
+        tray_id=tray_id,
+        tray_type=material,
+        tray_color=_tray_text(tray.get("tray_color")),
+        tray_weight=_tray_text(tray.get("tray_weight")),
+        tray_diameter=_tray_text(tray.get("tray_diameter")),
+        tray_temp=_tray_text(tray.get("tray_temp")),
+        nozzle_temp_min=_optional_int(tray.get("nozzle_temp_min")),
+        nozzle_temp_max=_optional_int(tray.get("nozzle_temp_max")),
+        remaining_percent=(
+            remaining if remaining is not None and 0 <= remaining <= 100 else None
+        ),
+    )
 
 
 def _tray_text(value: object) -> str | None:

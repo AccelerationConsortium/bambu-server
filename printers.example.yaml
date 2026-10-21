@@ -16,6 +16,33 @@ submissions:
                                  # an artifact are read and plate fit is not
                                  # reported rather than guessed from a partial scan
 
+# Control plane: claims and the start/stop/snapshot verbs. Off unless enabled
+# here. With it off the gateway is exactly the monitoring-only release.
+dispatch:
+  enabled: false
+  require_verified_identity: true  # approver and starter must come through the edge
+  safe_bed_c: 45                   # refuse to start above these: the last job
+  safe_nozzle_c: 70                # has not cooled and the plate is suspect
+  confirm_timeout_s: 180           # how long the printer has to report RUNNING
+  bed_leveling: true
+  flow_calibration: false
+  vibration_calibration: false
+  timelapse: false
+
+# STL slicing with an installed Bambu Studio (CLI, headless). Off unless enabled.
+# `work_dir` must be writable by the service (its home is read-only under systemd).
+slicer:
+  enabled: false
+  executable: /home/you/.local/bin/bambu-studio
+  profiles_dir: /home/you/.local/opt/bambu-studio/squashfs-root/resources/profiles/BBL
+  work_dir: var/slicer
+  timeout_s: 600
+  process_profile: "0.20mm Standard @BBL X1C"
+  filament_profiles:               # material a submitter names -> filament preset
+    PLA: "Bambu PLA Basic @BBL X1C"
+  machine_profiles:                # printer id -> machine preset; others refuse .stl
+    bambu_x1c_01: "Bambu Lab X1 Carbon 0.4 nozzle"
+
 printers:
   - id: bambu_x1c_01
     name: Bambu X1 Carbon 01
@@ -30,6 +57,11 @@ printers:
       nozzle_type: hardened_steel    # fallback for printers whose live field is blank
       nozzle_diameter_mm: 0.4
       bed_size_mm: [256, 256]        # X, Y
+      # The build plate installed. The printer cannot detect it, so this is
+      # the only record; dispatch refuses while it is undeclared and refuses a
+      # job sliced for another plate. One of: cool_plate, eng_plate,
+      # hot_plate, textured_plate, supertack_plate.
+      plate: textured_plate
       chamber_temperature_c: null    # null on a machine with no chamber control
       limits:                        # `[min, max]` or `{min_c: , max_c: }`
         nozzle_temperature_c: [0, 300]

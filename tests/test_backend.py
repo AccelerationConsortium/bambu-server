@@ -140,6 +140,38 @@ def test_backend_starts_only_mqtt_and_builds_reading(monkeypatch) -> None:
     # model's configured temperature against.
     assert reading.ams_trays[0].nozzle_temp_min == 190
     assert reading.ams_trays[0].nozzle_temp_max == 240
+    # No model declared: the printer's chamber value is passed through.
+    assert reading.chamber_temperature_c == 35.0
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("P1S", None),
+        ("A1", None),
+        ("A1 mini", None),
+        ("Bambu Lab  P1P", None),
+        ("X1 Carbon", 35.0),
+        ("H2D", 35.0),
+        (None, 35.0),
+    ],
+)
+def test_chamber_placeholder_is_dropped_on_models_without_a_sensor(
+    monkeypatch, model, expected
+) -> None:
+    # The P1 and A1 series report a fixed 5 C chamber; a value from them is
+    # never a reading, so it must not surface as one.
+    fake = FakePrinter("printer.invalid", "access-secret", "serial-secret")
+    monkeypatch.setattr(backend_module.bambu, "Printer", lambda *_args: fake)
+    backend = BambuLabsBackend(
+        PrinterDefinition(id="bambu_one", name="One", model=model, env_prefix="BAMBU_ONE"),
+        PrinterCredentials(
+            host="printer.invalid",
+            access_code="access-secret",
+            serial="serial-secret",
+        ),
+    )
+    assert backend.read().chamber_temperature_c == expected
 
 
 def _inventory(payload):
@@ -197,3 +229,34 @@ def test_unknown_or_malformed_inventory_is_not_reported_as_empty(payload):
 def test_known_empty_inventory_is_distinct_from_unknown():
     assert _inventory({"ams": [{"id": "1", "tray": [{"id": "0"}]}]}) == ([1], [])
     assert _inventory({"ams": []}) == ([], [])
+
+
+def _external(vt_tray):
+    from types import SimpleNamespace
+
+    backend = object.__new__(BambuLabsBackend)
+    backend._printer = SimpleNamespace(
+        mqtt_client=SimpleNamespace(dump=lambda: {"print": {"vt_tray": vt_tray}})
+    )
+    return backend._read_external_spool()
+
+
+def test_external_spool_is_decoded_like_a_tray():
+    spool = _external({
+        "id": "254", "tray_type": "PLA", "tray_color": "8E9089FF",
+        "nozzle_temp_min": "190", "nozzle_temp_max": "230", "tag_uid": "secret-tag",
+    })
+    assert (spool.ams_id, spool.tray_id) == (254, 0)
+    assert spool.tray_type == "PLA"
+    assert spool.tray_color == "8E9089FF"
+    assert (spool.nozzle_temp_min, spool.nozzle_temp_max) == (190, 230)
+
+
+def test_the_external_spool_has_no_remaining_estimate():
+    # The A1 reports remain 0 for a hand-fed spool; that is not "empty".
+    assert _external({"id": "254", "tray_type": "PLA", "remain": 0}).remaining_percent is None
+
+
+@pytest.mark.parametrize("vt_tray", [None, "bad", {}, {"id": "254", "tray_type": ""}])
+def test_an_external_spool_without_a_selected_filament_is_not_loaded(vt_tray):
+    assert _external(vt_tray) is None

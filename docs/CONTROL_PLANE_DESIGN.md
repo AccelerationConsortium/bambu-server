@@ -1,10 +1,56 @@
 # Bambu Printer Gateway — Control Plane Design (proposal, for review)
 
-**Status:** DRAFT — no control code may ship until this design is approved.
+**Status:** PARTIALLY APPROVED AND BUILT (2026-10-04). A human approved a
+narrow slice of this design: phase 1 (claims, `details.claimed_by`,
+`allowed_actions` from the shared gate), `stop_print` from phase 3, and
+`start_print` with its upload from phase 4, plus a camera `snapshot` verb for
+the plate check (not in the original table), and on 2026-10-05 the phase 2
+`light` verb (chamber light, any observable state, claim required). On
+2026-10-20 the external spool (MQTT `vt_tray`, addressed as AMS 254 tray 0) was
+approved as a `start_print` mapping target, so a printer with no AMS (the A1)
+can be dispatched. It gets the same material and nozzle-window checks as an AMS
+tray, maps a single-filament job only (the command's `use_ams` is all or
+nothing), and is sent as `use_ams: false` with mapping `[254]`, as Bambu Studio
+does. It counts as loaded only when the printer names a filament for it, which
+on the A1 is what the operator selects after feeding the spool. The same day
+the gcode check was narrowed for one case: current Bambu Studio start gcode
+saves the bed mesh with `M500` right after probing (`G29`, optionally `M400`),
+so that `M500` is accepted when it sits inside the machine start gcode, as
+confirmed by the `; MACHINE_START_GCODE_END` marker after it. Every other
+`M500`, and every other refused command, is still refused. On 2026-10-21 a
+view-only camera was approved so a person can watch a printer before submitting
+and while its job runs: `GET /printers/{id}/camera.jpg`, only with
+`dispatch.enabled`, no claim, no command published, at most one camera read per
+printer every 2 s shared by every viewer (failures cached the same way), and
+camera reads serialized with the plate-check snapshot. Its frames carry no
+snapshot token, so they can never satisfy the plate check. The submission page
+shows it under Machine, off until a person presses Show camera, and pauses it
+while the tab is hidden. With the live view in place the separate snapshot step
+in the start panel was dropped (approved the same day): a camera
+`start_print` without a `snapshot_token` makes the gateway capture the frame
+itself, under the claim, at the moment start is pressed, and record its hash
+and time with the job; if the camera delivers none the start is refused (502)
+and nothing is uploaded. A `snapshot_token` from `/control/snapshot` is still
+accepted. The person's `plate_confirmed_empty` statement is unchanged. The rest of
+phase 2, pause/resume, temperature, motion, filament, and every excluded verb
+remain unapproved. Homing to raise the plate into camera view was proposed and
+declined: it drives the nozzle into the plate before anyone knows it is clear.
+`start_print` uses the human-in-the-loop model of §7 with one addition: a
+person must confirm the build plate is empty, by printer camera or in person.
+Departures from this draft, recorded rather than smoothed over:
+
+- Control is reachable over HTTP from the `/ui` page; it is **not** yet routed
+  through `lab-skills` or plan execution.
+- §6.4's reconcile verb is not built. A failed or uncertain dispatch leaves the
+  job `failed` with `dispatch.uncertainty`; a person clears the printer on the
+  printer itself.
+- The one-shot approval ticket of §7 is realised as: job approval (verified
+  identity) + a claim + the start request's own plate confirmation, each
+  recorded on the job.
+
 **Companion:** `docs/SUBMISSION_PIPELINE_DESIGN.md` — the concrete submission →
-validation → queue → dispatch flow. Everything in it up to the approval gate is
-built; its dispatch step is the work this design gates, and
-`submissions.dispatch()` is the named, tested stub waiting on it.
+validation → queue → dispatch flow; its dispatch step is implemented in
+`bambu_server.dispatch`.
 **Binding constraints:** `../ac-organic-lab/docs/AGENT_RULES.md` and
 `../ac-organic-lab/docs/STATUS_SPEC.md` (authoritative). This design must never
 weaken them. Repo-local rules: `AGENT_RULES.md` (this repo) and `docs/TODO.md`.

@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from time import monotonic
 
 from . import __version__
-from .backend import PrinterBackend, PrinterReading
+from .backend import AmsTrayReading, PrinterBackend, PrinterReading
 from .config import PrinterDefinition
 from .filament_colors import tray_color_label
 from .models import (
@@ -235,24 +235,11 @@ class PrinterMonitor:
             if reading.ams_unit_ids is not None:
                 details["ams_unit_ids"] = reading.ams_unit_ids
             if reading.ams_trays is not None:
-                details["ams_trays"] = [
-                    {
-                        "ams_id": tray.ams_id,
-                        "tray_id": tray.tray_id,
-                        "tray_index": tray.tray_index,
-                        "tray_type": tray.tray_type,
-                        "tray_color": tray.tray_color,
-                        "tray_color_name": tray_color_label(tray, self.definition.profile.ams.color_labels)[0],
-                        "tray_color_source": tray_color_label(tray, self.definition.profile.ams.color_labels)[1],
-                        "tray_weight": tray.tray_weight,
-                        "tray_diameter": tray.tray_diameter,
-                        "tray_temp": tray.tray_temp,
-                        "nozzle_temp_min": tray.nozzle_temp_min,
-                        "nozzle_temp_max": tray.nozzle_temp_max,
-                        "remaining_percent": tray.remaining_percent,
-                    }
-                    for tray in reading.ams_trays
-                ]
+                details["ams_trays"] = [self._tray_details(tray) for tray in reading.ams_trays]
+            # Kept apart from ams_trays: it is not a slot of any AMS unit, and
+            # counting it among them would misstate how many slots are loaded.
+            if reading.external_spool is not None:
+                details["external_spool"] = self._tray_details(reading.external_spool)
 
         return EquipmentStatus(
             protocol_version=PROTOCOL_VERSION,
@@ -303,6 +290,24 @@ class PrinterMonitor:
                 ),
             )
         return "unknown", "Printer state is unknown", None
+
+    def _tray_details(self, tray: AmsTrayReading) -> dict[str, object]:
+        name, source = tray_color_label(tray, self.definition.profile.ams.color_labels)
+        return {
+            "ams_id": tray.ams_id,
+            "tray_id": tray.tray_id,
+            "tray_index": tray.tray_index,
+            "tray_type": tray.tray_type,
+            "tray_color": tray.tray_color,
+            "tray_color_name": name,
+            "tray_color_source": source,
+            "tray_weight": tray.tray_weight,
+            "tray_diameter": tray.tray_diameter,
+            "tray_temp": tray.tray_temp,
+            "nozzle_temp_min": tray.nozzle_temp_min,
+            "nozzle_temp_max": tray.nozzle_temp_max,
+            "remaining_percent": tray.remaining_percent,
+        }
 
     @staticmethod
     def _metrics(reading: PrinterReading) -> dict[str, MetricValue]:

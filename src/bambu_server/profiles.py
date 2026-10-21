@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
+from .backend import EXTERNAL_SPOOL_ID
 from .config import AmsPolicy, MachineLimits, PrinterDefinition, TrayColorLabel
 from .filament_colors import ColorSource, tray_color_label
 
@@ -39,7 +40,7 @@ class LoadedTray(BaseModel):
     inventory, and are never carried here.
     """
 
-    ams_id: int | None = Field(default=None, description="Printer-reported AMS unit ID; HT units retain IDs such as 128/129.")
+    ams_id: int | None = Field(default=None, description="Printer-reported AMS unit ID; HT units retain IDs such as 128/129, and 254 is the external spool (tray 0).")
     tray_id: int | None = Field(default=None, description="Zero-based slot within the AMS unit. Use (ams_id, tray_id) as the address.")
     tray_index: int | None = Field(default=None, description="Legacy field, null for decoded inventory. MQTT n is not a slot address.")
     tray_type: str | None = None
@@ -51,8 +52,13 @@ class LoadedTray(BaseModel):
     remaining_percent: int | None = Field(default=None, ge=0, le=100, description="Printer-estimated remaining filament percentage; null means unavailable, not zero or a full spool.")
 
     @property
+    def external(self) -> bool:
+        """The external spool holder rather than an AMS slot."""
+        return self.ams_id == EXTERNAL_SPOOL_ID
+
+    @property
     def label(self) -> str:
-        location = f"AMS {self.ams_id} tray {self.tray_id}"
+        location = "external spool" if self.external else f"AMS {self.ams_id} tray {self.tray_id}"
         return f"{self.tray_type or 'unknown filament'} ({location})"
 
 
@@ -76,6 +82,8 @@ class ObservedMachineState(BaseModel):
             nozzle_type=reading.nozzle_type,
             nozzle_diameter_mm=reading.nozzle_diameter,
             ams_unit_ids=reading.ams_unit_ids,
+            # The external spool is a loaded tray like any other for matching
+            # and dispatch, addressed as (254, 0).
             loaded_trays=[
                 LoadedTray(
                     ams_id=tray.ams_id,
@@ -89,7 +97,10 @@ class ObservedMachineState(BaseModel):
                     nozzle_temp_max_c=tray.nozzle_temp_max,
                     remaining_percent=tray.remaining_percent,
                 )
-                for tray in (reading.ams_trays or [])
+                for tray in [
+                    *(reading.ams_trays or []),
+                    *([reading.external_spool] if reading.external_spool else []),
+                ]
             ],
         )
 

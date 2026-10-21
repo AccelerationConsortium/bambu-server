@@ -5,13 +5,31 @@ first and in full. The authoritative device contract is
 `../ac-organic-lab/docs/STATUS_SPEC.md`. This file only adds rules specific to
 the Bambu printer gateway.
 
-1. The service is read-only until a human explicitly approves a control-plane
-   design integrated with `lab-skills`, cooperative claims, preconditions, and
-   audited plan execution.
+1. Control is limited to what a human approved on 2026-10-04: cooperative
+   claims, a camera snapshot, the chamber light (approved 2026-10-05),
+   `start_print` of an approved job (from an AMS tray or, approved 2026-10-20,
+   the external spool, checked the same way; and, approved the same day, with
+   the stock start gcode's bed-mesh `M500` right after `G29` accepted -- every
+   other refused command still refused), and
+   `stop_print`, all behind `dispatch.enabled` and the gates in
+   `bambu_server.dispatch`. Any other verb, a relaxed gate, or integration with
+   `lab-skills` plan execution needs a new, explicitly approved design.
 2. Monitoring must never start, pause, resume, stop, heat, home, move, calibrate,
    upload to, or otherwise control a printer.
 3. The service may request MQTT state refreshes in its background monitoring
-   loop. A dashboard request must never cause printer I/O.
-4. Printer access codes, serial numbers, addresses, and raw MQTT payloads are
+   loop. A status, profile, or queue request must never cause printer I/O; only
+   a claimed `/control/*` request may, with one exception approved 2026-10-21:
+   the view-only `GET /printers/{id}/camera.jpg`, present only with
+   `dispatch.enabled`, which reads the camera port (never publishes a command),
+   at most once per printer every 2 s shared by all viewers, and whose frames
+   are never plate-check evidence. The page loads with it off; a person turns
+   it on.
+4. A print is started only by a person who has confirmed the build plate is
+   empty. (Since 2026-10-21, approved, a camera confirmation needs no separate
+   snapshot step: the person checks the live view and the gateway records a
+   frame under the claim when they press start, refusing if it cannot.) An agent must never set `plate_confirmed_empty`, start a print, or
+   approve a job on its own initiative, and must never retry a failed or
+   uncertain dispatch -- a person checks the printer first.
+5. Printer access codes, serial numbers, addresses, and raw MQTT payloads are
    local secrets and must not be committed, returned by HTTP, or logged.
-5. Tests and development defaults must not contact lab hardware.
+6. Tests and development defaults must not contact lab hardware.

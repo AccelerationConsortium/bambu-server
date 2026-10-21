@@ -1,8 +1,12 @@
 # Bambu Printer Submission & Validation Pipeline — design spec (for implementation)
 
-**Status:** IMPLEMENTED up to the approval gate (see `docs/TODO.md` for what
-shipped and the decisions taken on §12). Dispatch is **not** built: no control
-code ships until the dispatch step is separately approved per `AGENT_RULES.md`.
+**Status:** IMPLEMENTED through dispatch. The dispatch step (§8) was approved by
+a human on 2026-10-04 as human-in-the-loop with a mandatory empty-plate
+confirmation, and ships behind `dispatch.enabled` (off by default). See
+`README.md` → *Control plane* and `docs/TODO.md` for what shipped and what is
+still owed. §8's notes about the FTP client being off and §11's "keep
+Camera/FTP off" now read: opened only by claimed control routes, one transfer
+or one frame at a time.
 **Scope:** submission → model validation → per-machine queue → ETA → (approved)
 dispatch. **This document is the contract the implementer builds against.**
 

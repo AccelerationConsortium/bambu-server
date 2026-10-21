@@ -17,10 +17,24 @@ The following documents take precedence over this file and must not be weakened:
 This service is a multi-printer gateway. It translates Bambu Lab's local MQTT
 telemetry into one STATUS_SPEC v1.0 HTTP surface per configured printer.
 
-The first release is monitoring-only. Do not add control endpoints or invoke
-command methods from `bambulabs_api` without an explicitly approved design that
-routes execution through `lab-skills`, implements claims and interlocks, and
-conforms to STATUS_SPEC v1.1 or later.
+Monitoring is the default. A human approved (2026-10-04) a narrow,
+human-in-the-loop control plane, enabled per deployment by `dispatch.enabled`:
+STATUS_SPEC v1.1 claims plus exactly four verbs -- camera snapshot, chamber
+light (added 2026-10-05), `start_print` for an approved job after a person
+confirms the plate is empty, and `stop_print`. On 2026-10-20 a human approved
+the external spool (`vt_tray`) as a `start_print` mapping target for printers
+without an AMS, checked like an AMS tray, and the one `M500` in Bambu's stock
+start gcode (saving the bed mesh right after `G29`) as accepted by the gcode
+check. On 2026-10-21 a view-only camera (`GET /printers/{id}/camera.jpg`, no
+claim, one shared read per printer every 2 s, off on the page until a person
+turns it on, never plate-check evidence) was approved, and with it the manual
+snapshot step was dropped: a camera start records its own frame under the
+claim when the person presses start. Homing was considered and
+deliberately not added: it moves the bed into whatever is on the plate. All printer commands go through `bambu_server.dispatch` and
+the backend's control methods; nothing else may call `bambulabs_api` command
+methods. Adding a verb, relaxing a gate, or letting an agent start a print
+without a person needs a new explicitly approved design. Routing control
+through `lab-skills` is still owed.
 
 ## Working conventions
 

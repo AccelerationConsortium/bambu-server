@@ -1,4 +1,4 @@
-"""Submission store, state machine, and the dispatch boundary."""
+"""Submission store, state machine, and dispatch bookkeeping."""
 
 from __future__ import annotations
 
@@ -12,11 +12,12 @@ from bambu_server.config import MachineProfileConfig, PrinterDefinition, Submiss
 from bambu_server.profiles import MachineProfile, ObservedMachineState, build_profile
 from bambu_server.submissions import (
     ArtifactTooLarge,
-    DispatchUnavailable,
+    DispatchRecord,
     InvalidTransition,
+    PlateCheck,
     SubmissionError,
     SubmissionStore,
-    dispatch,
+    TrayAssignment,
     run_validation,
     safe_display_name,
 )
@@ -246,15 +247,54 @@ async def test_the_queue_is_scoped_to_one_machine(
     assert store.queue_for("bambu_other") == []
 
 
-async def test_dispatch_is_not_implemented(
+def _record() -> DispatchRecord:
+    now = datetime.now(UTC)
+    return DispatchRecord(
+        dispatched_by="operator",
+        dispatched_by_verified=True,
+        requested_at=now,
+        plate_check=PlateCheck(
+            confirmed_by="operator", confirmed_by_verified=True, method="in_person",
+            confirmed_at=now,
+        ),
+        ams_mapping=[TrayAssignment(filament_id=1, ams_id=0, tray_id=1)],
+        bed_type="textured_plate",
+        plate_index=1,
+        remote_filename="gw_x.3mf",
+    )
+
+
+async def test_dispatch_requires_approval_and_happens_once(
     store: SubmissionStore, profile: MachineProfile
 ) -> None:
-    """The one printer-touching step stays behind the approval gate."""
+    """Only an approved job can enter dispatching, and only one attempt is recorded."""
     job = await run_validation(store, await _accept(store), profile)
-    approved = await store.approve(job, approved_by="operator")
+    with pytest.raises(InvalidTransition):
+        await store.begin_dispatch(job, _record())
 
-    with pytest.raises(DispatchUnavailable):
-        await dispatch(approved)
+    approved = await store.approve(job, approved_by="operator")
+    dispatching = await store.begin_dispatch(approved, _record())
+    assert dispatching.state == "dispatching"
+    assert dispatching.dispatch is not None
+
+    failed = await store.update_dispatch(dispatching, to_state="failed", note="test")
+    with pytest.raises(InvalidTransition):
+        await store.begin_dispatch(failed, _record())
+
+
+async def test_a_restart_fails_an_interrupted_dispatch_with_its_uncertainty(
+    store: SubmissionStore, profile: MachineProfile, tmp_path: Path
+) -> None:
+    job = await run_validation(store, await _accept(store), profile)
+    job = await store.begin_dispatch(await store.approve(job, approved_by="op"), _record())
+
+    reloaded = SubmissionStore(SubmissionSettings(directory=tmp_path / "submissions"))
+    reloaded.load()
+    after = reloaded.get(job.submission_id)
+
+    assert after is not None and after.state == "failed"
+    assert after.dispatch is not None
+    assert "may or may not" in (after.dispatch.uncertainty or "")
 
 
 async def test_a_corrupt_record_does_not_stop_the_store_loading(

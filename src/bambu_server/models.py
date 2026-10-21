@@ -29,7 +29,9 @@ PROTOCOL_VERSION = "1.2"
 class GatewayInfo(BaseModel):
     service: str
     version: str
-    mode: Literal["monitoring_only"] = "monitoring_only"
+    #: ``control`` once the local config enables dispatch; until then the
+    #: gateway is exactly the monitoring-only release.
+    mode: Literal["monitoring_only", "control"] = "monitoring_only"
     printer_count: int
 
 
