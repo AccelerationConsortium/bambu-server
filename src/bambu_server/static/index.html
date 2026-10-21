@@ -74,11 +74,11 @@
   .machine-grid .specs { margin-top: 0; }
   .machine-grid .camera-frame { max-width: 480px; }
   /* Submission: the form and a file preview on the left, the checklist on the right. */
-  .submit-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 20px; align-items: start; }
+  .submit-grid { display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.45fr); gap: 20px; align-items: start; }
   @media (max-width: 760px) { .submit-grid { grid-template-columns: 1fr; } }
   .submit-form { display: grid; gap: 12px; }
   .submit-form [hidden] { display: none; }
-  .preview { width: 100%; max-width: 180px; aspect-ratio: 1; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .preview { width: 100%; max-width: 220px; aspect-ratio: 1; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
   .preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .preview-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
   tr.pending td { color: var(--muted); }
@@ -136,6 +136,14 @@
         <div>
           <label for="file">File (.3mf, .gcode, or .stl to slice)</label>
           <input type="file" id="file" accept=".3mf,.gcode,.stl">
+        </div>
+        <div>
+          <!-- Standard lab holders, printable without uploading a file. No
+               catalog yet: the list is a placeholder until one is defined. -->
+          <label for="standard-part">Or print a standard holder</label>
+          <select id="standard-part" disabled>
+            <option value="">None available yet</option>
+          </select>
         </div>
         <div>
           <label for="material">Material (required for .stl; otherwise read from the file if blank)</label>
