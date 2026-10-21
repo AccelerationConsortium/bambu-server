@@ -65,7 +65,6 @@
   button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
   .start-grid { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   @media (max-width: 760px) { .start-grid { grid-template-columns: 1fr; } }
-  .snapshot { width: 100%; max-height: 360px; object-fit: contain; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; display: block; }
   /* Camera on the left at a fixed size, the machine's detail tiles beside it. */
   .machine-grid { display: grid; grid-template-columns: 420px minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 10px; }
   @media (max-width: 620px) { .machine-grid { grid-template-columns: 1fr; } }
@@ -76,7 +75,6 @@
   .camera-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
   .camera-frame [hidden] { display: none; }
   .camera-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
-  .snapshot-empty { display: flex; align-items: center; justify-content: center; min-height: 180px; color: var(--muted); background: var(--chip); border-radius: 8px; font-size: 13px; text-align: center; padding: 12px; }
   .confirm { display: flex; gap: 8px; align-items: flex-start; margin: 12px 0; padding: 10px 12px; border: 1px solid var(--warn); border-radius: 8px; color: var(--ink); }
   .confirm input { margin-top: 3px; }
   .method { display: flex; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
@@ -168,10 +166,10 @@
             <label><input type="radio" name="plate-method" value="printer_camera" checked> Printer camera</label>
             <label><input type="radio" name="plate-method" value="in_person"> In person at the printer</label>
           </div>
-          <div id="snapshot-box"><div class="snapshot-empty">Take a snapshot to see the plate through the printer's camera.</div></div>
-          <div style="margin-top:8px"><button class="small" id="snapshot-btn">Take snapshot</button>
+          <p class="detail">Check the plate in the camera view above (<strong>Start camera</strong>). When you press Start print, the gateway records a camera frame with the job.</p>
+          <div style="margin-top:8px">
             <button class="small" id="light-btn" title="Chamber light; no motion">Light on</button>
-            <span id="snapshot-msg" class="detail"></span></div>
+            <span id="plate-msg" class="detail"></span></div>
         </fieldset>
       </div>
       <div>
@@ -245,7 +243,7 @@ function randomId() {
 
 const state = { machine: null, profile: null, actor: null, status: null };
 // One claim session per page load; the token lives only in memory.
-const control = { session: randomId(), token: null, heartbeat: null, job: null, snapshot: null };
+const control = { session: randomId(), token: null, heartbeat: null, job: null };
 
 /** Show who the edge says you are, or admit that nobody checked. */
 async function loadIdentity() {
@@ -528,7 +526,7 @@ async function refreshQueue() {
   }
 }
 
-// ---- control: claim, snapshot, start, stop --------------------------------
+// ---- control: claim, light, start, stop -----------------------------------
 
 function whoAmI() {
   if (state.actor && state.actor.verified && state.actor.user) return state.actor.user;
@@ -587,11 +585,9 @@ function plateMethod() {
 }
 
 function updateStartButton() {
-  const camera = plateMethod() === "printer_camera";
-  const ready = $("plate-ok").checked && Boolean(control.token) &&
-    (!camera || Boolean(control.snapshot));
-  $("start-btn").disabled = !ready;
-  $("snapshot-btn").disabled = !camera;
+  // No snapshot step: with the camera method the gateway records the frame
+  // itself when Start print is pressed (and refuses if it cannot).
+  $("start-btn").disabled = !($("plate-ok").checked && Boolean(control.token));
 }
 
 async function openStart(submissionId) {
@@ -599,10 +595,8 @@ async function openStart(submissionId) {
   const msg = $("start-msg");
   msg.className = "detail";
   msg.textContent = "";
-  control.snapshot = null;
   $("plate-ok").checked = false;
-  $("snapshot-box").replaceChildren(el("div", "Take a snapshot to see the plate through the printer's camera.", "snapshot-empty"));
-  $("snapshot-msg").textContent = "";
+  $("plate-msg").textContent = "";
   let job;
   try {
     job = await api("/submissions/" + submissionId);
@@ -662,31 +656,6 @@ function renderTrayRows(job) {
   if (!uses.length) rows.append(el("p", "The file does not say which filaments it uses.", "err"));
 }
 
-async function takeSnapshot() {
-  const msg = $("snapshot-msg");
-  msg.className = "detail";
-  msg.textContent = "Asking the printer's camera…";
-  $("snapshot-btn").disabled = true;
-  try {
-    const snap = await api("/printers/" + state.machine + "/control/snapshot", {
-      method: "POST", headers: controlHeaders(),
-    });
-    control.snapshot = snap;
-    const img = el("img", null, "snapshot");
-    img.src = "data:" + snap.content_type + ";base64," + snap.image_base64;
-    img.alt = "Printer camera frame";
-    $("snapshot-box").replaceChildren(img);
-    msg.textContent = "Captured " + new Date(snap.captured_at).toLocaleTimeString() +
-      ". Valid for 5 minutes.";
-  } catch (error) {
-    control.snapshot = null;
-    msg.className = "err";
-    msg.textContent = error.message + " — check the plate in person instead.";
-  } finally {
-    updateStartButton();
-  }
-}
-
 function lightIsOn() {
   return Boolean(state.status && state.status.details && state.status.details.light_state === "on");
 }
@@ -696,7 +665,7 @@ function renderLightButton() {
 }
 
 async function toggleLight() {
-  const msg = $("snapshot-msg");
+  const msg = $("plate-msg");
   const on = !lightIsOn();
   $("light-btn").disabled = true;
   try {
@@ -704,7 +673,7 @@ async function toggleLight() {
       method: "POST", headers: controlHeaders(), body: JSON.stringify({ on }),
     });
     msg.className = "detail";
-    msg.textContent = "Light " + (on ? "on" : "off") + " requested; take a new snapshot in a moment.";
+    msg.textContent = "Light " + (on ? "on" : "off") + " requested; the camera view shows it in a moment.";
     // Reflect what the printer reports once the monitor sees it.
     setTimeout(async () => {
       try { state.status = await api("/printers/" + state.machine + "/status"); } catch (_) {}
@@ -736,7 +705,6 @@ async function startPrint() {
     submission_id: job.submission_id,
     plate_confirmed_empty: true,
     plate_check_method: camera ? "printer_camera" : "in_person",
-    snapshot_token: camera && control.snapshot ? control.snapshot.token : null,
     ams_mapping: mapping,
   };
   if (!(state.actor && state.actor.verified)) body.dispatched_by = whoAmI();
@@ -768,7 +736,6 @@ async function startPrint() {
 async function closeStart() {
   $("start-panel").hidden = true;
   control.job = null;
-  control.snapshot = null;
   await releaseClaim();
 }
 
@@ -792,8 +759,8 @@ async function stopPrint() {
 }
 
 // ---- camera: view only, off until someone asks for it ----------------------
-// Not the plate check: a frame from here carries no snapshot token, and
-// starting a print still needs a snapshot taken under the claim.
+// Not the plate check: a frame from here carries no snapshot token; a camera
+// start has the gateway capture its own frame under the claim.
 const camera = { on: false, timer: null, url: null };
 
 function setCamera(on) {
@@ -942,7 +909,6 @@ window.addEventListener("message", event => {
     $("banner").append(el("div", "Could not load printers: " + error.message, "err"));
   }
   $("submit").onclick = submit;
-  $("snapshot-btn").onclick = takeSnapshot;
   $("light-btn").onclick = toggleLight;
   $("camera-btn").onclick = () => setCamera(!camera.on);
   document.addEventListener("visibilitychange", () => {

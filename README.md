@@ -253,8 +253,10 @@ sliced for; the job revalidates against the printer's current state; every
 filament is mapped to a loaded tray holding that material (an AMS tray, or the
 external spool as `ams_id` 254 / `tray_id` 0 for a single-filament job on a
 printer without an AMS); and the request says
-`plate_confirmed_empty: true`, by camera snapshot taken under this claim or in
-person. With `require_verified_identity` (the default) both the approver and the
+`plate_confirmed_empty: true`, by camera or in person. A camera confirmation
+records a frame under this claim: the gateway captures it when start is pressed
+(or uses a `/control/snapshot` token sent with the request), and refuses with
+502 if the camera delivers none. With `require_verified_identity` (the default) both the approver and the
 person starting it must be edge-verified identities (403 otherwise).
 `allowed_actions` on `/status` is computed by the same gate, so the two never
 disagree.

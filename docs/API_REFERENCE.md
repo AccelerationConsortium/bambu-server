@@ -26,8 +26,9 @@ chamber camera frame (`image/jpeg`, `Cache-Control: no-store`, capture time in
 `X-Captured-At`) without a claim. It is the one read that touches the printer:
 the camera is read at most once per printer every 2 s and the frame is shared by
 all callers; 503 when the camera does not deliver one. A frame from here is
-never plate-check evidence; `start_print` needs a `/control/snapshot` taken
-under the claim.
+never plate-check evidence: a camera `start_print` records its own frame under
+the claim (a fresh capture when no `snapshot_token` is sent, or a
+`/control/snapshot` taken under the claim within 5 minutes).
 
 | Tray field | Meaning |
 |---|---|

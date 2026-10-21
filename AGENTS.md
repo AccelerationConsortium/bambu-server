@@ -27,7 +27,9 @@ without an AMS, checked like an AMS tray, and the one `M500` in Bambu's stock
 start gcode (saving the bed mesh right after `G29`) as accepted by the gcode
 check. On 2026-10-21 a view-only camera (`GET /printers/{id}/camera.jpg`, no
 claim, one shared read per printer every 2 s, off on the page until a person
-turns it on, never plate-check evidence) was approved. Homing was considered and
+turns it on, never plate-check evidence) was approved, and with it the manual
+snapshot step was dropped: a camera start records its own frame under the
+claim when the person presses start. Homing was considered and
 deliberately not added: it moves the bed into whatever is on the plate. All printer commands go through `bambu_server.dispatch` and
 the backend's control methods; nothing else may call `bambulabs_api` command
 methods. Adding a verb, relaxing a gate, or letting an agent start a print

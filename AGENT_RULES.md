@@ -25,7 +25,9 @@ the Bambu printer gateway.
    are never plate-check evidence. The page loads with it off; a person turns
    it on.
 4. A print is started only by a person who has confirmed the build plate is
-   empty. An agent must never set `plate_confirmed_empty`, start a print, or
+   empty. (Since 2026-10-21, approved, a camera confirmation needs no separate
+   snapshot step: the person checks the live view and the gateway records a
+   frame under the claim when they press start, refusing if it cannot.) An agent must never set `plate_confirmed_empty`, start a print, or
    approve a job on its own initiative, and must never retry a failed or
    uncertain dispatch -- a person checks the printer first.
 5. Printer access codes, serial numbers, addresses, and raw MQTT payloads are

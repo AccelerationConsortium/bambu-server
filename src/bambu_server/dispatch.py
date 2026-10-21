@@ -320,6 +320,18 @@ class Dispatcher:
 
     async def snapshot(self, printer_id: str, *, claim_token: str | None) -> SnapshotResponse:
         self.require_claim(printer_id, claim_token)
+        snap, image = await self._capture(printer_id)
+        return SnapshotResponse(
+            token=snap.token,
+            printer_id=printer_id,
+            captured_at=snap.captured_at,
+            sha256=snap.sha256,
+            image_base64=base64.b64encode(image).decode("ascii"),
+        )
+
+    async def _capture(self, printer_id: str) -> tuple[_Snapshot, bytes]:
+        """Read one frame under the claim the caller already checked, and keep it."""
+
         control = self._control(printer_id)
         try:
             image = await asyncio.to_thread(self._backends[printer_id].snapshot)
@@ -333,7 +345,7 @@ class Dispatcher:
         path = directory / f"{token}.jpg"
         await asyncio.to_thread(path.write_bytes, image)
         holder = control.claims.holder()
-        self._snapshots[token] = _Snapshot(
+        snap = _Snapshot(
             token=token,
             printer_id=printer_id,
             session_id=holder.session_id if holder else None,
@@ -341,14 +353,9 @@ class Dispatcher:
             sha256=digest,
             path=path,
         )
+        self._snapshots[token] = snap
         self._prune_snapshots(now)
-        return SnapshotResponse(
-            token=token,
-            printer_id=printer_id,
-            captured_at=now,
-            sha256=digest,
-            image_base64=base64.b64encode(image).decode("ascii"),
-        )
+        return snap, image
 
     def _prune_snapshots(self, now: datetime) -> None:
         cutoff = now - timedelta(seconds=_SNAPSHOT_RETENTION_S)
@@ -476,7 +483,7 @@ class Dispatcher:
                     },
                 )
             mapping = check_tray_mapping(request.ams_mapping, facts, profile)
-            plate_check = self._plate_check(
+            plate_check, snapshot_token = await self._plate_check(
                 request, control=control, printer_id=printer_id, who=who, verified=verified
             )
 
@@ -496,8 +503,8 @@ class Dispatcher:
             except InvalidTransition as exc:
                 raise ControlRefusal(409, {"detail": str(exc)}) from exc
             control.active_job = job.submission_id
-            if request.plate_check_method == "printer_camera" and request.snapshot_token:
-                await self._keep_snapshot(request.snapshot_token, job)
+            if snapshot_token:
+                await self._keep_snapshot(snapshot_token, job)
 
             path = self._store.artifact_path(job)
             try:
@@ -673,7 +680,7 @@ class Dispatcher:
             raise ControlRefusal(422, {"detail": "a name is required"})
         return name or "unverified caller", False
 
-    def _plate_check(
+    async def _plate_check(
         self,
         request: StartPrintRequest,
         *,
@@ -681,16 +688,47 @@ class Dispatcher:
         printer_id: str,
         who: str,
         verified: bool,
-    ) -> PlateCheck:
+    ) -> tuple[PlateCheck, str | None]:
+        """The person's plate confirmation, and the token of the frame recorded with it.
+
+        A camera confirmation with no snapshot token (approved 2026-10-21) has
+        the gateway capture the frame itself, now, under this claim: the person
+        looked at the live camera view, and the record keeps the frame from the
+        moment they pressed start. If the camera cannot deliver one, nothing
+        starts.
+        """
+
         now = datetime.now(UTC)
         if request.plate_check_method == "in_person":
-            return PlateCheck(
+            plate_check = PlateCheck(
                 confirmed_by=who,
                 confirmed_by_verified=verified,
                 method="in_person",
                 confirmed_at=now,
             )
-        snap = self._snapshots.get(request.snapshot_token or "")
+            return plate_check, None
+        if not request.snapshot_token:
+            try:
+                snap, _image = await self._capture(printer_id)
+            except ControlRefusal as exc:
+                raise ControlRefusal(
+                    502,
+                    {
+                        "detail": f"{exc.body.get('detail')}; nothing was started -- "
+                        "check the plate in person instead",
+                        "camera_unavailable": True,
+                    },
+                ) from exc
+            plate_check = PlateCheck(
+                confirmed_by=who,
+                confirmed_by_verified=verified,
+                method="printer_camera",
+                confirmed_at=now,
+                snapshot_sha256=snap.sha256,
+                snapshot_captured_at=snap.captured_at,
+            )
+            return plate_check, snap.token
+        snap = self._snapshots.get(request.snapshot_token)
         holder = control.claims.holder()
         if (
             snap is None
@@ -714,7 +752,7 @@ class Dispatcher:
                     "snapshot_max_age_s": SNAPSHOT_MAX_AGE_S,
                 },
             )
-        return PlateCheck(
+        plate_check = PlateCheck(
             confirmed_by=who,
             confirmed_by_verified=verified,
             method="printer_camera",
@@ -722,6 +760,7 @@ class Dispatcher:
             snapshot_sha256=snap.sha256,
             snapshot_captured_at=snap.captured_at,
         )
+        return plate_check, snap.token
 
     async def _keep_snapshot(self, token: str, job: SubmissionJob) -> None:
         snap = self._snapshots.pop(token, None)

@@ -160,20 +160,44 @@ def test_an_unreachable_camera_is_a_503(
     assert "camera unavailable" in response.json()["detail"]
 
 
-def test_a_viewer_frame_is_not_a_plate_check(
+def test_a_camera_start_records_a_fresh_frame_of_its_own(
     control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
 ) -> None:
+    """No snapshot step: the gateway captures the plate frame when start is pressed."""
     job_id = _approved_job(control_client, tmp_path)
-    assert control_client.get(f"{BASE}/camera.jpg").status_code == 200
+    assert control_client.get(f"{BASE}/camera.jpg").status_code == 200  # watching
+    assert control_backend.snapshots == 1
     headers = {"X-Claim-Token": _claim(control_client)}
     response = control_client.post(
         f"{BASE}/control/start_print",
         headers=headers,
         json=_start_body(job_id, plate_check_method="printer_camera"),
     )
-    assert response.status_code == 412
-    assert response.json()["snapshot_missing"] is True
-    assert control_backend.uploads == []
+    assert response.status_code == 200, response.text
+    check = response.json()["dispatch"]["plate_check"]
+    assert check["method"] == "printer_camera"
+    assert check["snapshot_sha256"] and check["snapshot_captured_at"]
+    # A fresh read under the claim, not the shared viewer frame.
+    assert control_backend.snapshots == 2
+    plate = control_client.get(f"/submissions/{job_id}/plate.jpg")
+    assert plate.status_code == 200 and plate.content.startswith(b"\xff\xd8")
+
+
+def test_a_camera_start_without_a_camera_starts_nothing(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
+) -> None:
+    job_id = _approved_job(control_client, tmp_path)
+    control_backend.fail_snapshot = True
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers=headers,
+        json=_start_body(job_id, plate_check_method="printer_camera"),
+    )
+    assert response.status_code == 502
+    assert response.json()["camera_unavailable"] is True
+    assert "in person" in response.json()["detail"]
+    assert control_backend.uploads == [] and control_backend.start_commands == []
 
 
 # -- claims ----------------------------------------------------------------------

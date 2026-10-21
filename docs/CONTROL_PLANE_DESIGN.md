@@ -25,7 +25,13 @@ printer every 2 s shared by every viewer (failures cached the same way), and
 camera reads serialized with the plate-check snapshot. Its frames carry no
 snapshot token, so they can never satisfy the plate check. The submission page
 shows it under Machine, off until a person presses Show camera, and pauses it
-while the tab is hidden. The rest of
+while the tab is hidden. With the live view in place the separate snapshot step
+in the start panel was dropped (approved the same day): a camera
+`start_print` without a `snapshot_token` makes the gateway capture the frame
+itself, under the claim, at the moment start is pressed, and record its hash
+and time with the job; if the camera delivers none the start is refused (502)
+and nothing is uploaded. A `snapshot_token` from `/control/snapshot` is still
+accepted. The person's `plate_confirmed_empty` statement is unchanged. The rest of
 phase 2, pause/resume, temperature, motion, filament, and every excluded verb
 remain unapproved. Homing to raise the plate into camera view was proposed and
 declined: it drives the nozzle into the plate before anyone knows it is clear.

@@ -9,8 +9,8 @@ held to three limits:
 * **No commands.** A frame read opens the camera port only; nothing is
   published to the printer.
 * **Not evidence.** A viewer frame carries no snapshot token, so it can never
-  stand in for the plate check: ``start_print`` still needs a snapshot taken
-  under the claim.
+  stand in for the plate check: a camera ``start_print`` captures its own
+  frame under the claim when start is pressed.
 
 A failed read is cached for the same interval, so an unreachable camera is not
 retried by every poll.

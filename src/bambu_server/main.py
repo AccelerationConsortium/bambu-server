@@ -841,7 +841,7 @@ def _register_camera_route(
 
         No claim, no command: one camera read per printer every 2 s at most,
         shared by every viewer. A frame from here is never evidence that the
-        plate is empty; ``start_print`` needs a snapshot taken under the claim.
+        plate is empty; a camera ``start_print`` captures its own under the claim.
         """
 
         try:
