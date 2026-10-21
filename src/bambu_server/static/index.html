@@ -66,8 +66,16 @@
   .start-grid { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   @media (max-width: 760px) { .start-grid { grid-template-columns: 1fr; } }
   .snapshot { width: 100%; max-height: 360px; object-fit: contain; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; display: block; }
-  .camera { margin-top: 12px; }
-  .camera .snapshot { margin-top: 8px; }
+  /* Camera on the left at a fixed size, the machine's detail tiles beside it. */
+  .machine-grid { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 10px; }
+  @media (max-width: 620px) { .machine-grid { grid-template-columns: 1fr; } }
+  .machine-grid .specs { margin-top: 0; }
+  .machine-grid .camera { max-width: 320px; }
+  .camera-frame { width: 100%; aspect-ratio: 4 / 3; background: var(--chip); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .camera-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .camera-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
+  .camera-frame [hidden] { display: none; }
+  .camera-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
   .snapshot-empty { display: flex; align-items: center; justify-content: center; min-height: 180px; color: var(--muted); background: var(--chip); border-radius: 8px; font-size: 13px; text-align: center; padding: 12px; }
   .confirm { display: flex; gap: 8px; align-items: flex-start; margin: 12px 0; padding: 10px 12px; border: 1px solid var(--warn); border-radius: 8px; color: var(--ink); }
   .confirm input { margin-top: 3px; }
@@ -107,11 +115,18 @@
         <input type="text" id="requested_by" placeholder="e.g. alice" autocomplete="name">
       </div>
     </div>
-    <div class="specs" id="specs"></div>
-    <div class="camera">
-      <button class="small" id="camera-btn">Show camera</button>
-      <span id="camera-msg" class="detail"></span>
-      <img id="camera-img" class="snapshot" alt="View from the selected printer's camera" hidden>
+    <div class="machine-grid">
+      <div class="camera">
+        <div class="camera-frame">
+          <img id="camera-img" alt="View from the selected printer's camera" hidden>
+          <div class="camera-empty" id="camera-empty">Camera off</div>
+        </div>
+        <div class="camera-bar">
+          <button class="small" id="camera-btn">Start camera</button>
+          <span id="camera-msg" class="detail"></span>
+        </div>
+      </div>
+      <div class="specs" id="specs"></div>
     </div>
   </section>
 
@@ -784,12 +799,19 @@ function setCamera(on) {
   camera.on = on;
   clearTimeout(camera.timer);
   camera.timer = null;
-  $("camera-btn").textContent = on ? "Hide camera" : "Show camera";
-  $("camera-img").hidden = !on;
+  $("camera-btn").textContent = on ? "Stop camera" : "Start camera";
   $("camera-msg").textContent = "";
-  if (on) { refreshCamera(); return; }
+  clearCameraFrame(on ? "Connecting…" : "Camera off");
+  if (on) refreshCamera();
+}
+
+// The frame keeps its size; only what is inside it changes.
+function clearCameraFrame(text) {
+  $("camera-img").hidden = true;
   $("camera-img").removeAttribute("src");
   if (camera.url) { URL.revokeObjectURL(camera.url); camera.url = null; }
+  $("camera-empty").textContent = text;
+  $("camera-empty").hidden = false;
 }
 
 async function refreshCamera() {
@@ -814,6 +836,8 @@ async function refreshCamera() {
       } else {
         const url = URL.createObjectURL(await response.blob());
         $("camera-img").src = url;
+        $("camera-img").hidden = false;
+        $("camera-empty").hidden = true;
         if (camera.url) URL.revokeObjectURL(camera.url);
         camera.url = url;
         const at = response.headers.get("X-Captured-At");
@@ -830,7 +854,7 @@ async function refreshCamera() {
 async function selectMachine(id) {
   if (control.token) await closeStart();
   state.machine = id;
-  if (camera.on) { $("camera-img").removeAttribute("src"); refreshCamera(); }
+  if (camera.on) { clearCameraFrame("Connecting…"); refreshCamera(); }
   $("verdict-panel").hidden = true;
   try {
     const profile = await api("/printers/" + id + "/profile");
