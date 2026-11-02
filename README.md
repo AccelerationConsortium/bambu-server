@@ -15,12 +15,20 @@ expected finish times. That path writes to the gateway's own disk and never to
 a printer.
 
 By default the service is **monitoring-only** and exposes no control endpoints.
-A deployment that sets `dispatch.enabled` gets a narrow, human-in-the-loop
-control plane: claims plus four verbs (camera snapshot, chamber light, start an
-approved job, stop), behind the gates described in [Control plane](#control-plane). The
-third-party library's other command methods remain unreachable. Control is not
-yet exposed as `lab-skills` skills; the only caller is a person on the `/ui`
-page or a direct HTTP client holding a claim.
+A deployment that sets `dispatch.enabled` gets a narrow control plane: claims
+plus four verbs (camera snapshot, chamber light, start an approved job, stop),
+behind the gates described in [Control plane](#control-plane). A person
+confirms the plate is empty before every start, except on a printer whose
+**agent mode** an admin has switched on — approved 2026-11-02 for the Bambu A1
+(`bambu_a1_01`) only — where an agent may decide from a claimed camera
+snapshot ([Agent mode](#agent-mode-bambu-a1-only)). The third-party library's
+other command methods remain unreachable. Control is not yet exposed as
+`lab-skills` skills.
+
+Every job keeps a durable, schema-versioned **result bundle** and its exact
+artifact on the gateway's disk. Filing a record in the ELN is optional and goes
+only through the central dashboard's ingest ([Print records and ELN
+ingest](#print-records-and-eln-ingest)); the gateway never writes to the ELN.
 
 ## Architecture
 
@@ -106,48 +114,205 @@ Submission pipeline routes:
 |---|---|---|
 | GET | `/printers/{id}/profile` | The machine a submitter targets and is validated against |
 | GET | `/printers/{id}/queue` | Running job and waiting submissions, with finish times |
-| POST | `/submissions` | Upload a `.3mf` / `.gcode` artifact; validated inline |
-| GET | `/submissions` | List jobs (`machine`, `state`, `limit` filters) |
+| POST | `/submissions` | Upload a `.3mf` / `.gcode` artifact (optional `eln_project`); validated inline |
+| GET | `/submissions` | List jobs: `machine`, `state`, `limit`, plus `updated_after`, `order=newest`, `offset` |
 | GET | `/submissions/{submission_id}` | One job with its verdict and history |
-| POST | `/submissions/{submission_id}/approve` | Record sign-off on a queued job |
-| POST | `/submissions/{submission_id}/cancel` | Withdraw a waiting job from the queue |
-| DELETE | `/submissions/{submission_id}` | Delete a finished job's record (retention) |
-| GET | `/submissions/{submission_id}/objects` | Per-object bed-mm centres, bounds, transforms, and labelled-G-code cross-checks |
-| GET | `/events` | Pollable `job.started`, `job.finished`, and `job.failed` feed |
-| GET/POST | `/printers/{id}/robot-calibration` | Stored bed-mm → robot-frame transform; never moves a robot |
-| GET | `/submissions/{submission_id}/pickup-targets` | Finished-job arm-frame targets and cool-down readiness |
+| POST | `/submissions/{submission_id}/approve` | Record sign-off on a queued job (optional `eln_project`) |
+| POST | `/submissions/{submission_id}/cancel` | Withdraw a waiting job from the queue (keeps the artifact) |
+| DELETE | `/submissions/{submission_id}` | Delete a finished job's record and artifact; its result bundle stays |
+| GET | `/submissions/{submission_id}/artifact` | The exact stored file; `ETag` is its quoted SHA-256, `If-None-Match` answers 304 |
+| GET | `/submissions/{submission_id}/result` | The schema-versioned result bundle (`final` once terminal) |
+| POST/GET | `/submissions/{submission_id}/eln-ingest` | Queue a terminal job's record for ELN filing via central / read its outbox entry |
+| GET | `/results/outbox` | Outbox counts and entries |
+
+Agent workflow and agent mode routes:
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/submissions/{submission_id}/objects` | Per-object positions in bed coordinates (mm), plate index |
+| GET | `/submissions/{submission_id}/pickup-targets` | Finished job's objects in bed mm, bed temperature and cooled readiness |
+| GET | `/events` | Lifecycle events; ids persist across restarts (`after=` paging) |
+| GET/POST | `/printers/{id}/agent-mode` | Read the agent mode switch and audit / flip it (verified admin only) |
+| POST | `/printers/{id}/bed-check` | Advisory empty-bed comparison of a claimed snapshot (opt-in) |
 
 With `dispatch.enabled: false`, no `/control/*` routes exist and no route
 dispatches a print.
 
 ## Agent workflow
 
-An orchestration agent can submit an already-sliced artifact, inspect
-`/submissions/{id}/objects`, and wait on `GET /events` (using its last
-`next_after` value) or an operator-configured `agent_workflow.event_webhook_urls`
-target such as the dashboard's `/api/ingest/events`. Event payloads include the
-submission, printer, timestamp, and parsed object placements.
+Object positions are reported in the **printer's bed frame**, never a robot's:
+millimetres, origin at the front-left corner of the printable area, +X to the
+right and +Y toward the back seen from the front of the printer, Z up from the
+plate, exactly as the sliced toolpath addresses the bed. Compare them with
+`bed_size_mm` from `GET /printers/{id}/profile` (also in the result bundle).
+The agent driving the arm owns the bed-to-arm calibration and transform; the
+gateway stores none and never contacts or moves a robot.
 
-After `job.finished`, the agent requests `/submissions/{id}/pickup-targets`.
-The response is only planning data: it is ready only when the monitor's cached
-bed temperature is at or below `agent_workflow.pickup_safe_bed_c`, and only
-after a person has stored a 4×4 affine transform using
-`POST /printers/{id}/robot-calibration`. This service never opens a robot
-connection or issues motion.
+Positions come from the sliced file, best source first:
 
-`agent_workflow.vision_enabled` enables an optional, dependency-light advisory
-comparison of an existing claimed control snapshot against an
-operator-captured `<printer_id>.jpg` empty-bed reference. It returns
-`clear` only for an exact reference match and otherwise conservatively returns
-`occupied` or `unknown`. It is intentionally **not** a `start_print` plate
-check: the lab safety contract requires a person to confirm an empty plate, so
-an AI agent cannot use vision to set `plate_confirmed_empty` or start a print.
-H2D camera support remains dependent on the backend camera implementation; if
-the claimed snapshot route cannot produce a frame, this check cannot run.
+1. `slicer_plate_json` — Bambu Studio's own per-object bounding boxes for the
+   sliced plate (`Metadata/plate_N.json`, `bbox_objects`);
+2. `gcode_label` — the extruding moves inside the slicer's object labels
+   (`; start printing object, unique label id: N`, `EXCLUDE_OBJECT_START`, …),
+   travel and purge moves excluded;
+3. `model_transform` — the 3MF build item transform, used for plate 1 only
+   because later plates are offset in the project layout.
 
-End-to-end: submit → validate → human approves → agent may inspect objects →
-person claims and confirms the plate → explicit `start_print` → wait for event
-→ cool down → fetch pickup targets → send those data to the robot planner.
+Each object carries `object_id`, `name`, `center_x_mm`/`center_y_mm`,
+`bounds` (min/max XY), `rotation_deg` where the source has it, `plate_index`
+and `source`, plus `gcode_bounds` — the labelled extrusion footprint — as an
+independent cross-check. A file that does not say where its objects are yields
+an empty list, never a guess. For a multi-plate 3MF only the inspected (first
+sliced) plate is reported.
+
+**Events.** `GET /events?after=<event_id>` (or the webhooks in
+`agent_workflow.event_webhook_urls`) delivers `job.started`, one event per
+terminal state (`job.finished`, `job.failed`, `job.rejected`,
+`job.cancelled`), `job.cooled`, and `gateway.restarted`. Each event carries
+`schema_version`, `event_id`, `gateway_id`, `boot_id`, `submission_id`,
+`printer_id`, `state`, `updated_at`, `eln_project` and `note`. Event ids are
+zero-padded decimals that keep increasing across restarts (they are kept in
+`events.jsonl` beside the submissions), and every restart emits a
+`gateway.restarted` marker with a new `boot_id`; a failure the gateway records
+at startup because a restart interrupted a dispatch is a `job.failed` with
+`recovered_after_restart: true`.
+
+`job.finished` includes the job's `object_positions` (bed mm) and `pickup`:
+the cached bed temperature, `agent_workflow.pickup_safe_bed_c`, and `cooled`.
+When the bed is still hot, the gateway keeps watching its cached temperature
+(no printer I/O) and emits `job.cooled` once it is safe, for up to
+`agent_workflow.cooldown_watch_timeout_s` (the watch is not resumed after a
+restart; poll `pickup-targets` instead). Emission and webhook failures are
+logged and never affect a job.
+
+**End-to-end for an agent:**
+
+1. `POST /submissions` (sliced `.3mf`, `target_machine`, optional `eln_project`).
+2. Approval: a person approves — or, on the A1 in agent mode, the agent.
+3. `POST /printers/{id}/control/claim`, then keep it alive with `heartbeat`.
+4. Plate check: a person confirms (`in_person` / `printer_camera`) — or, in
+   agent mode, the agent takes `POST /printers/{id}/control/snapshot`, judges
+   the returned `image_base64` itself, and keeps the `token`.
+5. `POST /printers/{id}/control/start_print` (see [Agent mode](#agent-mode-bambu-a1-only)).
+6. Wait for `job.finished` (or `job.failed`) on `/events` or a webhook.
+7. Wait for cool-down: `job.cooled`, or poll
+   `GET /submissions/{id}/pickup-targets` until `ready`.
+8. Hand the bed-frame `objects` to the arm agent, which applies its own
+   calibration. The bundle at `/submissions/{id}/result` keeps the record.
+
+`agent_workflow.vision_enabled` adds an optional, dependency-light advisory
+check, `POST /printers/{id}/bed-check`, that compares a claimed snapshot with an
+operator-captured `<printer_id>.jpg` empty-bed reference. It returns `clear`
+only on an exact match and otherwise `occupied` or `unknown`. Its result is not
+a plate check; an agent in agent mode may use it as one input to its own
+decision.
+
+### Agent mode (Bambu A1 only)
+
+Approved by Yang on 2026-11-02. With the switch on, an agent may submit,
+approve and start jobs on the Bambu A1, deciding itself that the plate is empty.
+Everywhere else, and on the A1 with the switch off, agents are refused and the
+human-in-the-loop path is unchanged.
+
+- **Eligibility** is static config: `agent_mode_eligible: true` on the printer.
+  The config refuses it on any model but a Bambu A1 (not the A1 mini).
+- **The switch** is off by default and is runtime state. Only an edge-verified
+  identity whose role is in `dispatch.agent_mode_admin_roles` (default
+  `admin`) can flip it, with `POST /printers/{id}/agent-mode
+  {"enabled": true|false, "reason": "..."}`; an agent cannot, even as an
+  admin. Every flip is appended to `agent_mode_audit.jsonl` (who, role, when,
+  reason, previous value) before it takes effect. `GET .../agent-mode` returns
+  the state and recent audit; `details.agent_mode` on `/printers/{id}/status`
+  and on `/status` shows it too. An unreadable switch file fails closed (off).
+  Turning it off refuses the next agent action at once; a running job is not
+  affected.
+- **Who is an agent:** a request with an `X-Agent-Id` header, or whose
+  edge-verified role is in `dispatch.agent_roles` (default `agent`). The
+  verified identity and the agent id are both recorded
+  (`requested_by_agent`, `approved_by_agent`, `dispatch.dispatched_by_agent`).
+- **Refusals** are 403 with `agent_mode: "not_eligible"` (any printer but the
+  A1) or `agent_mode: "off"` (switch off), for agent submissions, approvals and
+  starts.
+
+An agent's start, on the A1 with the switch on:
+
+```json
+POST /printers/bambu_a1_01/control/start_print
+X-Claim-Token: <claim token>
+X-Agent-Id: <agent id>
+
+{"submission_id": "<id>", "plate_confirmed_empty": true,
+ "plate_check_method": "agent_camera", "snapshot_token": "<from /control/snapshot>",
+ "plate_check_rationale": "optional: why the plate looks empty",
+ "ams_mapping": [{"filament_id": 1, "ams_id": 0, "tray_id": 1}]}
+```
+
+`agent_camera` needs a `snapshot_token` taken from that printer under the same
+claim and no older than `dispatch.agent_snapshot_max_age_s` (120 s by
+default); the gateway never captures a frame on the agent's behalf. An agent
+must use `agent_camera`, and only an agent may. The record keeps the deciding
+agent, its identity, the rationale and the frame's SHA-256; the frame is
+archived as `GET /submissions/{id}/plate.jpg`. Every other gate still applies:
+the claim, a cold idle printer, the declared plate, revalidation, the tray
+mapping, verified identities, and one attempt per job with no retry.
+
+**H2D camera:** snapshots are not supported for the H2D yet — its camera is not
+the P1/A1 port-6000 service this gateway reads. `control/snapshot` answers 501
+and the viewer 503 without opening a connection, so an H2D plate check is in
+person only. The H2D is not eligible for agent mode in any case.
+
+## Print records and ELN ingest
+
+Records are durable by default. Terminal jobs and their artifacts are not swept
+(`submissions.retain_terminal_days` is null unless set), and cancelling keeps
+the artifact (`submissions.cancel_deletes_artifact: true` restores deletion).
+
+When a job reaches a terminal state the gateway writes one result bundle to
+`<submissions>/results/<submission_id>.json` (temp file, then `os.replace`),
+and never prunes it — not even on `DELETE`. Schema `ac.bambu.print_result`,
+`schema_version` 1: gateway id and version, printer id, state, `eln_project`,
+the artifact (kind, filename, size, SHA-256, still stored, download path), a
+timeline (submitted, approved, dispatch requested, command published, observed
+running and finished, terminal), the plate check (method, who decided, agent
+id, rationale, snapshot SHA-256), `bed_size_mm`, `objects` in bed mm, `pickup`
+readiness at finish, and the full job record with history, verdict and facts.
+`GET /submissions/{id}/result` returns it; for a job still in play it returns
+one built on request with `final: false`. Terminal jobs from before this
+existed get a bundle at the next startup, without an event.
+
+**ELN ingest is optional** and follows the lab's OT-2 gateway pattern: devices
+never write to the ELN; they push only to the central server's `/api/ingest/*`,
+which alone holds ELN credentials. Each terminal job gets an outbox entry in
+`<submissions>/outbox/<submission_id>.json`:
+
+- `local_only` — no ELN project chosen, or no central ingest configured
+  (`local_reason` says which);
+- `pending` → `delivered` → `filing` → `filed`, or `held` (the central server
+  refused it or held it for a person).
+
+A job is queued automatically when it has an `eln_project` (from submission or
+approval) and ingest is configured. To file one later,
+`POST /submissions/{id}/eln-ingest {"eln_project": "..."}` on a terminal job
+(refused with 409 while ingest is not configured, or once it is already
+queued or filed; a `held` or `local_only` entry can be re-queued). The worker
+POSTs `{schema_version, device_id, gateway_id, id, eln_project, bundle}` to the
+ingest URL with `Authorization: Bearer $BAMBU_RESULTS_TOKEN`, then polls
+`GET {url}/{device_id}/{submission_id}` for `{"state": "filing" | "filed" |
+"held"}`; `device_id` is the printer id. Network errors, 408/425/429 and 5xx
+retry with exponential backoff (`results.retry_initial_s` doubling to
+`results.retry_max_s`); other 4xx hold the entry; a 404 on the status poll
+delivers again. Entries are files, so the outbox resumes after a restart.
+`/status` reports `results_ingest_configured`, `results_outbox` (count per
+state), `results_pending` (pending plus delivered), `results_filing` and
+`results_held`. Outbox and bundle failures are logged and never affect a job.
+
+Deployment env vars (see `.env.example`):
+
+| Variable | Purpose |
+|---|---|
+| `BAMBU_RESULTS_URL` | Central ingest URL, e.g. `https://<dashboard>/api/ingest/print-results`; overrides `results.ingest_url` |
+| `BAMBU_RESULTS_TOKEN` | Bearer token for that ingest; required, read from the environment only |
+| `BAMBU_EDGE_SHARED_SECRET` | Needed for verified identities, hence for admin flips of agent mode |
 
 The status envelope uses `equipment_kind: other` because the authoritative
 contract does not yet define a `3d_printer` kind. `details.device_type` carries
@@ -290,8 +455,12 @@ printer without an AMS); and the request says
 `plate_confirmed_empty: true`, by camera or in person. A camera confirmation
 records a frame under this claim: the gateway captures it when start is pressed
 (or uses a `/control/snapshot` token sent with the request), and refuses with
-502 if the camera delivers none. With `require_verified_identity` (the default) both the approver and the
-person starting it must be edge-verified identities (403 otherwise).
+502 if the camera delivers none. On the A1 in agent mode an agent states it
+instead with `plate_check_method: agent_camera` and the token of the frame it
+judged ([Agent mode](#agent-mode-bambu-a1-only)); a person cannot use that
+method and an agent cannot use the others. With `require_verified_identity`
+(the default) both the approver and the caller starting it must be
+edge-verified identities (403 otherwise).
 `allowed_actions` on `/status` is computed by the same gate, so the two never
 disagree.
 
@@ -437,7 +606,9 @@ words itself honestly — it distinguishes "not signed in" from "this deployment
 cannot tell who you are" (`identity_available`).
 
 Approval is human-in-the-loop by design: nothing auto-approves, and a submission
-that did not pass validation can never be approved.
+that did not pass validation can never be approved. The one exception is the
+A1 in agent mode, where an agent may approve; the job then records the agent
+as `approved_by_agent`.
 
 ### Behind the dashboard's login
 
@@ -467,17 +638,18 @@ landing the visitor on the dashboard.
 
 ### Retention
 
-Terminal records (`rejected`, `finished`, `failed`, `cancelled`) are swept at
-startup once older than `submissions.retain_terminal_days` (30 by default; set
-it to null to keep everything). A job that is **still in play is never swept**,
-however old — one stuck in `validating` is a signal, not litter. The set of
-terminal states is derived from the transition table rather than listed twice,
-so a state added there cannot be missed here.
+Job records and artifacts are the lab's print records, so nothing is swept by
+default. Setting `submissions.retain_terminal_days` sweeps terminal records
+(`rejected`, `finished`, `failed`, `cancelled`) older than that at startup. A
+job that is **still in play is never swept**, however old — one stuck in
+`validating` is a signal, not litter. The set of terminal states is derived
+from the transition table rather than listed twice, so a state added there
+cannot be missed here. Result bundles under `results/` are never swept.
 
 `DELETE /submissions/{id}` removes one finished job's record and artifact
-immediately. Only a terminal job can be deleted: withdrawing one that is still
-waiting is `cancel`, which leaves a record of the decision — deleting it would
-erase that along with the job.
+immediately; its result bundle stays. Only a terminal job can be deleted:
+withdrawing one that is still waiting is `cancel`, which leaves a record of the
+decision — deleting it would erase that along with the job.
 
 Sweeping happens at startup rather than on a timer so the store's on-disk and
 in-memory views stay identical. A record removed underneath a running process
@@ -492,10 +664,10 @@ reaches no printer, and it is deliberately refused for anything past the queue �
 stopping a running print is a control-plane action that needs a claim, and this
 surface has none.
 
-Cancelling deletes the stored artifact (a withdrawn job has no further use for
-it, and it is the submitter's data) and marks `artifact_removed`. The job record
-stays, with the actor and reason in its history, so the withdrawal remains
-auditable. There is no undo — a withdrawn job is resubmitted, not revived. An
+Cancelling keeps the stored artifact by default, as part of the record; with
+`submissions.cancel_deletes_artifact: true` it deletes it instead and marks
+`artifact_removed`. The job record stays either way, with the actor and reason
+in its history, so the withdrawal remains auditable. There is no undo — a withdrawn job is resubmitted, not revived. An
 approved job that is cancelled has its `dispatch_ready` retracted.
 
 ## Dashboard registration

@@ -15,6 +15,19 @@ submissions:
   scan_max_bytes: 67108864       # 64 MiB; above this only the head and tail of
                                  # an artifact are read and plate fit is not
                                  # reported rather than guessed from a partial scan
+  retain_terminal_days: null     # keep print records; set a number to sweep old ones
+  cancel_deletes_artifact: false # cancelling keeps the artifact unless true
+
+# Result bundles and the optional ELN ingest via the central dashboard only.
+# Without an ingest URL and BAMBU_RESULTS_TOKEN (env) every job stays local_only.
+results:
+  gateway_id: bambu_gateway
+  ingest_url: null               # e.g. https://<dashboard>/api/ingest/print-results;
+                                 # BAMBU_RESULTS_URL overrides it
+  poll_interval_s: 60            # filing-status poll after delivery
+  retry_initial_s: 10            # backoff doubles up to retry_max_s
+  retry_max_s: 1800
+  request_timeout_s: 10
 
 # Control plane: claims and the start/stop/snapshot verbs. Off unless enabled
 # here. With it off the gateway is exactly the monitoring-only release.
@@ -24,6 +37,12 @@ dispatch:
   safe_bed_c: 45                   # refuse to start above these: the last job
   safe_nozzle_c: 70                # has not cooled and the plate is suspect
   confirm_timeout_s: 180           # how long the printer has to report RUNNING
+  # Agent mode (approved 2026-11-02, Bambu A1 only): who may flip a printer's
+  # switch, which edge roles count as agents (as does an X-Agent-Id header),
+  # and how fresh an agent_camera snapshot must be.
+  agent_mode_admin_roles: [admin]
+  agent_roles: [agent]
+  agent_snapshot_max_age_s: 120
   bed_leveling: true
   flow_calibration: false
   vibration_calibration: false
@@ -33,7 +52,8 @@ dispatch:
 agent_workflow:
   event_webhook_urls: []           # e.g. [https://dashboard/api/ingest/events]
   event_buffer_size: 1000
-  pickup_safe_bed_c: 45
+  pickup_safe_bed_c: 45            # bed temperature at which a finished plate counts as cooled
+  cooldown_watch_timeout_s: 14400  # how long to watch for job.cooled after job.finished
   vision_enabled: false            # advisory snapshot comparison only
   empty_bed_reference_directory: null  # operator-captured <printer_id>.jpg files
 
@@ -77,3 +97,20 @@ printers:
         chamber_temperature_c: null
       ams:
         filament_forbidden: []       # e.g. [ABS, ASA] on an open-frame machine
+
+  - id: bambu_a1_01
+    name: Bambu A1 01
+    model: A1
+    env_prefix: BAMBU_A1_01
+    # Lets a verified admin switch agent mode on for this printer at runtime
+    # (POST /printers/bambu_a1_01/agent-mode). The switch itself starts off.
+    # Accepted on a Bambu A1 only; any other model fails config validation.
+    agent_mode_eligible: true
+    profile:
+      enclosure: open
+      nozzle_diameter_mm: 0.4
+      bed_size_mm: [256, 256]
+      plate: textured_plate
+      limits:
+        nozzle_temperature_c: [0, 300]
+        bed_temperature_c: [0, 100]

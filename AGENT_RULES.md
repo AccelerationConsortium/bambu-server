@@ -30,6 +30,18 @@ the Bambu printer gateway.
    frame under the claim when they press start, refusing if it cannot.) An agent must never set `plate_confirmed_empty`, start a print, or
    approve a job on its own initiative, and must never retry a failed or
    uncertain dispatch -- a person checks the printer first.
+   **One exception, approved by Yang on 2026-11-02 (relayed in PR #8):** on the
+   Bambu A1 (`bambu_a1_01`, the only model config accepts
+   `agent_mode_eligible` on), while an edge-verified admin has switched its
+   agent mode on, an agent may submit, approve and start jobs and may itself
+   decide the plate is empty from a camera snapshot it took under its claim
+   (`plate_check_method: agent_camera`, frame at most
+   `dispatch.agent_snapshot_max_age_s` old, deciding agent and rationale
+   recorded, frame archived with its SHA-256). The switch is off by default,
+   only an admin can flip it, and every flip is audited. Nothing else changes:
+   on every other printer, and on the A1 with the switch off, the rule above
+   holds in full, and no agent ever retries a failed or uncertain dispatch.
+   Widening this to another printer needs a new approval.
 5. Printer access codes, serial numbers, addresses, and raw MQTT payloads are
    local secrets and must not be committed, returned by HTTP, or logged.
 6. Tests and development defaults must not contact lab hardware.
