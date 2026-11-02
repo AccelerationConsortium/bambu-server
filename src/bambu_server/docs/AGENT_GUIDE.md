@@ -55,6 +55,15 @@ the endpoint also accepts `.gcode` for inspection. Dispatch requires a sliced
 and configured that target's presets; it also requires `material`. Do not
 assume that enabled A1 agent mode implies that A1 STL slicing is configured.
 
+For server-side A1 slicing where configured, send multipart fields `file`
+(the STL), `target_machine=bambu_a1_01`, and `material=PLA` to
+`POST /submissions`, using your own API key and `X-Agent-Id`. There is no
+separate `/slice` route. The request runs Bambu Studio on the server and
+returns the validated, stored sliced `.3mf` submission with source hash and
+preset provenance. Allow time for slicing; it is synchronous with the upload
+request. It does not send any printer command. The server selects the target's
+presets, so callers cannot silently use P1S process settings for an A1.
+
 An agent may instead slice locally with Bambu Studio and submit the result.
 Use A1 machine, process and filament presets for an A1; P1S/X1C process settings
 are not substitutes. Check the validation verdict returned by submission.

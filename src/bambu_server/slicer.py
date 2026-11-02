@@ -92,39 +92,58 @@ class BambuStudioSlicer:
 
         return self._settings.enabled and printer_id in self._settings.machine_profiles
 
-    def materials(self) -> list[str]:
-        return sorted(self._settings.filament_profiles)
+    def materials(self, printer_id: str) -> list[str]:
+        """The materials an ``.stl`` can be sliced in for this printer."""
+
+        return sorted(self._settings.filaments_for(printer_id))
 
     def resolve_presets(self, request: SliceRequest) -> tuple[Path, Path, Path]:
-        """Locate the machine, process and filament preset files, or refuse."""
+        """Locate the machine, process and filament preset files, or refuse.
+
+        The process and filament presets must be made for the machine preset:
+        when a bundled preset lists ``compatible_printers``, the machine must be
+        among them. Bambu Studio's CLI does not enforce this itself, and a
+        process tuned for one printer's motion slices quietly wrong for another.
+        """
 
         settings = self._settings
         if not settings.enabled:
             raise SlicerUnavailable("slicing is not enabled on this gateway")
         if settings.profiles_dir is None:
             raise SlicerUnavailable("the slicer's profiles directory is not configured")
-        machine_name = settings.machine_profiles.get(request.printer_id)
-        if machine_name is None:
+        presets = settings.presets_for(request.printer_id)
+        if presets is None:
             raise SlicerUnavailable(
                 f"{request.printer_id} has no slicer machine preset; upload a sliced .3mf instead"
             )
-        filament_name = settings.filament_profiles.get(request.material.strip().upper())
+        machine_name = presets.machine
+        process_name = settings.process_for(request.printer_id)
+        filament_name = settings.filaments_for(request.printer_id).get(
+            request.material.strip().upper()
+        )
         if filament_name is None:
-            offered = ", ".join(self.materials()) or "none"
+            offered = ", ".join(self.materials(request.printer_id)) or "none"
             raise SlicerError(
-                f"no filament preset for {request.material!r}; materials that can be sliced "
-                f"here: {offered}"
+                f"no filament preset for {request.material!r} on {request.printer_id}; "
+                f"materials that can be sliced for it here: {offered}"
             )
-        for name in (machine_name, settings.process_profile, filament_name):
+        for name in (machine_name, process_name, filament_name):
             if not _PRESET_NAME_RE.match(name):
                 raise SlicerUnavailable(f"preset name {name!r} contains characters not allowed")
         root = settings.profiles_dir
         machine = root / "machine" / f"{machine_name}.json"
-        process = root / "process" / f"{settings.process_profile}.json"
+        process = root / "process" / f"{process_name}.json"
         filament = root / "filament" / f"{filament_name}.json"
         for path in (machine, process, filament):
             if not path.is_file():
                 raise SlicerUnavailable(f"slicer preset not found: {path.name}")
+        for kind, path in (("process", process), ("filament", filament)):
+            compatible = _compatible_printers(path)
+            if compatible and machine_name not in compatible:
+                raise SlicerUnavailable(
+                    f"{kind} preset {path.stem!r} is not made for {machine_name!r}; "
+                    f"configure a {kind} preset for {request.printer_id}"
+                )
         return machine, process, filament
 
     async def slice(
@@ -287,6 +306,20 @@ def _flatten_preset(
     merged.pop("inherits", None)
     merged.pop("include", None)
     return merged
+
+
+def _compatible_printers(preset: Path) -> list[str]:
+    """The machine presets a bundled preset declares itself made for.
+
+    Empty means the preset makes no claim (a user preset, or one that relies on
+    ``compatible_printers_condition``), and nothing is enforced.
+    """
+
+    body = _flatten_preset(preset.parent.parent, preset.parent.name, preset.stem)
+    listed = body.get("compatible_printers")
+    if not isinstance(listed, list):
+        return []
+    return [name for name in listed if isinstance(name, str)]
 
 
 _VERSION_RE = re.compile(r"BambuStudio Version (\S+)")

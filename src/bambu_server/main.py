@@ -819,7 +819,7 @@ def create_app(
             raise HTTPException(
                 status_code=422,
                 detail="material is required to slice an .stl (one of: "
-                + ", ".join(slicer.materials()) + ")",
+                + ", ".join(slicer.materials(printer_id)) + ")",
             )
         settings_ = slicer.settings
         job_dir = settings_.work_dir / uuid.uuid4().hex

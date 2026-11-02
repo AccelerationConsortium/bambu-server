@@ -240,6 +240,33 @@ class ResultsSettings(BaseModel):
     worker_tick_s: float = Field(default=2.0, ge=0.05, le=60)
 
 
+def _upper_material_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key).strip().upper(): preset for key, preset in value.items()}
+    return value
+
+
+class SlicerPrinterPresets(BaseModel):
+    """The presets one printer slices with.
+
+    Only ``machine`` is required. ``process`` and ``filaments`` fall back to the
+    gateway-wide ``process_profile`` and ``filament_profiles`` when omitted;
+    a printer whose kinematics differ from those defaults (an A1 against X1C
+    presets) must name its own. A ``filaments`` map *replaces* the defaults
+    rather than extending them, so a material the printer does not list is
+    refused instead of being sliced with another machine's preset.
+    """
+
+    machine: str = Field(min_length=1)
+    process: str | None = Field(default=None, min_length=1)
+    filaments: dict[str, str] | None = None
+
+    @field_validator("filaments", mode="before")
+    @classmethod
+    def upper_keys(cls, value: Any) -> Any:
+        return _upper_material_keys(value)
+
+
 class SlicerSettings(BaseModel):
     """Bambu Studio CLI slicing of an uploaded ``.stl``.
 
@@ -255,24 +282,50 @@ class SlicerSettings(BaseModel):
     profiles_dir: Path | None = None
     work_dir: Path = Path("var/slicer")
     timeout_s: float = Field(default=600.0, ge=30, le=3600)
-    #: The process preset applied to every slice. One, deliberately: the
-    #: submitter picks a material, not a print profile.
+    #: The default process preset, for a printer that does not name its own.
+    #: One per printer, deliberately: the submitter picks a material, not a
+    #: print profile.
     process_profile: str = "0.20mm Standard @BBL X1C"
-    #: Material name (as the submitter types it, upper-cased) to the filament
-    #: preset to slice with. A material with no entry cannot be sliced here.
+    #: Default material name (as the submitter types it, upper-cased) to the
+    #: filament preset to slice with, for a printer that does not name its own.
+    #: A material with no entry cannot be sliced here.
     filament_profiles: dict[str, str] = Field(default_factory=dict)
-    #: Printer id to the machine preset for it (e.g. "Bambu Lab P1S 0.4 nozzle").
+    #: Printer id to its presets. A bare string is the machine preset alone
+    #: (e.g. "Bambu Lab P1S 0.4 nozzle"), with the defaults above.
     #: A printer with no entry does not accept ``.stl`` uploads.
-    machine_profiles: dict[str, str] = Field(default_factory=dict)
+    machine_profiles: dict[str, SlicerPrinterPresets] = Field(default_factory=dict)
     #: Ceiling on an uploaded mesh.
     max_stl_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
 
     @field_validator("filament_profiles", mode="before")
     @classmethod
     def upper_keys(cls, value: Any) -> Any:
+        return _upper_material_keys(value)
+
+    @field_validator("machine_profiles", mode="before")
+    @classmethod
+    def accept_bare_machine(cls, value: Any) -> Any:
         if isinstance(value, dict):
-            return {str(key).strip().upper(): preset for key, preset in value.items()}
+            return {
+                printer_id: {"machine": presets} if isinstance(presets, str) else presets
+                for printer_id, presets in value.items()
+            }
         return value
+
+    def presets_for(self, printer_id: str) -> SlicerPrinterPresets | None:
+        return self.machine_profiles.get(printer_id)
+
+    def process_for(self, printer_id: str) -> str:
+        presets = self.presets_for(printer_id)
+        if presets is not None and presets.process is not None:
+            return presets.process
+        return self.process_profile
+
+    def filaments_for(self, printer_id: str) -> dict[str, str]:
+        presets = self.presets_for(printer_id)
+        if presets is not None and presets.filaments is not None:
+            return presets.filaments
+        return self.filament_profiles
 
 
 class Settings(BaseModel):

@@ -437,13 +437,35 @@ a *record*, not an action: it marks the job `approved` and sets
 ### STL slicing
 
 With `slicer.enabled`, `POST /submissions` also takes an `.stl` for any printer
-listed under `slicer.machine_profiles`, plus a `material` listed under
-`slicer.filament_profiles`. The gateway runs the installed Bambu Studio CLI
+listed under `slicer.machine_profiles`, plus a configured `material`. Each
+printer may name its own machine, process and filament presets; a bare machine
+name retains the shared process/filament defaults. An explicit per-printer
+filament map replaces those defaults. Presets with a `compatible_printers`
+list must include the selected machine, including inherited restrictions.
+The gateway runs the installed Bambu Studio CLI
 headlessly in a scratch directory, forcing two machine facts the stock presets
 get wrong: the nozzle type the printer reports and the build plate declared in
 its profile. The resulting `.3mf` is then validated and queued like any other
 upload, and the job carries `provenance` (source mesh hash, presets, slicer
 version). Slicing runs inline in the request.
+
+For A1 server-side PLA slicing, add the following alongside existing printer
+entries under `slicer.machine_profiles` in the local configuration:
+
+```yaml
+bambu_a1_01:
+  machine: Bambu Lab A1 0.4 nozzle
+  process: 0.20mm Standard @BBL A1
+  filaments:
+    PLA: Generic PLA @BBL A1
+```
+
+Agents upload multipart fields `file=design.stl`,
+`target_machine=bambu_a1_01`, and `material=PLA` to `POST /submissions`
+through the authenticated edge with their own API key and `X-Agent-Id`.
+A1 agent mode must be on. There is no separate `/slice` endpoint. HTTP 201
+returns a stored submission; inspect its validation and state before approval.
+Slicing and submission do not claim, upload to, or start the physical printer.
 
 ### Control plane
 
