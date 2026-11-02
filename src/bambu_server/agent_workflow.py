@@ -114,6 +114,7 @@ class EventHub:
         self._events: deque[GatewayEvent] = deque(maxlen=max_events)
         self._webhook_urls = webhook_urls
         self._next = 0
+        self._deliveries: set[asyncio.Task[None]] = set()
 
     def page(self, after: str | None, limit: int) -> EventPage:
         events = list(self._events)
@@ -137,7 +138,9 @@ class EventHub:
         )
         self._events.append(event)
         for url in self._webhook_urls:
-            asyncio.create_task(self._deliver(url, event))
+            task = asyncio.create_task(self._deliver(url, event))
+            self._deliveries.add(task)
+            task.add_done_callback(self._deliveries.discard)
         return event
 
     async def _deliver(self, url: str, event: GatewayEvent) -> None:
@@ -150,8 +153,8 @@ class EventHub:
                 pass
         try:
             await asyncio.to_thread(send)
-        except OSError:
-            logger.warning("Could not deliver gateway event to configured webhook")
+        except Exception:
+            logger.exception("Could not deliver gateway event to configured webhook")
 
 
 def transform_target(position: ObjectPosition, calibration: BedToRobotCalibration) -> PickupTarget:

@@ -558,6 +558,52 @@ def test_verified_identities_are_required_by_default(
 # -- honest failures -------------------------------------------------------------
 
 
+def test_a_failing_event_sink_does_not_skip_the_completion_watcher(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path, monkeypatch
+) -> None:
+    """Notification is best effort: its failure must not leave a running job unwatched."""
+
+    async def fail(self, *args, **kwargs):
+        raise RuntimeError("event bus unavailable")
+
+    monkeypatch.setattr("bambu_server.agent_workflow.EventHub.publish", fail)
+    job_id = _approved_job(control_client, tmp_path)
+    headers = {"X-Claim-Token": _claim(control_client)}
+    response = control_client.post(
+        f"{BASE}/control/start_print", headers=headers, json=_start_body(job_id)
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "running"
+
+    control_backend.reading = replace(control_backend.reading, gcode_state="FINISH")
+    state = "running"
+    for _ in range(40):
+        state = control_client.get(f"/submissions/{job_id}").json()["state"]
+        if state == "finished":
+            break
+        time.sleep(0.1)
+    assert state == "finished"
+
+
+def test_a_failing_event_sink_still_returns_a_failed_dispatch(
+    control_client: TestClient, control_backend: FakeBackend, tmp_path: Path, monkeypatch
+) -> None:
+    async def fail(self, *args, **kwargs):
+        raise RuntimeError("event bus unavailable")
+
+    monkeypatch.setattr("bambu_server.agent_workflow.EventHub.publish", fail)
+    job_id = _approved_job(control_client, tmp_path)
+    control_backend.fail_upload = True
+    response = control_client.post(
+        f"{BASE}/control/start_print",
+        headers={"X-Claim-Token": _claim(control_client)},
+        json=_start_body(job_id),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "failed"
+    assert control_backend.start_commands == []
+
+
 def test_a_failed_upload_starts_nothing(
     control_client: TestClient, control_backend: FakeBackend, tmp_path: Path
 ) -> None:

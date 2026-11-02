@@ -322,8 +322,18 @@ class Dispatcher:
         return snapshot.path.read_bytes()
 
     async def _emit(self, event_type: str, job: SubmissionJob) -> None:
-        if self._event_sink is not None:
+        """Best-effort notification. A sink failure never changes dispatch."""
+
+        if self._event_sink is None:
+            return
+        try:
             await self._event_sink(event_type, job)
+        except Exception:
+            logger.exception(
+                "Job event %s for %s was not emitted; dispatch continues",
+                event_type,
+                job.submission_id,
+            )
 
     def _control(self, printer_id: str) -> _PrinterControl:
         control = self._printers.get(printer_id)
