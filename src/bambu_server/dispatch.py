@@ -526,9 +526,11 @@ class Dispatcher:
                 upload = await asyncio.to_thread(backend.upload_file, path, remote_name)
             except PrinterCommandError as exc:
                 control.active_job = None
-                return await self._store.update_dispatch(
+                job = await self._store.update_dispatch(
                     job, to_state="failed", note=f"upload failed: {exc}; nothing was started"
                 )
+                await self._emit("job.failed", job)
+                return job
             job = await self._store.update_dispatch(job, upload_verified_bytes=upload.byte_size)
 
             command = StartPrintCommand(
@@ -552,9 +554,11 @@ class Dispatcher:
                     f"start command not confirmed by the broker: {exc}; the file is on the "
                     "printer but no start was confirmed -- check the printer"
                 )
-                return await self._store.update_dispatch(
+                job = await self._store.update_dispatch(
                     job, to_state="failed", note=note, uncertainty=note
                 )
+                await self._emit("job.failed", job)
+                return job
             job = await self._store.update_dispatch(job, command_published_at=datetime.now(UTC))
 
         return await self._await_running(job, monitor, backend, control)
@@ -592,9 +596,11 @@ class Dispatcher:
             f"within {int(self.settings.confirm_timeout_s)} s; its real state is unknown -- "
             "look at the printer before doing anything else"
         )
-        return await self._store.update_dispatch(
+        job = await self._store.update_dispatch(
             job, to_state="failed", note=note, uncertainty=note
         )
+        await self._emit("job.failed", job)
+        return job
 
     async def _watch_running(self, submission_id: str) -> None:
         job = self._store.get(submission_id)
