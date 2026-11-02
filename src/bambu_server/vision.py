@@ -18,7 +18,10 @@ class BedAssessment(BaseModel):
     confidence: float
     detections: list[str]
     advisory: Literal[True] = True
-    note: str = "Advisory only; a person must still confirm the plate before start_print."
+    note: str = (
+        "Advisory only; not a plate check. A person confirms the plate, or an agent in "
+        "agent mode decides itself with plate_check_method agent_camera."
+    )
 
 
 class BedDetector(Protocol):

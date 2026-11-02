@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -92,6 +92,9 @@ TERMINAL_STATES: frozenset[str] = frozenset(
 )
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+#: Called with the job as persisted after each state change.
+TransitionListener = Callable[["SubmissionJob"], None]
 
 
 class SubmissionError(ValueError):
@@ -195,15 +198,17 @@ class TrayAssignment(BaseModel):
         return EXTERNAL_SPOOL_ID if self.external else self.ams_id * 4 + self.tray_id
 
 
-PlateCheckMethod = Literal["printer_camera", "in_person"]
+PlateCheckMethod = Literal["printer_camera", "in_person", "agent_camera"]
 
 
 class PlateCheck(BaseModel):
-    """The human's confirmation that the build plate is empty.
+    """The confirmation that the build plate is empty.
 
-    Recorded, not inferred: the gateway cannot see the plate, so the person
-    who can says so, and the record keeps how they looked and -- when they
-    looked through the printer's camera -- which frame they looked at.
+    Recorded, not inferred by the gateway. A person states it (in person or
+    from the camera); on a printer in agent mode, an agent may state it from a
+    claimed snapshot (``agent_camera``, approved 2026-11-02 for the Bambu A1),
+    and the record names the agent and its rationale. A camera check keeps the
+    hash of the exact frame the decision rested on.
     """
 
     confirmed_by: str
@@ -213,6 +218,10 @@ class PlateCheck(BaseModel):
     #: SHA-256 of the camera frame shown during confirmation, when one was.
     snapshot_sha256: str | None = None
     snapshot_captured_at: datetime | None = None
+    decided_by: Literal["person", "agent"] = "person"
+    #: The deciding agent's id, for an ``agent_camera`` check.
+    agent_id: str | None = None
+    rationale: str | None = Field(default=None, max_length=1000)
 
 
 class DispatchRecord(BaseModel):
@@ -220,6 +229,8 @@ class DispatchRecord(BaseModel):
 
     dispatched_by: str
     dispatched_by_verified: bool
+    #: The agent id when an agent started the job in agent mode.
+    dispatched_by_agent: str | None = None
     requested_at: datetime
     plate_check: PlateCheck
     ams_mapping: list[TrayAssignment]
@@ -247,6 +258,8 @@ class SubmissionJob(BaseModel):
     #: submission from a self-declared one, instead of having to know how the
     #: service happened to be deployed when it arrived.
     requested_by_verified: bool = False
+    #: The agent id when an agent submitted the job (agent mode only).
+    requested_by_agent: str | None = None
     material: str | None = Field(default=None, max_length=60)
     original_filename: str
     artifact_kind: ArtifactKind
@@ -257,7 +270,12 @@ class SubmissionJob(BaseModel):
     updated_at: datetime
     approved_by: str | None = None
     approved_by_verified: bool = False
+    #: The agent id when an agent approved the job (agent mode only).
+    approved_by_agent: str | None = None
     approved_at: datetime | None = None
+    #: The ELN project the result should be filed under, via the central
+    #: server's ingest. ``None`` keeps the job's record local only.
+    eln_project: str | None = Field(default=None, max_length=120)
     #: True once the stored artifact has been deleted (cancellation). The job
     #: record outlives its file so the audit trail survives, but nothing can be
     #: run from it afterwards.
@@ -271,7 +289,7 @@ class SubmissionJob(BaseModel):
     dispatch: DispatchRecord | None = None
     history: list[StateTransition] = Field(default_factory=list)
 
-    @field_validator("requested_by", "material")
+    @field_validator("requested_by", "material", "eln_project")
     @classmethod
     def clean_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -297,6 +315,26 @@ class SubmissionStore:
         self._root = settings.directory
         self._jobs: dict[str, SubmissionJob] = {}
         self._lock = asyncio.Lock()
+        self._listeners: list[TransitionListener] = []
+        #: Jobs :meth:`load` failed because a restart interrupted their
+        #: dispatch, for the record keeper to report once it is running.
+        self.recovered: list[SubmissionJob] = []
+
+    def add_listener(self, listener: TransitionListener) -> None:
+        """Register a synchronous, non-blocking callback for each state change.
+
+        Called after the change is persisted. A listener failure is logged and
+        never undoes or blocks the transition.
+        """
+
+        self._listeners.append(listener)
+
+    def _notify(self, job: SubmissionJob) -> None:
+        for listener in self._listeners:
+            try:
+                listener(job)
+            except Exception:
+                logger.exception("Transition listener failed for %s", job.submission_id)
 
     @property
     def root(self) -> Path:
@@ -376,6 +414,7 @@ class SubmissionStore:
             (self._root / f"{updated.submission_id}.json").write_text(
                 updated.model_dump_json(indent=2), encoding="utf-8"
             )
+            self.recovered.append(updated)
             count += 1
         return count
 
@@ -412,13 +451,22 @@ class SubmissionStore:
         *,
         machine: str | None = None,
         state: str | None = None,
+        updated_after: datetime | None = None,
+        newest_first: bool = False,
     ) -> list[SubmissionJob]:
+        """Matching jobs, oldest submission first, or most recently updated first."""
+
         jobs = [
             job
             for job in self._jobs.values()
             if (machine is None or job.target_machine == machine)
             and (state is None or job.state == state)
+            and (updated_after is None or job.updated_at > updated_after)
         ]
+        if newest_first:
+            return sorted(
+                jobs, key=lambda job: (job.updated_at, job.submission_id), reverse=True
+            )
         return sorted(jobs, key=lambda job: (job.created_at, job.submission_id))
 
     def queue_for(self, machine: str) -> list[SubmissionJob]:
@@ -444,6 +492,8 @@ class SubmissionStore:
         material: str | None,
         original_filename: str,
         provenance: SliceProvenance | None = None,
+        eln_project: str | None = None,
+        agent_id: str | None = None,
     ) -> SubmissionJob:
         """Persist an uploaded artifact and register it as a ``submitted`` job."""
 
@@ -452,6 +502,7 @@ class SubmissionStore:
             raise SubmissionError(f"unsupported artifact extension {extension!r}")
         owner = clean_text(requested_by, field="requested_by", required=True)
         filament = clean_text(material, field="material", required=False)
+        project = clean_text(eln_project, field="eln_project", required=False)
 
         self._root.mkdir(parents=True, exist_ok=True)
         submission_id = uuid.uuid4().hex
@@ -488,7 +539,9 @@ class SubmissionStore:
             target_machine=target_machine,
             requested_by=owner,  # type: ignore[arg-type]
             requested_by_verified=requested_by_verified,
+            requested_by_agent=agent_id,
             material=filament,
+            eln_project=project,
             original_filename=safe_display_name(original_filename),
             artifact_kind=kind,
             byte_size=size,
@@ -497,7 +550,10 @@ class SubmissionStore:
             created_at=now,
             updated_at=now,
             provenance=provenance,
-            history=[StateTransition(at=now, from_state=None, to_state="submitted")],
+            history=[StateTransition(
+                at=now, from_state=None, to_state="submitted",
+                note=f"submitted by agent {agent_id}" if agent_id else None,
+            )],
         )
         async with self._lock:
             self._jobs[submission_id] = job
@@ -533,9 +589,15 @@ class SubmissionStore:
             return updated
 
     async def approve(
-        self, job: SubmissionJob, *, approved_by: str, verified: bool = False
+        self,
+        job: SubmissionJob,
+        *,
+        approved_by: str,
+        verified: bool = False,
+        eln_project: str | None = None,
+        agent_id: str | None = None,
     ) -> SubmissionJob:
-        """Record the human sign-off that gates dispatch.
+        """Record the sign-off that gates dispatch (a person's, or an agent's in agent mode).
 
         Approval is a *record*, not an action: it moves no hardware and starts
         nothing. It flips ``verdict.dispatch_ready``, which is the flag a future
@@ -553,21 +615,25 @@ class SubmissionStore:
                 raise InvalidTransition(
                     "a submission that did not pass validation cannot be approved"
                 )
+            project = clean_text(eln_project, field="eln_project", required=False)
             now = datetime.now(UTC)
             verdict = current.verdict.model_copy(update={"dispatch_ready": True})
-            updated = current.model_copy(
-                update={
-                    "verdict": verdict,
-                    "approved_by": _CONTROL_CHARS.sub("", approved_by).strip()[:120],
-                    "approved_by_verified": verified,
-                    "approved_at": now,
-                }
-            )
+            update: dict[str, object] = {
+                "verdict": verdict,
+                "approved_by": _CONTROL_CHARS.sub("", approved_by).strip()[:120],
+                "approved_by_verified": verified,
+                "approved_by_agent": agent_id,
+                "approved_at": now,
+            }
+            if project is not None:
+                update["eln_project"] = project[:120]
+            updated = current.model_copy(update=update)
             self._jobs[updated.submission_id] = updated
+            agent_note = f" as agent {agent_id}" if agent_id else ""
             return await self._transition_locked(
                 updated.submission_id,
                 "approved",
-                f"approved by {updated.approved_by}{_verified_suffix(verified)}",
+                f"approved by {updated.approved_by}{_verified_suffix(verified)}{agent_note}",
             )
 
     async def cancel(
@@ -585,11 +651,11 @@ class SubmissionStore:
         is deliberately not offered for a job that has been dispatched --
         stopping a running print is a control-plane action that needs a claim.
 
-        The stored artifact is deleted, because a withdrawn job has no further
-        use for it and it is the submitter's data. The job record stays, so the
-        decision and its reason remain auditable; ``artifact_removed`` marks
-        that the file is gone. There is no undo -- a withdrawn job is
-        resubmitted, not revived.
+        The stored artifact is kept by default, as part of the print record;
+        ``submissions.cancel_deletes_artifact`` deletes it instead, and
+        ``artifact_removed`` then marks that the file is gone. The job record
+        stays either way, so the decision and its reason remain auditable.
+        There is no undo -- a withdrawn job is resubmitted, not revived.
         """
 
         async with self._lock:
@@ -600,12 +666,12 @@ class SubmissionStore:
                     f"{current.submission_id} is {current.state}"
                 )
 
-            path = self.artifact_path(current)
-            await asyncio.to_thread(path.unlink, True)
-
             who = clean_text(cancelled_by, field="cancelled_by", required=True)
             why = clean_text(reason, field="reason", required=False)
-            update: dict[str, object] = {"artifact_removed": True}
+            update: dict[str, object] = {}
+            if self._settings.cancel_deletes_artifact:
+                await asyncio.to_thread(self.artifact_path(current).unlink, True)
+                update["artifact_removed"] = True
             if current.verdict is not None:
                 # An approved job carries dispatch_ready; withdrawing it must
                 # retract that, or the record would still read as cleared to run.
@@ -650,8 +716,9 @@ class SubmissionStore:
                 current.submission_id,
                 "dispatching",
                 f"dispatch requested by {record.dispatched_by}"
-                f"{_verified_suffix(record.dispatched_by_verified)}; plate confirmed "
-                f"empty via {record.plate_check.method.replace('_', ' ')}",
+                f"{_verified_suffix(record.dispatched_by_verified)}"
+                f"{f' as agent {record.dispatched_by_agent}' if record.dispatched_by_agent else ''}"
+                f"; plate confirmed empty via {record.plate_check.method.replace('_', ' ')}",
             )
 
     async def update_dispatch(
@@ -738,6 +805,7 @@ class SubmissionStore:
         )
         self._jobs[submission_id] = updated
         await self._persist(updated)
+        self._notify(updated)
         return updated
 
     async def _persist(self, job: SubmissionJob) -> None:
