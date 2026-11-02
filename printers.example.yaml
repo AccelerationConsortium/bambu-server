@@ -29,6 +29,14 @@ dispatch:
   vibration_calibration: false
   timelapse: false
 
+# Agent workflow integrations are data-only. They cannot move a printer or robot.
+agent_workflow:
+  event_webhook_urls: []           # e.g. [https://dashboard/api/ingest/events]
+  event_buffer_size: 1000
+  pickup_safe_bed_c: 45
+  vision_enabled: false            # advisory snapshot comparison only
+  empty_bed_reference_directory: null  # operator-captured <printer_id>.jpg files
+
 # STL slicing with an installed Bambu Studio (CLI, headless). Off unless enabled.
 # `work_dir` must be writable by the service (its home is read-only under systemd).
 slicer:

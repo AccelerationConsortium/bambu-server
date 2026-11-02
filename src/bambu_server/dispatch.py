@@ -26,6 +26,7 @@ import hashlib
 import logging
 import re
 import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -249,6 +250,7 @@ class Dispatcher:
         monitors: dict[str, PrinterMonitor],
         backends: dict[str, PrinterBackend],
         poll_interval_s: float,
+        event_sink: Callable[[str, SubmissionJob], Awaitable[None]] | None = None,
     ) -> None:
         self.settings = settings
         self.gate = ControlGate(settings)
@@ -258,6 +260,7 @@ class Dispatcher:
         self._poll_s = max(0.01, poll_interval_s)
         self._printers = {printer_id: _PrinterControl() for printer_id in monitors}
         self._snapshots: dict[str, _Snapshot] = {}
+        self._event_sink = event_sink
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -309,6 +312,18 @@ class Dispatcher:
     def plate_snapshot_path(self, job: SubmissionJob) -> Path | None:
         path = self._store.root / f"{job.submission_id}.plate.jpg"
         return path if path.is_file() else None
+
+    def snapshot_image(self, token: str, *, printer_id: str) -> bytes | None:
+        """Return a retained control snapshot for advisory local analysis."""
+
+        snapshot = self._snapshots.get(token)
+        if snapshot is None or snapshot.printer_id != printer_id or not snapshot.path.is_file():
+            return None
+        return snapshot.path.read_bytes()
+
+    async def _emit(self, event_type: str, job: SubmissionJob) -> None:
+        if self._event_sink is not None:
+            await self._event_sink(event_type, job)
 
     def _control(self, printer_id: str) -> _PrinterControl:
         control = self._printers.get(printer_id)
@@ -568,6 +583,7 @@ class Dispatcher:
             job = await self._store.update_dispatch(
                 job, to_state="running", note=note, observed_running_at=datetime.now(UTC)
             )
+            await self._emit("job.started", job)
             control.watcher = asyncio.create_task(self._watch_running(job.submission_id))
             return job
         control.active_job = None
@@ -596,21 +612,23 @@ class Dispatcher:
                 gcode_state = (print_job.state if print_job and print_job.state else "").upper()
                 now = datetime.now(UTC)
                 if gcode_state == "FINISH":
-                    await self._store.update_dispatch(
+                    job = await self._store.update_dispatch(
                         job,
                         to_state="finished",
                         note="printer reports the job finished",
                         observed_finished_at=now,
                     )
+                    await self._emit("job.finished", job)
                 else:
                     note = "printer left the running state without finishing"
                     if gcode_state:
                         note += f" (state {gcode_state.lower()})"
                     if status.last_error:
                         note += f"; printer error {status.last_error.code}"
-                    await self._store.update_dispatch(
+                    job = await self._store.update_dispatch(
                         job, to_state="failed", note=note, observed_finished_at=now
                     )
+                    await self._emit("job.failed", job)
                 return
         except InvalidTransition:
             logger.exception("Could not record the outcome of %s", submission_id)

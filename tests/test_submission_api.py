@@ -193,6 +193,22 @@ def test_an_unknown_submission_is_404(client: TestClient) -> None:
     assert client.get("/submissions/" + "0" * 32).status_code == 404
 
 
+def test_object_and_robot_calibration_endpoints(client: TestClient) -> None:
+    created = _upload(client).json()
+    assert client.get(f"/submissions/{created['submission_id']}/objects").json() == []
+
+    calibration = {
+        "printer_id": "bambu_test_01",
+        "arm_frame": "robot_base",
+        "matrix": [1, 0, 0, 100, 0, 1, 0, 200, 0, 0, 1, 10, 0, 0, 0, 1],
+    }
+    response = client.post("/printers/bambu_test_01/robot-calibration", json=calibration)
+    assert response.status_code == 200
+    assert response.json()["arm_frame"] == "robot_base"
+    assert client.get("/printers/bambu_test_01/robot-calibration").status_code == 200
+    assert client.get("/events").json() == {"events": [], "next_after": None}
+
+
 def test_approval_records_sign_off_and_sets_dispatch_ready(client: TestClient) -> None:
     created = _upload(client).json()
 

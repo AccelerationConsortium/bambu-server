@@ -76,3 +76,28 @@ The gateway trusts edge identity only with its configured shared edge secret.
 Names supplied directly by clients are unverified labels. Dashboard links use
 the authenticated edge; this does not turn the gateway's direct port into an
 authenticated surface. Never send secrets or printer addresses in submissions.
+
+## Agent workflow data
+
+`GET /submissions/{id}/objects` returns parsed per-object bed coordinates:
+model-name/id, centre XY, min/max bounds, rotation where represented, plate
+index, and an extrusion-only labelled-G-code bounds cross-check where available.
+It returns no invented positions for unlabeled or unsupported artifacts.
+
+`GET /events?after=<event_id>` is a bounded, pollable lifecycle feed with
+`job.started`, `job.finished`, and `job.failed` events. Configure
+`agent_workflow.event_webhook_urls` to also POST the same JSON event to the
+dashboard ingest endpoint or another operator-approved receiver; delivery is
+best effort and cannot change printer state.
+
+`POST /printers/{id}/robot-calibration` stores a 4×4 affine bed-mm to robot-frame
+matrix and `GET /submissions/{id}/pickup-targets` converts finished-job object
+centres using it. The latter includes cached bed temperature and is only
+`ready` below `agent_workflow.pickup_safe_bed_c`. Neither endpoint talks to a
+robot or creates a motion.
+
+When both dispatch and `agent_workflow.vision_enabled` are enabled,
+`POST /printers/{id}/bed-check` accepts a claimed-control `snapshot_token` and
+returns an advisory empty-bed assessment based on an operator reference image.
+It performs no camera access itself. It cannot be supplied to `start_print`;
+the required human plate confirmation remains unchanged.

@@ -112,8 +112,42 @@ Submission pipeline routes:
 | POST | `/submissions/{submission_id}/approve` | Record sign-off on a queued job |
 | POST | `/submissions/{submission_id}/cancel` | Withdraw a waiting job from the queue |
 | DELETE | `/submissions/{submission_id}` | Delete a finished job's record (retention) |
+| GET | `/submissions/{submission_id}/objects` | Per-object bed-mm centres, bounds, transforms, and labelled-G-code cross-checks |
+| GET | `/events` | Pollable `job.started`, `job.finished`, and `job.failed` feed |
+| GET/POST | `/printers/{id}/robot-calibration` | Stored bed-mm → robot-frame transform; never moves a robot |
+| GET | `/submissions/{submission_id}/pickup-targets` | Finished-job arm-frame targets and cool-down readiness |
 
-No `/control/*` routes exist, and no route dispatches a print.
+With `dispatch.enabled: false`, no `/control/*` routes exist and no route
+dispatches a print.
+
+## Agent workflow
+
+An orchestration agent can submit an already-sliced artifact, inspect
+`/submissions/{id}/objects`, and wait on `GET /events` (using its last
+`next_after` value) or an operator-configured `agent_workflow.event_webhook_urls`
+target such as the dashboard's `/api/ingest/events`. Event payloads include the
+submission, printer, timestamp, and parsed object placements.
+
+After `job.finished`, the agent requests `/submissions/{id}/pickup-targets`.
+The response is only planning data: it is ready only when the monitor's cached
+bed temperature is at or below `agent_workflow.pickup_safe_bed_c`, and only
+after a person has stored a 4×4 affine transform using
+`POST /printers/{id}/robot-calibration`. This service never opens a robot
+connection or issues motion.
+
+`agent_workflow.vision_enabled` enables an optional, dependency-light advisory
+comparison of an existing claimed control snapshot against an
+operator-captured `<printer_id>.jpg` empty-bed reference. It returns
+`clear` only for an exact reference match and otherwise conservatively returns
+`occupied` or `unknown`. It is intentionally **not** a `start_print` plate
+check: the lab safety contract requires a person to confirm an empty plate, so
+an AI agent cannot use vision to set `plate_confirmed_empty` or start a print.
+H2D camera support remains dependent on the backend camera implementation; if
+the claimed snapshot route cannot produce a frame, this check cannot run.
+
+End-to-end: submit → validate → human approves → agent may inspect objects →
+person claims and confirms the plate → explicit `start_print` → wait for event
+→ cool down → fetch pickup targets → send those data to the robot planner.
 
 The status envelope uses `equipment_kind: other` because the authoritative
 contract does not yet define a `3d_printer` kind. `details.device_type` carries
@@ -236,7 +270,7 @@ version). Slicing runs inline in the request.
 ### Control plane
 
 Off unless `dispatch.enabled` is set. When on, each printer gets STATUS_SPEC
-v1.1 claims and three verbs under `/printers/{id}/control/`:
+v1.1 claims and four verbs under `/printers/{id}/control/`:
 
 | Route | What it does |
 |---|---|
@@ -300,10 +334,10 @@ built-in defaults, because a guessed limit is a fabricated machine fact.
 The gcode scan is explicitly a **heuristic**, and the passing detail says so. It
 is not a proof of safety.
 
-Material matching is not a dispatch mapping: per-filament slot selection,
-per-slot temperature checks, sufficient quantity, and revalidation at dispatch
-remain prerequisites for the future control plane. The current approval flag
-does not establish those guarantees or enable printer execution.
+Material matching is not a dispatch mapping: the person starting the job
+explicitly selects every filament slot, and the gateway rechecks slot material,
+per-slot temperature windows, and current printer state at dispatch. Approval
+alone does not establish those guarantees or start a printer.
 
 ### What is read from an artifact
 

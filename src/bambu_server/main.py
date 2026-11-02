@@ -45,7 +45,15 @@ from pydantic import BaseModel, Field
 from sdl_lab_contract.claims import ClaimRejection, ClaimRequest, ClaimResponse
 
 from . import __version__
-from .artifacts import ARTIFACT_EXTENSIONS
+from .agent_workflow import (
+    BedToRobotCalibration,
+    CalibrationStore,
+    EventHub,
+    EventPage,
+    PickupPlan,
+    transform_target,
+)
+from .artifacts import ARTIFACT_EXTENSIONS, ObjectPosition, inspect_object_positions
 from .backend import BambuLabsBackend, PrinterBackend
 from .camera import CameraUnavailable, CameraViewer
 from .claims import ClaimConflict, ClaimLost
@@ -92,6 +100,7 @@ from .submissions import (
     run_validation,
     safe_display_name,
 )
+from .vision import BedAssessment, ReferenceDigestDetector
 
 #: Header carrying the claim token on control routes (STATUS_SPEC §5).
 CLAIM_HEADER = "X-Claim-Token"
@@ -174,6 +183,7 @@ def create_app(
     dispatchers: dict[str, Dispatcher] = {}
     slicers: dict[str, BambuStudioSlicer] = {}
     cameras: dict[str, CameraViewer] = {}
+    workflows: dict[str, object] = {}
     control_enabled = bool(settings and settings.dispatch.enabled)
 
     @asynccontextmanager
@@ -185,6 +195,35 @@ def create_app(
         await asyncio.to_thread(store.load)
         stores["default"] = store
         app.state.submissions = store
+        calibration = CalibrationStore(store.root)
+        await asyncio.to_thread(calibration.load)
+        hub = EventHub(
+            webhook_urls=active_settings.agent_workflow.event_webhook_urls,
+            max_events=active_settings.agent_workflow.event_buffer_size,
+        )
+        workflows.update(
+            calibration=calibration,
+            events=hub,
+            detector=ReferenceDigestDetector(
+                active_settings.agent_workflow.empty_bed_reference_directory
+            ),
+        )
+
+        async def publish_job_event(event_type: str, job: SubmissionJob) -> None:
+            try:
+                positions = await asyncio.to_thread(
+                    inspect_object_positions,
+                    store.artifact_path(job),
+                    scan_max_bytes=store.settings.scan_max_bytes,
+                )
+            except (OSError, ValueError):
+                positions = ()
+            await hub.publish(
+                event_type,
+                submission_id=job.submission_id,
+                printer_id=job.target_machine,
+                object_positions=positions,
+            )
         backends: dict[str, PrinterBackend] = {}
         for definition in active_settings.printers:
             credentials = resolve_credentials(definition)
@@ -203,6 +242,7 @@ def create_app(
             monitors=monitors,
             backends=backends,
             poll_interval_s=active_settings.poll_interval_seconds,
+            event_sink=publish_job_event,
         )
         dispatchers["default"] = dispatcher
         cameras["default"] = CameraViewer(backends)
@@ -221,6 +261,7 @@ def create_app(
             stores.clear()
             dispatchers.clear()
             slicers.clear()
+            workflows.clear()
 
     app = FastAPI(
         title="AC Bambu Printer Gateway",
@@ -229,8 +270,9 @@ def create_app(
             "Monitoring-only MQTT gateway for Bambu Lab printers. Each configured "
             "printer is exposed through the AC lab equipment status spec v1.2. "
             "Profiles expose typed AMS inventory, color-label provenance, and remaining "
-            "filament estimates. Submission, validation, queuing and approval only store "
-            "gateway records; dispatch is unavailable. Use the authenticated /bambu/ "
+            "filament estimates. Dispatch can be enabled locally for claimed, human-confirmed "
+            "starts. Agent workflow routes expose artifact positions, lifecycle events, and "
+            "robot pickup data only. Use the authenticated /bambu/ "
             "edge path for browser access. No credentials or raw MQTT payloads are exposed."
         ),
         docs_url=None,
@@ -286,6 +328,18 @@ def create_app(
         if slicer is None:  # pragma: no cover - only outside the app lifespan
             raise HTTPException(status_code=503, detail="slicer unavailable")
         return slicer
+
+    def get_calibration() -> CalibrationStore:
+        value = workflows.get("calibration")
+        if not isinstance(value, CalibrationStore):
+            raise HTTPException(status_code=503, detail="calibration store unavailable")
+        return value
+
+    def get_events() -> EventHub:
+        value = workflows.get("events")
+        if not isinstance(value, EventHub):
+            raise HTTPException(status_code=503, detail="event feed unavailable")
+        return value
 
     @app.get("/", response_model=GatewayInfo, tags=["gateway"])
     async def gateway_info() -> GatewayInfo:
@@ -705,6 +759,109 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown submission")
         return job
 
+    @app.get("/submissions/{submission_id}/objects", tags=["agent-workflow"])
+    async def submission_objects(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> list[ObjectPosition]:
+        """Object centres and bounds in bed millimetres."""
+
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        try:
+            return await asyncio.to_thread(
+                inspect_object_positions, store.artifact_path(job),
+                scan_max_bytes=store.settings.scan_max_bytes,
+            )
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="object positions unavailable") from exc
+
+    @app.get("/events", response_model=EventPage, tags=["agent-workflow"])
+    async def workflow_events(
+        events: Annotated[EventHub, Depends(get_events)],
+        after: Annotated[str | None, Query(max_length=40)] = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> EventPage:
+        """Poll lifecycle events; configured webhooks are delivered independently."""
+
+        return events.page(after, limit)
+
+    @app.get(
+        "/printers/{printer_id}/robot-calibration",
+        response_model=BedToRobotCalibration,
+        tags=["agent-workflow"],
+    )
+    async def get_robot_calibration(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        calibration: Annotated[CalibrationStore, Depends(get_calibration)],
+    ) -> BedToRobotCalibration:
+        value = calibration.get(monitor.definition.id)
+        if value is None:
+            raise HTTPException(status_code=404, detail="no robot calibration configured")
+        return value
+
+    @app.post(
+        "/printers/{printer_id}/robot-calibration",
+        response_model=BedToRobotCalibration,
+        tags=["agent-workflow"],
+    )
+    async def set_robot_calibration(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        calibration: Annotated[CalibrationStore, Depends(get_calibration)],
+        request: BedToRobotCalibration,
+    ) -> BedToRobotCalibration:
+        """Store only a transform; this endpoint never contacts or moves a robot."""
+
+        if request.printer_id != monitor.definition.id:
+            raise HTTPException(status_code=422, detail="printer_id must match the URL")
+        return await calibration.set(request.model_copy(update={"updated_at": datetime.now(UTC)}))
+
+    @app.get(
+        "/submissions/{submission_id}/pickup-targets",
+        response_model=PickupPlan,
+        tags=["agent-workflow"],
+    )
+    async def pickup_targets(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        calibration: Annotated[CalibrationStore, Depends(get_calibration)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> PickupPlan:
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        safe = app.state.settings.agent_workflow.pickup_safe_bed_c
+        if job.state != "finished":
+            return PickupPlan(
+                submission_id=job.submission_id, printer_id=job.target_machine, ready=False,
+                reason="job is not finished", safe_bed_temperature_c=safe,
+            )
+        monitor = monitors[job.target_machine]
+        metric = monitor.status().metrics.get("bed_temperature")
+        bed = float(metric.value) if metric and isinstance(metric.value, (int, float)) else None
+        transform = calibration.get(job.target_machine)
+        if transform is None:
+            return PickupPlan(
+                submission_id=job.submission_id, printer_id=job.target_machine, ready=False,
+                reason="no robot calibration configured", bed_temperature_c=bed,
+                safe_bed_temperature_c=safe,
+            )
+        positions = await asyncio.to_thread(
+            inspect_object_positions, store.artifact_path(job),
+            scan_max_bytes=store.settings.scan_max_bytes,
+        )
+        cool = bed is not None and bed <= safe
+        return PickupPlan(
+            submission_id=job.submission_id, printer_id=job.target_machine,
+            ready=cool and bool(positions),
+            reason="ready for robot planning" if cool and positions else (
+                "bed temperature is unavailable or above the pickup limit"
+                if not cool else "no object positions found"
+            ),
+            bed_temperature_c=bed, safe_bed_temperature_c=safe,
+            targets=[transform_target(position, transform) for position in positions],
+        )
+
     @app.post(
         "/submissions/{submission_id}/approve",
         response_model=SubmissionJob,
@@ -813,8 +970,49 @@ def create_app(
     if control_enabled:
         _register_control_routes(app, get_monitor, get_actor, get_dispatcher)
         _register_camera_route(app, get_monitor, get_camera)
+        if settings and settings.agent_workflow.vision_enabled:
+            _register_advisory_bed_check(app, get_monitor, get_dispatcher, workflows)
 
     return app
+
+
+def _register_advisory_bed_check(
+    app: FastAPI,
+    get_monitor: Callable[..., PrinterMonitor],
+    get_dispatcher: Callable[[], Dispatcher],
+    workflows: dict[str, object],
+) -> None:
+    """Assess a previously captured control snapshot without printer I/O.
+
+    This route is intentionally advisory.  It cannot be passed to
+    ``start_print`` and does not relax the required human confirmation.
+    """
+
+    class BedCheckRequest(BaseModel):
+        snapshot_token: str = Field(min_length=1, max_length=64)
+
+    @app.post(
+        "/printers/{printer_id}/bed-check",
+        response_model=BedAssessment,
+        tags=["agent-workflow"],
+    )
+    async def advisory_bed_check(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        request: BedCheckRequest,
+    ) -> BedAssessment:
+        detector = workflows.get("detector")
+        if not isinstance(detector, ReferenceDigestDetector):
+            raise HTTPException(status_code=503, detail="bed detector unavailable")
+        image = dispatcher.snapshot_image(request.snapshot_token, printer_id=monitor.definition.id)
+        if image is None:
+            raise HTTPException(status_code=404, detail="snapshot token is unknown or expired")
+        return await asyncio.to_thread(
+            detector.assess,
+            printer_id=monitor.definition.id,
+            snapshot_token=request.snapshot_token,
+            image=image,
+        )
 
 
 def _register_camera_route(

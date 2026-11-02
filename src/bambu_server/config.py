@@ -174,6 +174,24 @@ class DispatchSettings(BaseModel):
     timelapse: bool = False
 
 
+class AgentWorkflowSettings(BaseModel):
+    """Optional data integrations for orchestration agents; all are off by default."""
+
+    #: Operator-configured HTTPS endpoints, e.g. the dashboard event ingest
+    #: route.  Failed delivery is logged without a body and never affects a job.
+    event_webhook_urls: list[str] = Field(default_factory=list)
+    event_buffer_size: int = Field(default=1000, ge=10, le=10000)
+    #: Temperature at or below which the pickup endpoint calls a finished bed
+    #: ready. It is advice for a robot planner, never a robot command.
+    pickup_safe_bed_c: float = Field(default=45.0, gt=0)
+    #: Vision remains advisory under the lab safety rules. It cannot satisfy
+    #: the human plate-clear confirmation required by start_print.
+    vision_enabled: bool = False
+    #: A directory containing operator-captured empty-bed references named
+    #: ``<printer_id>.jpg``. No reference produces ``unknown``, never ``clear``.
+    empty_bed_reference_directory: Path | None = None
+
+
 class SlicerSettings(BaseModel):
     """Bambu Studio CLI slicing of an uploaded ``.stl``.
 
@@ -216,6 +234,7 @@ class Settings(BaseModel):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
     submissions: SubmissionSettings = Field(default_factory=SubmissionSettings)
     dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
+    agent_workflow: AgentWorkflowSettings = Field(default_factory=AgentWorkflowSettings)
     slicer: SlicerSettings = Field(default_factory=SlicerSettings)
 
     @model_validator(mode="after")
@@ -292,4 +311,9 @@ def load_settings(path: str | Path | None = None) -> Settings:
         ).resolve()
     if not settings.slicer.work_dir.is_absolute():
         settings.slicer.work_dir = (resolved.parent / settings.slicer.work_dir).resolve()
+    references = settings.agent_workflow.empty_bed_reference_directory
+    if references is not None and not references.is_absolute():
+        settings.agent_workflow.empty_bed_reference_directory = (
+            resolved.parent / references
+        ).resolve()
     return settings

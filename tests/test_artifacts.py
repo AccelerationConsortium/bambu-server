@@ -10,6 +10,7 @@ import pytest
 from bambu_server.artifacts import (
     ArtifactError,
     inspect_artifact,
+    inspect_object_positions,
     parse_duration_minutes,
 )
 
@@ -215,3 +216,27 @@ def test_unsupported_extension_is_an_error(tmp_path: Path) -> None:
     path.write_bytes(b"solid\n")
     with pytest.raises(ArtifactError):
         _inspect(path)
+
+
+def test_3mf_model_transform_positions_are_reported_and_cross_checked(tmp_path: Path) -> None:
+    path = write_3mf(tmp_path / "objects.3mf", plate_gcode=(
+        SAMPLE_GCODE
+        + "; OBJECT: widget\nG1 X20 Y30 E10\nG1 X40 Y50 E12\n"
+    ))
+    model = """<?xml version="1.0"?>
+    <model><resources><object id="7" name="widget"><mesh><vertices>
+    <vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/>
+    <vertex x="10" y="20" z="0"/></vertices></mesh></object></resources>
+    <build><item objectid="7" transform="1 0 0 0 1 0 0 0 1 30 40 0"/></build></model>"""
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("3D/3dmodel.model", model)
+
+    objects = inspect_object_positions(path, scan_max_bytes=SCAN_BUDGET)
+
+    assert len(objects) == 1
+    assert objects[0].name == "widget"
+    assert objects[0].center_x_mm == 35
+    assert objects[0].center_y_mm == 50
+    assert objects[0].bounds.min_x_mm == 30
+    assert objects[0].gcode_bounds is not None
+    assert objects[0].gcode_bounds.min_x_mm == 20

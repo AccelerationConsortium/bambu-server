@@ -174,6 +174,34 @@ class ArtifactFacts(BaseModel):
     notes: tuple[str, ...] = Field(default_factory=tuple)
 
 
+class ObjectBounds(BaseModel):
+    """Axis-aligned XY bounds in the printer's bed coordinate system."""
+
+    min_x_mm: float
+    min_y_mm: float
+    max_x_mm: float
+    max_y_mm: float
+
+
+class ObjectPosition(BaseModel):
+    """One independently addressable model or labelled toolpath region.
+
+    ``gcode_bounds`` is an extrusion-only observation, when the slicer emitted
+    object labels.  It is intentionally a cross-check rather than a replacement
+    for the model transform: purge lines and travel moves are not object shape.
+    """
+
+    object_id: str
+    name: str | None = None
+    center_x_mm: float
+    center_y_mm: float
+    bounds: ObjectBounds
+    rotation_deg: float | None = None
+    plate_index: int | None = None
+    source: Literal["model_transform", "gcode_label"]
+    gcode_bounds: ObjectBounds | None = None
+
+
 class _Scan:
     """Accumulates observations over one pass of a gcode stream."""
 
@@ -739,3 +767,217 @@ def inspect_artifact(path: Path, *, scan_max_bytes: int) -> ArtifactFacts:
     if kind == "gcode":
         return _inspect_gcode(path, scan_max_bytes=scan_max_bytes)
     return _inspect_3mf(path, scan_max_bytes=scan_max_bytes)
+
+
+# -- Per-object placement -------------------------------------------------
+
+_OBJECT_LABEL_RE = re.compile(r"^;\s*(?:OBJECT|MESH|PRINTING_OBJECT)\s*[:=]\s*(.+)$", re.I)
+_EXCLUDE_OBJECT_RE = re.compile(
+    r"^EXCLUDE_OBJECT_DEFINE\s+NAME=([^\s]+).*?CENTER=([-.\d]+),([-.\d]+)", re.I
+)
+_E_RE = re.compile(r"(?:^|\s)E(-?\d+(?:\.\d+)?)", re.I)
+
+
+def _bounds(values: list[tuple[float, float]]) -> ObjectBounds | None:
+    if not values:
+        return None
+    xs, ys = zip(*values, strict=True)
+    return ObjectBounds(
+        min_x_mm=round(min(xs), 3),
+        min_y_mm=round(min(ys), 3),
+        max_x_mm=round(max(xs), 3),
+        max_y_mm=round(max(ys), 3),
+    )
+
+
+def _labelled_gcode_positions(data: bytes, *, plate_index: int | None) -> list[ObjectPosition]:
+    """Extract slicer object labels and their extrusion-only XY footprints.
+
+    This deliberately accepts several common comment spellings.  Unlabelled
+    gcode cannot safely be divided into objects and returns no invented parts.
+    """
+
+    points: dict[str, list[tuple[float, float]]] = {}
+    names: dict[str, str] = {}
+    current: str | None = None
+    x = y = None
+    e = None
+    absolute_e = True
+    for raw in data.decode("latin-1", errors="replace").splitlines():
+        label = _OBJECT_LABEL_RE.match(raw.strip())
+        if label:
+            name = label.group(1).strip()
+            if name and name.lower() not in {"noname", "unknown"}:
+                current = name
+                points.setdefault(current, [])
+                names[current] = name
+            continue
+        defined = _EXCLUDE_OBJECT_RE.match(raw.strip())
+        if defined:
+            name, cx, cy = defined.groups()
+            current = name
+            points.setdefault(name, []).append((float(cx), float(cy)))
+            names[name] = name
+            continue
+        body = raw.split(";", 1)[0].strip()
+        word = body.split(maxsplit=1)[0].upper() if body else ""
+        if word == "M82":
+            absolute_e = True
+            continue
+        if word == "M83":
+            absolute_e = False
+            continue
+        if word not in {"G0", "G1"}:
+            continue
+        values = {axis: float(value) for axis, value in _AXIS_RE.findall(body.upper())}
+        x, y = values.get("X", x), values.get("Y", y)
+        extruder = _E_RE.search(body)
+        is_extruding = False
+        if extruder:
+            next_e = float(extruder.group(1))
+            is_extruding = next_e > (e if e is not None else 0.0) if absolute_e else next_e > 0
+            e = next_e if absolute_e else (e or 0.0) + next_e
+        if current and is_extruding and x is not None and y is not None:
+            points[current].append((x, y))
+
+    result: list[ObjectPosition] = []
+    for index, (key, object_points) in enumerate(points.items(), start=1):
+        bounds = _bounds(object_points)
+        if bounds is None:
+            continue
+        result.append(ObjectPosition(
+            object_id=f"gcode-{index}",
+            name=names.get(key),
+            center_x_mm=round((bounds.min_x_mm + bounds.max_x_mm) / 2, 3),
+            center_y_mm=round((bounds.min_y_mm + bounds.max_y_mm) / 2, 3),
+            bounds=bounds,
+            plate_index=plate_index,
+            source="gcode_label",
+            gcode_bounds=bounds,
+        ))
+    return result
+
+
+def _model_positions(
+    data: bytes, *, plate_index: int | None, object_plates: dict[str, int] | None = None
+) -> list[ObjectPosition]:
+    """Read standard 3MF build-item transforms and object vertex bounds.
+
+    The 3MF transform has nine linear values followed by translation.  The
+    implementation handles ordinary mesh resources; unsupported components are
+    omitted rather than guessed.
+    """
+
+    root = _parse_xml(data)
+    if root is None:
+        return []
+    meshes: dict[str, list[tuple[float, float, float]]] = {}
+    names: dict[str, str] = {}
+    for element in root.iter():
+        if _local_name(element.tag) != "object" or not element.get("id"):
+            continue
+        object_id = element.get("id") or ""
+        name = element.get("name") or element.get("partnumber")
+        if name:
+            names[object_id] = name
+        vertices: list[tuple[float, float, float]] = []
+        for vertex in element.iter():
+            if _local_name(vertex.tag) != "vertex":
+                continue
+            try:
+                vertices.append((float(vertex.get("x", "")), float(vertex.get("y", "")), float(vertex.get("z", "0"))))
+            except ValueError:
+                continue
+        if vertices:
+            meshes[object_id] = vertices
+    result: list[ObjectPosition] = []
+    for item in root.iter():
+        if _local_name(item.tag) != "item" or not item.get("objectid"):
+            continue
+        object_id = item.get("objectid") or ""
+        vertices = meshes.get(object_id)
+        if not vertices:
+            continue
+        try:
+            transform = [float(value) for value in (item.get("transform") or "").split()]
+        except ValueError:
+            continue
+        if not transform:
+            transform = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]
+        if len(transform) != 12:
+            continue
+        a, b, _c, d, e, _f, _g, _h, _i, tx, ty, _tz = transform
+        transformed = [(a * vx + d * vy + tx, b * vx + e * vy + ty) for vx, vy, _vz in vertices]
+        bounds = _bounds(transformed)
+        if bounds is None:
+            continue
+        rotation = round(__import__("math").degrees(__import__("math").atan2(b, a)), 3)
+        result.append(ObjectPosition(
+            object_id=f"3mf-{object_id}",
+            name=names.get(object_id),
+            center_x_mm=round((bounds.min_x_mm + bounds.max_x_mm) / 2, 3),
+            center_y_mm=round((bounds.min_y_mm + bounds.max_y_mm) / 2, 3),
+            bounds=bounds,
+            rotation_deg=rotation,
+            plate_index=(object_plates or {}).get(object_id, plate_index),
+            source="model_transform",
+        ))
+    return result
+
+
+def _model_setting_plates(data: bytes) -> dict[str, int]:
+    """Map Bambu project object IDs to their declared plate, when present."""
+
+    root = _parse_xml(data)
+    if root is None:
+        return {}
+    plates: dict[str, int] = {}
+    for plate in root.iter():
+        if _local_name(plate.tag) != "plate":
+            continue
+        try:
+            index = int(plate.get("index", ""))
+        except ValueError:
+            continue
+        for object_ in plate.iter():
+            if _local_name(object_.tag) == "object" and object_.get("id"):
+                plates[object_.get("id") or ""] = index
+    return plates
+
+
+def inspect_object_positions(path: Path, *, scan_max_bytes: int) -> tuple[ObjectPosition, ...]:
+    """Return object positions from a submitted artifact without printer I/O."""
+
+    if path.suffix.lower() == ".gcode":
+        data = path.read_bytes()
+        if len(data) > scan_max_bytes:
+            return ()
+        return tuple(_labelled_gcode_positions(data, plate_index=None))
+    if path.suffix.lower() != ".3mf":
+        raise ArtifactError(f"unsupported artifact extension {path.suffix!r}")
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        plate_names = sorted(name for name in names if _PLATE_GCODE_RE.match(name))
+        plate_index = _plate_index(plate_names[0]) if plate_names else None
+        model = _read_member(archive, "3D/3dmodel.model", budget=_MAX_CONFIG_BYTES)
+        settings = _read_member(archive, "Metadata/model_settings.config", budget=_MAX_CONFIG_BYTES)
+        positions = (
+            _model_positions(
+                model,
+                plate_index=plate_index,
+                object_plates=_model_setting_plates(settings) if settings else None,
+            )
+            if model else []
+        )
+        if plate_names:
+            gcode = _read_member(archive, plate_names[0], budget=scan_max_bytes)
+            labelled = _labelled_gcode_positions(gcode or b"", plate_index=plate_index)
+            by_name = {entry.name: entry for entry in labelled if entry.name}
+            positions = [
+                entry.model_copy(update={"gcode_bounds": by_name[entry.name].bounds})
+                if entry.name in by_name else entry
+                for entry in positions
+            ]
+            if not positions:
+                positions = labelled
+        return tuple(positions)
