@@ -30,6 +30,19 @@ artifact on the gateway's disk. Filing a record in the ELN is optional and goes
 only through the central dashboard's ingest ([Print records and ELN
 ingest](#print-records-and-eln-ingest)); the gateway never writes to the ELN.
 
+## Documentation for agents
+
+Read the [operating guide](src/bambu_server/docs/AGENT_GUIDE.md) for identity,
+A1 agent mode, slicing/submission, claimed-camera decisions, external-spool
+mapping, completion and recovery. The [API overview](docs/API_REFERENCE.md)
+summarizes the endpoint families.
+
+The service serves `/agent-docs`, `/agent-docs/api-reference` (generated from
+its actual OpenAPI), `/llms.txt`, and the JSON `/docs/agent` guide. All are
+credential-free documentation reads without printer I/O. Swagger at `/docs`
+is read-only. Dashboard registration belongs on the shared `bambu_gateway`
+entry; deploy these routes before enabling the new registry links.
+
 ## Architecture
 
 ```text

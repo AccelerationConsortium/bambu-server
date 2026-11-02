@@ -78,6 +78,7 @@ from .dispatch import (
     StopPrintRequest,
     StopPrintResponse,
 )
+from .documentation import RefusalBody, register_documentation
 from .identity import Actor, actor_for, resolve_actor
 from .models import (
     PROTOCOL_VERSION,
@@ -356,7 +357,7 @@ def create_app(
         title="AC Bambu Printer Gateway",
         version=__version__,
         description=(
-            "Monitoring-only MQTT gateway for Bambu Lab printers. Each configured "
+            "MQTT monitoring gateway with optional claimed control for Bambu Lab printers. Each configured "
             "printer is exposed through the AC lab equipment status spec v1.2. "
             "Profiles expose typed AMS inventory, color-label provenance, and remaining "
             "filament estimates. Dispatch can be enabled locally for claimed starts after a "
@@ -379,6 +380,7 @@ def create_app(
         return get_swagger_ui_html(
             openapi_url="../openapi.json" if request.url.path.endswith("/") else "./openapi.json",
             title="Bambu Gateway API",
+            swagger_ui_parameters={"supportedSubmitMethods": []},
         )
 
     configured_origins = settings.cors_origins if settings else ["http://localhost:8000"]
@@ -1359,6 +1361,7 @@ def create_app(
         if settings and settings.agent_workflow.vision_enabled:
             _register_advisory_bed_check(app, get_monitor, get_dispatcher, workflows)
 
+    register_documentation(app)
     return app
 
 
@@ -1465,8 +1468,9 @@ def _register_control_routes(
     """
 
     control_responses = {
-        412: {"description": "A precondition is not met; the body names which."},
-        423: {"description": "No live claim token was presented."},
+        403: {"model": RefusalBody, "description": "Verified identity or agent mode required."},
+        412: {"model": RefusalBody, "description": "A precondition is not met; the body names which."},
+        423: {"model": RefusalBody, "description": "No live claim token was presented."},
     }
 
     @app.post(
@@ -1532,7 +1536,11 @@ def _register_control_routes(
     @app.post(
         "/printers/{printer_id}/control/snapshot",
         response_model=SnapshotResponse,
-        responses={423: control_responses[423], 502: {"description": "Camera unreachable."}},
+        responses={
+            423: control_responses[423],
+            501: {"model": RefusalBody, "description": "Snapshot unsupported for this printer model."},
+            502: {"model": RefusalBody, "description": "Camera unreachable."},
+        },
         tags=["control"],
     )
     async def control_snapshot(
