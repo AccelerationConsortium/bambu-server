@@ -343,9 +343,10 @@ async def test_a_blank_material_is_treated_as_absent(store: SubmissionStore) -> 
     assert job.material is None
 
 
-async def test_cancelling_a_queued_job_removes_it_and_its_artifact(
+async def test_cancelling_a_queued_job_removes_it_but_keeps_its_artifact(
     store: SubmissionStore, profile: MachineProfile
 ) -> None:
+    """The artifact is part of the print record; deleting it is opt-in."""
     job = await run_validation(store, await _accept(store), profile)
     path = store.artifact_path(job)
     assert path.exists()
@@ -353,12 +354,66 @@ async def test_cancelling_a_queued_job_removes_it_and_its_artifact(
     cancelled = await store.cancel(job, cancelled_by="operator", reason="wrong plate")
 
     assert cancelled.state == "cancelled"
-    assert cancelled.artifact_removed is True
-    assert not path.exists()
+    assert cancelled.artifact_removed is False
+    assert path.exists()
     assert store.queue_for("bambu_test_01") == []
     # The record outlives the file, so the withdrawal stays explicable.
     assert cancelled.history[-1].note == "cancelled by operator: wrong plate"
     assert store.get(job.submission_id) is not None
+
+
+async def test_cancel_deletes_the_artifact_only_when_configured(
+    tmp_path: Path, profile: MachineProfile
+) -> None:
+    store = SubmissionStore(
+        SubmissionSettings(directory=tmp_path / "submissions", cancel_deletes_artifact=True)
+    )
+    store.load()
+    job = await run_validation(store, await _accept(store), profile)
+    path = store.artifact_path(job)
+
+    cancelled = await store.cancel(job, cancelled_by="operator")
+
+    assert cancelled.artifact_removed is True
+    assert not path.exists()
+
+
+def test_terminal_records_are_kept_by_default() -> None:
+    settings = SubmissionSettings()
+    assert settings.retain_terminal_days is None
+    assert settings.cancel_deletes_artifact is False
+
+
+async def test_listeners_see_each_persisted_transition_and_cannot_break_it(
+    store: SubmissionStore, profile: MachineProfile
+) -> None:
+    seen: list[str] = []
+
+    def record(job) -> None:
+        seen.append(job.state)
+
+    def explode(job) -> None:
+        raise RuntimeError("listener failure")
+
+    store.add_listener(explode)
+    store.add_listener(record)
+    job = await run_validation(store, await _accept(store), profile)
+
+    assert job.state == "queued"
+    assert seen == ["validating", "validated", "queued"]
+
+
+async def test_listing_supports_updated_after_and_newest_first(
+    store: SubmissionStore, profile: MachineProfile
+) -> None:
+    first = await run_validation(store, await _accept(store), profile)
+    second = await run_validation(store, await _accept(store), profile)
+    first = await store.approve(first, approved_by="operator")
+
+    newest = store.list(newest_first=True)
+    assert [job.submission_id for job in newest] == [first.submission_id, second.submission_id]
+    changed = store.list(updated_after=second.updated_at)
+    assert [job.submission_id for job in changed] == [first.submission_id]
 
 
 async def test_cancelling_an_approved_job_retracts_dispatch_ready(

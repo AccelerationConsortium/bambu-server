@@ -73,6 +73,8 @@ def write_3mf(
     plate_gcode: str | None = SAMPLE_GCODE,
     project_settings: dict[str, object] | None = None,
     slice_info: str | None = SLICE_INFO_XML,
+    model_xml: str = '<?xml version="1.0"?><model unit="millimeter"><resources/></model>',
+    extra_members: dict[str, str] | None = None,
 ) -> Path:
     """Build a minimal Bambu-shaped 3mf container.
 
@@ -95,15 +97,14 @@ def write_3mf(
         settings.update(project_settings)
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(
-            "3D/3dmodel.model",
-            '<?xml version="1.0"?><model unit="millimeter"><resources/></model>',
-        )
+        archive.writestr("3D/3dmodel.model", model_xml)
         archive.writestr("Metadata/project_settings.config", json.dumps(settings))
         if slice_info is not None:
             archive.writestr("Metadata/slice_info.config", slice_info)
         if plate_gcode is not None:
             archive.writestr("Metadata/plate_1.gcode", plate_gcode)
+        for name, body in (extra_members or {}).items():
+            archive.writestr(name, body)
     return path
 
 

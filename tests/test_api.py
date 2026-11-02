@@ -68,10 +68,12 @@ def test_gateway_status_summarizes_printer_monitoring(client: TestClient) -> Non
     assert body["allowed_actions"] == []
     assert body["components"]["bambu_test_01"]["connected"] is True
     assert body["components"]["bambu_test_01"]["state"] == "ready"
-    assert body["details"] == {
-        "monitoring_only": True,
-        "printer_count": 1,
-    }
+    details = body["details"]
+    assert details["monitoring_only"] is True
+    assert details["printer_count"] == 1
+    assert details["agent_mode"]["bambu_test_01"]["enabled"] is False
+    assert details["results_ingest_configured"] is False
+    assert details["results_pending"] == 0 and details["results_filing"] == 0
 
 
 def test_ready_status_is_cached_and_contains_no_secrets(

@@ -110,8 +110,10 @@ Open, from the design's §10 data gaps and what the build surfaced:
   It is legal only from `queued` / `approved`, never for a dispatched job —
   aborting a print stays a control-plane action. Worth folding back into
   `SUBMISSION_PIPELINE_DESIGN.md` §5 when that doc is next revised.
-- ~~No retention policy~~ — done. Terminal records are swept at startup past
-  `submissions.retain_terminal_days` (30 default, null disables), and
+- ~~No retention policy~~ — done, then made opt-in (2026-11-02): records are
+  print records, so nothing is swept unless `submissions.retain_terminal_days`
+  is set, cancelling keeps the artifact, and result bundles are never swept.
+  When set, terminal records are swept at startup past that age, and
   `DELETE /submissions/{id}` removes one finished job immediately. A job still
   in play is never swept however old. Sweeping at startup rather than on a
   timer keeps on-disk and in-memory views identical — the divergence that
@@ -179,8 +181,11 @@ the HTTPS block, since only they know what else changed.
 
 Known gap, inherited from the OT-2 embed: a write inside the framed panel
 bypasses the dashboard's `control_action` audit row. Submissions are recorded in
-the job store's history, so there is a trail; it is not in `equipment_events`
-until the gateway pushes to `/api/ingest/events`.
+the job store's history, so there is a trail. Lifecycle events can now be
+pushed with `agent_workflow.event_webhook_urls` (e.g. to `/api/ingest/events`)
+and result bundles through the outbox to the central ingest
+(`BAMBU_RESULTS_URL`); the central side of the print-results route, and of
+`GET {url}/{device_id}/{id}` filing status, still has to exist there.
 
 ## Test suite
 

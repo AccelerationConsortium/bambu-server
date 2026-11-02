@@ -15,6 +15,7 @@ Three surfaces live here and they are deliberately different in kind:
 """
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import uuid
@@ -23,7 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path as PathLib
 from pathlib import PurePosixPath
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import (
     Depends,
@@ -45,8 +46,17 @@ from pydantic import BaseModel, Field
 from sdl_lab_contract.claims import ClaimRejection, ClaimRequest, ClaimResponse
 
 from . import __version__
-from .artifacts import ARTIFACT_EXTENSIONS
-from .backend import BambuLabsBackend, PrinterBackend
+from .agent_mode import (
+    AgentCaller,
+    AgentModeGate,
+    AgentModeRefusal,
+    AgentModeStore,
+    AgentModeView,
+    agent_caller,
+)
+from .agent_workflow import EventHub, EventPage, PickupInfo
+from .artifacts import ARTIFACT_EXTENSIONS, ObjectPosition
+from .backend import BambuLabsBackend, PrinterBackend, camera_snapshot_supported
 from .camera import CameraUnavailable, CameraViewer
 from .claims import ClaimConflict, ClaimLost
 from .config import (
@@ -56,6 +66,7 @@ from .config import (
     load_settings,
     resolve_credentials,
     resolve_edge_secret,
+    resolve_results_ingest,
 )
 from .dispatch import (
     ControlRefusal,
@@ -80,7 +91,22 @@ from .models import (
 from .monitor import PrinterMonitor
 from .profiles import MachineProfile
 from .queueing import QueueView, build_queue_view
+from .records import (
+    OUTBOX_STATES,
+    OutboxConflict,
+    OutboxEntry,
+    OutboxStore,
+    OutboxWorker,
+    RecordKeeper,
+    ResultBundle,
+    ResultStore,
+    Transport,
+    urllib_transport,
+)
 from .slicer import BambuStudioSlicer, SliceRequest, SlicerError, SlicerUnavailable
+from .submissions import (
+    TERMINAL_STATES as TERMINAL_JOB_STATES,
+)
 from .submissions import (
     ArtifactTooLarge,
     InvalidTransition,
@@ -89,9 +115,11 @@ from .submissions import (
     SubmissionError,
     SubmissionJob,
     SubmissionStore,
+    clean_text,
     run_validation,
     safe_display_name,
 )
+from .vision import BedAssessment, ReferenceDigestDetector
 
 #: Header carrying the claim token on control routes (STATUS_SPEC §5).
 CLAIM_HEADER = "X-Claim-Token"
@@ -127,6 +155,30 @@ class ApprovalRequest(BaseModel):
     #: Optional: ignored when the edge supplies a verified identity, and
     #: required only when it does not.
     approved_by: str | None = Field(default=None, min_length=1, max_length=120)
+    #: Optional ELN project for the finished record; replaces one chosen at
+    #: submission. Filing happens only through the central server's ingest.
+    eln_project: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class IngestRequest(BaseModel):
+    """Queue a terminal job's record for filing through the central server."""
+
+    eln_project: str = Field(min_length=1, max_length=120)
+    #: Ignored when the edge supplies a verified identity.
+    requested_by: str | None = Field(default=None, min_length=1, max_length=120)
+
+
+class AgentModeRequest(BaseModel):
+    """An admin's decision to switch agent mode, with the reason for the audit log."""
+
+    enabled: bool
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class OutboxView(BaseModel):
+    ingest_configured: bool
+    counts: dict[str, int]
+    entries: list[OutboxEntry]
 
 
 class CancellationRequest(BaseModel):
@@ -160,6 +212,7 @@ def create_app(
     *,
     settings: Settings | None = None,
     backend_factory: BackendFactory = BambuLabsBackend,
+    results_transport: Transport = urllib_transport,
 ) -> FastAPI:
     monitors: dict[str, PrinterMonitor] = {}
     # One-slot holder rather than a module global: `create_app` may be called
@@ -174,6 +227,7 @@ def create_app(
     dispatchers: dict[str, Dispatcher] = {}
     slicers: dict[str, BambuStudioSlicer] = {}
     cameras: dict[str, CameraViewer] = {}
+    workflows: dict[str, object] = {}
     control_enabled = bool(settings and settings.dispatch.enabled)
 
     @asynccontextmanager
@@ -185,6 +239,31 @@ def create_app(
         await asyncio.to_thread(store.load)
         stores["default"] = store
         app.state.submissions = store
+        results_settings = active_settings.results
+        hub = EventHub(
+            webhook_urls=active_settings.agent_workflow.event_webhook_urls,
+            max_events=active_settings.agent_workflow.event_buffer_size,
+            log_path=store.root / "events.jsonl",
+            gateway_id=results_settings.gateway_id,
+        )
+        await asyncio.to_thread(hub.load)
+        results = ResultStore(store.root)
+        outbox = OutboxStore(store.root)
+        await asyncio.to_thread(outbox.load)
+        ingest_url, ingest_token = resolve_results_ingest(results_settings)
+        if ingest_url and not ingest_token:
+            logger.warning(
+                "A results ingest URL is configured without BAMBU_RESULTS_TOKEN; "
+                "records stay local_only until the token is set"
+            )
+        workflows.update(
+            events=hub,
+            results=results,
+            outbox=outbox,
+            detector=ReferenceDigestDetector(
+                active_settings.agent_workflow.empty_bed_reference_directory
+            ),
+        )
         backends: dict[str, PrinterBackend] = {}
         for definition in active_settings.printers:
             credentials = resolve_credentials(definition)
@@ -197,23 +276,73 @@ def create_app(
                 stale_after_seconds=active_settings.stale_after_seconds,
             )
             monitors[definition.id] = monitor
+        agent_store = AgentModeStore(store.root)
+        await asyncio.to_thread(agent_store.load)
+        agent_gate = AgentModeGate(
+            agent_store,
+            {p.id for p in active_settings.printers if p.agent_mode_eligible},
+        )
+        workflows["agent_mode"] = agent_gate
         dispatcher = Dispatcher(
             settings=active_settings.dispatch,
             store=store,
             monitors=monitors,
             backends=backends,
             poll_interval_s=active_settings.poll_interval_seconds,
+            agent_mode=agent_gate,
         )
         dispatchers["default"] = dispatcher
-        cameras["default"] = CameraViewer(backends)
+        cameras["default"] = CameraViewer(
+            backends,
+            unsupported=frozenset(
+                p.id for p in active_settings.printers if not camera_snapshot_supported(p.model)
+            ),
+        )
         slicers["default"] = BambuStudioSlicer(active_settings.slicer)
+        keeper = RecordKeeper(
+            store=store,
+            results=results,
+            outbox=outbox,
+            events=hub,
+            monitors=monitors,
+            gateway_id=results_settings.gateway_id,
+            gateway_version=__version__,
+            pickup_safe_bed_c=active_settings.agent_workflow.pickup_safe_bed_c,
+            ingest_configured=bool(ingest_url and ingest_token),
+            cooldown_poll_s=active_settings.poll_interval_seconds,
+            cooldown_timeout_s=active_settings.agent_workflow.cooldown_watch_timeout_s,
+        )
+        workflows["keeper"] = keeper
+        store.add_listener(keeper.notify)
+        worker_task: asyncio.Task[None] | None = None
         try:
+            await keeper.start()
+            if ingest_url and ingest_token:
+                worker = OutboxWorker(
+                    outbox=outbox,
+                    results=results,
+                    url=ingest_url,
+                    token=ingest_token,
+                    gateway_id=results_settings.gateway_id,
+                    poll_interval_s=results_settings.poll_interval_s,
+                    retry_initial_s=results_settings.retry_initial_s,
+                    retry_max_s=results_settings.retry_max_s,
+                    request_timeout_s=results_settings.request_timeout_s,
+                    transport=results_transport,
+                )
+                workflows["worker"] = worker
+                worker_task = asyncio.create_task(worker.run(results_settings.worker_tick_s))
             for monitor in monitors.values():
                 await monitor.start()
             if active_settings.dispatch.enabled:
                 await dispatcher.start()
             yield
         finally:
+            if worker_task is not None:
+                worker_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await worker_task
+            await keeper.stop()
             await dispatcher.stop()
             for monitor in reversed(list(monitors.values())):
                 await monitor.stop()
@@ -221,6 +350,7 @@ def create_app(
             stores.clear()
             dispatchers.clear()
             slicers.clear()
+            workflows.clear()
 
     app = FastAPI(
         title="AC Bambu Printer Gateway",
@@ -229,8 +359,12 @@ def create_app(
             "Monitoring-only MQTT gateway for Bambu Lab printers. Each configured "
             "printer is exposed through the AC lab equipment status spec v1.2. "
             "Profiles expose typed AMS inventory, color-label provenance, and remaining "
-            "filament estimates. Submission, validation, queuing and approval only store "
-            "gateway records; dispatch is unavailable. Use the authenticated /bambu/ "
+            "filament estimates. Dispatch can be enabled locally for claimed starts after a "
+            "plate-clear check (a person, or an agent where a printer opts in). Every job "
+            "keeps a durable, schema-versioned result bundle and its exact artifact; "
+            "filing to the ELN happens only through the central server's ingest. Agent "
+            "workflow routes expose bed-frame object positions, lifecycle events and "
+            "cool-down readiness; they never move a robot. Use the authenticated /bambu/ "
             "edge path for browser access. No credentials or raw MQTT payloads are exposed."
         ),
         docs_url=None,
@@ -286,6 +420,50 @@ def create_app(
         if slicer is None:  # pragma: no cover - only outside the app lifespan
             raise HTTPException(status_code=503, detail="slicer unavailable")
         return slicer
+
+    def get_agent_gate() -> AgentModeGate:
+        value = workflows.get("agent_mode")
+        if not isinstance(value, AgentModeGate):  # pragma: no cover - outside lifespan
+            raise HTTPException(status_code=503, detail="agent mode unavailable")
+        return value
+
+    def get_agent(
+        request: Request, actor: Annotated[Actor, Depends(get_actor)]
+    ) -> AgentCaller:
+        roles = app.state.settings.dispatch.agent_roles
+        return agent_caller(actor, request.headers, agent_roles=roles)
+
+    def require_agent_mode(printer_id: str, agent: AgentCaller, action: str) -> None:
+        if not agent.is_agent:
+            return
+        try:
+            get_agent_gate().require(printer_id, action)
+        except AgentModeRefusal as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.body) from exc
+
+    def get_keeper() -> RecordKeeper:
+        value = workflows.get("keeper")
+        if not isinstance(value, RecordKeeper):  # pragma: no cover - outside lifespan
+            raise HTTPException(status_code=503, detail="record keeper unavailable")
+        return value
+
+    def get_results() -> ResultStore:
+        value = workflows.get("results")
+        if not isinstance(value, ResultStore):  # pragma: no cover - outside lifespan
+            raise HTTPException(status_code=503, detail="result store unavailable")
+        return value
+
+    def get_outbox() -> OutboxStore:
+        value = workflows.get("outbox")
+        if not isinstance(value, OutboxStore):  # pragma: no cover - outside lifespan
+            raise HTTPException(status_code=503, detail="outbox unavailable")
+        return value
+
+    def get_events() -> EventHub:
+        value = workflows.get("events")
+        if not isinstance(value, EventHub):
+            raise HTTPException(status_code=503, detail="event feed unavailable")
+        return value
 
     @app.get("/", response_model=GatewayInfo, tags=["gateway"])
     async def gateway_info() -> GatewayInfo:
@@ -352,8 +530,36 @@ def create_app(
             device_time=datetime.now(UTC),
             components=components,
             allowed_actions=[],
-            details={"monitoring_only": not control_enabled, "printer_count": len(monitors)},
+            details={
+                "monitoring_only": not control_enabled,
+                "printer_count": len(monitors),
+                "agent_mode": _agent_mode_summaries(),
+                **_outbox_details(),
+            },
         )
+
+    def _agent_mode_summaries() -> dict[str, object]:
+        gate = workflows.get("agent_mode")
+        if not isinstance(gate, AgentModeGate):
+            return {}
+        return {printer_id: gate.summary(printer_id) for printer_id in monitors}
+
+    def _outbox_details() -> dict[str, object]:
+        outbox = workflows.get("outbox")
+        keeper = workflows.get("keeper")
+        counts = (
+            outbox.counts() if isinstance(outbox, OutboxStore)
+            else dict.fromkeys(OUTBOX_STATES, 0)
+        )
+        return {
+            "results_ingest_configured": bool(
+                isinstance(keeper, RecordKeeper) and keeper.ingest_configured
+            ),
+            "results_outbox": counts,
+            "results_pending": counts["pending"] + counts["delivered"],
+            "results_filing": counts["filing"],
+            "results_held": counts["held"],
+        }
 
     @app.get("/whoami", response_model=Whoami, tags=["gateway"])
     async def whoami(actor: Annotated[Actor, Depends(get_actor)]) -> Whoami:
@@ -418,15 +624,22 @@ def create_app(
         With dispatch enabled, ``allowed_actions`` is computed by the same gate
         the control routes refuse with (STATUS_SPEC §6.2) and
         ``details.claimed_by`` names the current claim holder.
+        ``details.agent_mode`` reports whether agent mode is available for this
+        printer and switched on, and who last flipped it, when and why.
         """
         status = monitor.status()
-        if not control_enabled:
-            return status
-        dispatcher = get_dispatcher()
         printer_id = monitor.definition.id
+        gate = workflows.get("agent_mode")
+        agent_details = (
+            {"agent_mode": gate.summary(printer_id)} if isinstance(gate, AgentModeGate) else {}
+        )
+        if not control_enabled:
+            return status.model_copy(update={"details": {**status.details, **agent_details}})
+        dispatcher = get_dispatcher()
         holder = dispatcher.claims(printer_id).holder()
         details = {
             **status.details,
+            **agent_details,
             "monitoring_only": False,
             "claimed_by": holder.model_dump(mode="json") if holder else None,
             "build_plate": monitor.definition.profile.plate,
@@ -487,27 +700,34 @@ def create_app(
             ),
         ],
         actor: Annotated[Actor, Depends(get_actor)],
+        agent: Annotated[AgentCaller, Depends(get_agent)],
         target_machine: Annotated[str, Form(max_length=120)],
         requested_by: Annotated[str | None, Form(max_length=120)] = None,
         material: Annotated[str | None, Form(max_length=60)] = None,
+        eln_project: Annotated[str | None, Form(max_length=120)] = None,
     ) -> SubmissionJob:
         """Accept a print artifact, validate it, and queue it if it passes.
 
         Performs no printer I/O. Validation runs inline so the caller gets the
         per-check verdict in the response; the file read happens on a worker
         thread so a large artifact does not stall the status poll loop.
+        ``eln_project`` optionally names the ELN project the finished record
+        is filed under, through the central server. An agent (``X-Agent-Id`` or
+        an agent edge role) may submit only to a printer in agent mode.
         """
 
         # A verified identity wins over the form field: a signed-in person must
         # not be able to submit under someone else's name.
         try:
-            owner, owner_verified = actor_for(actor, requested_by)
+            owner, owner_verified = actor_for(actor, requested_by or agent.agent_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="requested_by is required") from exc
 
         monitor = monitors.get(target_machine)
         if monitor is None:
             raise HTTPException(status_code=404, detail="unknown target machine")
+        require_agent_mode(monitor.definition.id, agent, "submission")
+        agent_id = agent.agent_id if agent.is_agent else None
 
         extension = PurePosixPath(file.filename or "").suffix.lower()
         if extension == ".stl":
@@ -519,6 +739,8 @@ def create_app(
                 owner=owner,
                 owner_verified=owner_verified,
                 material=material,
+                eln_project=eln_project,
+                agent_id=agent_id,
             )
         kind = ARTIFACT_EXTENSIONS.get(extension)
         if kind is None:
@@ -553,11 +775,15 @@ def create_app(
                 requested_by_verified=owner_verified,
                 material=material,
                 original_filename=file.filename or "",
+                eln_project=eln_project,
+                agent_id=agent_id,
             )
         except ArtifactTooLarge as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         except SubmissionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         return await run_validation(store, job, monitor.profile())
 
@@ -570,6 +796,8 @@ def create_app(
         owner: str,
         owner_verified: bool,
         material: str | None,
+        eln_project: str | None = None,
+        agent_id: str | None = None,
     ) -> SubmissionJob:
         """Slice an uploaded mesh for the target machine, then intake the 3mf.
 
@@ -652,6 +880,8 @@ def create_app(
                     material=material,
                     original_filename=f"{PurePosixPath(source_name).stem}.3mf",
                     provenance=provenance,
+                    eln_project=eln_project,
+                    agent_id=agent_id,
                 )
             except ArtifactTooLarge as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from exc
@@ -688,8 +918,24 @@ def create_app(
         machine: Annotated[str | None, Query(max_length=120)] = None,
         state: Annotated[JobState | None, Query()] = None,
         limit: Annotated[int, Query(ge=1, le=500)] = 100,
+        updated_after: Annotated[datetime | None, Query()] = None,
+        order: Annotated[Literal["submitted", "newest"], Query()] = "submitted",
+        offset: Annotated[int, Query(ge=0)] = 0,
     ) -> list[SubmissionJob]:
-        return store.list(machine=machine, state=state)[:limit]
+        """List jobs.
+
+        Default order is oldest submission first. ``order=newest`` sorts by most
+        recent update; with ``updated_after`` and ``offset`` that pages through
+        changes since a client's last sync.
+        """
+
+        jobs = store.list(
+            machine=machine,
+            state=state,
+            updated_after=updated_after,
+            newest_first=order == "newest",
+        )
+        return jobs[offset:offset + limit]
 
     @app.get(
         "/submissions/{submission_id}",
@@ -705,6 +951,291 @@ def create_app(
             raise HTTPException(status_code=404, detail="unknown submission")
         return job
 
+    @app.get(
+        "/submissions/{submission_id}/artifact",
+        response_class=FileResponse,
+        responses={
+            200: {"description": "The exact stored artifact; ETag is its quoted SHA-256."},
+            304: {"description": "If-None-Match matched the artifact's SHA-256."},
+            410: {"description": "The artifact was deleted (cancel opt-in or retention)."},
+        },
+        tags=["submissions"],
+    )
+    async def submission_artifact(
+        request: Request,
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        actor: Annotated[Actor, Depends(get_actor)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> Response:
+        """Download the exact sliced file that was submitted (and printed).
+
+        A read, like every other GET here: access is gated by the lab edge, and
+        the download is logged with the caller's identity when the edge
+        verified one. Reads the gateway's own disk only.
+        """
+
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        path = store.artifact_path(job)
+        if job.artifact_removed or not path.is_file():
+            raise HTTPException(status_code=410, detail="the artifact is no longer stored")
+        etag = f'"{job.sha256}"'
+        if etag in [tag.strip() for tag in request.headers.get("if-none-match", "").split(",")]:
+            return Response(status_code=304, headers={"ETag": etag})
+        logger.info(
+            "Artifact of %s downloaded by %s%s",
+            submission_id,
+            actor.user or "an unidentified caller",
+            " (verified)" if actor.verified else "",
+        )
+        return FileResponse(
+            path,
+            media_type="model/3mf" if job.artifact_kind == "3mf" else "text/x.gcode",
+            filename=job.original_filename,
+            headers={"ETag": etag, "X-Content-SHA256": job.sha256},
+        )
+
+    @app.get(
+        "/submissions/{submission_id}/result",
+        response_model=ResultBundle,
+        tags=["submissions"],
+    )
+    async def submission_result(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        results: Annotated[ResultStore, Depends(get_results)],
+        keeper: Annotated[RecordKeeper, Depends(get_keeper)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> Response:
+        """The job's schema-versioned result bundle.
+
+        For a terminal job, the bundle written when it reached that state
+        (``final: true``); it survives even ``DELETE`` of the job record. For a
+        job still in play, one built now (``final: false``).
+        """
+
+        stored = results.read(submission_id)
+        if stored is not None:
+            return Response(content=stored, media_type="application/json")
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        bundle = keeper.bundle(
+            job, objects=await keeper.positions(job), pickup=None, final=False
+        )
+        return Response(content=bundle.model_dump_json(), media_type="application/json")
+
+    @app.get(
+        "/submissions/{submission_id}/objects",
+        response_model=list[ObjectPosition],
+        tags=["agent-workflow"],
+    )
+    async def submission_objects(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        keeper: Annotated[RecordKeeper, Depends(get_keeper)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> list[ObjectPosition]:
+        """Where each sliced object sits on the plate, in bed coordinates (mm).
+
+        Origin at the front-left corner of the printable area, +X right, +Y
+        toward the back seen from the front, as the printer's own toolpath
+        addresses it; compare with ``bed_size_mm`` from the printer's profile.
+        No robot frame: the arm agent applies its own calibration. Empty when
+        the file does not say where its objects are.
+        """
+
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        if not keeper.artifact_stored(job):
+            raise HTTPException(status_code=410, detail="the artifact is no longer stored")
+        return list(await keeper.positions(job))
+
+    @app.get("/events", response_model=EventPage, tags=["agent-workflow"])
+    async def workflow_events(
+        events: Annotated[EventHub, Depends(get_events)],
+        after: Annotated[str | None, Query(max_length=40)] = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> EventPage:
+        """Poll lifecycle events. Ids keep increasing across restarts; a
+        ``gateway.restarted`` event marks each one. Webhooks get the same events."""
+
+        return events.page(after, limit)
+
+    @app.get(
+        "/submissions/{submission_id}/pickup-targets",
+        response_model=PickupInfo,
+        tags=["agent-workflow"],
+    )
+    async def pickup_targets(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        keeper: Annotated[RecordKeeper, Depends(get_keeper)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> PickupInfo:
+        """A finished job's objects in bed coordinates, with cool-down readiness.
+
+        Reads the stored artifact and the monitor's cached bed temperature only;
+        never contacts a printer or a robot. ``ready`` needs a finished job, a
+        cooled bed and at least one known object position.
+        """
+
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        pickup = keeper.readiness(job.target_machine)
+        if pickup is None:  # pragma: no cover - a job's machine is always configured
+            raise HTTPException(status_code=404, detail="printer not configured")
+        objects = list(await keeper.positions(job))
+        if job.state != "finished":
+            ready, reason = False, f"the job is {job.state}, not finished"
+        elif not pickup.cooled:
+            ready, reason = False, "the bed is not cool enough, or its temperature is unknown"
+        elif not objects:
+            ready, reason = False, "the sliced file does not say where its objects are"
+        else:
+            ready, reason = True, "finished and cooled"
+        return PickupInfo(
+            submission_id=job.submission_id,
+            printer_id=job.target_machine,
+            state=job.state,
+            ready=ready,
+            reason=reason,
+            bed_size_mm=keeper.bed_size(job.target_machine),
+            pickup=pickup,
+            objects=objects,
+        )
+
+    @app.post(
+        "/submissions/{submission_id}/eln-ingest",
+        response_model=OutboxEntry,
+        responses={409: {"description": "Not terminal, already queued, or no ingest configured."}},
+        tags=["results"],
+    )
+    async def queue_eln_ingest(
+        store: Annotated[SubmissionStore, Depends(get_store)],
+        outbox: Annotated[OutboxStore, Depends(get_outbox)],
+        keeper: Annotated[RecordKeeper, Depends(get_keeper)],
+        actor: Annotated[Actor, Depends(get_actor)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+        request: IngestRequest,
+    ) -> OutboxEntry:
+        """File a finished job's record later: pick an ELN project and queue it.
+
+        Queues the result bundle in the on-disk outbox for the central server's
+        ingest, which alone writes to the ELN. A verified identity is recorded
+        as who queued it. Refused while central ingest is not configured.
+        """
+
+        job = store.get(submission_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown submission")
+        try:
+            who, verified = actor_for(actor, request.requested_by)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="requested_by is required") from exc
+        project = clean_text(request.eln_project, field="eln_project", required=True)
+        if not keeper.results_exists(job.submission_id) and job.state in TERMINAL_JOB_STATES:
+            await keeper.write_final_bundle(job)
+        try:
+            return await outbox.queue(
+                job,
+                eln_project=project or "",
+                queued_by=who,
+                verified=verified,
+                ingest_configured=keeper.ingest_configured,
+            )
+        except OutboxConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get(
+        "/submissions/{submission_id}/eln-ingest",
+        response_model=OutboxEntry,
+        tags=["results"],
+    )
+    async def read_eln_ingest(
+        outbox: Annotated[OutboxStore, Depends(get_outbox)],
+        submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
+    ) -> OutboxEntry:
+        entry = outbox.get(submission_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="no outbox entry for this submission")
+        return entry
+
+    @app.get("/results/outbox", response_model=OutboxView, tags=["results"])
+    async def results_outbox(
+        outbox: Annotated[OutboxStore, Depends(get_outbox)],
+        keeper: Annotated[RecordKeeper, Depends(get_keeper)],
+        state: Annotated[str | None, Query(max_length=20)] = None,
+        limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    ) -> OutboxView:
+        return OutboxView(
+            ingest_configured=keeper.ingest_configured,
+            counts=outbox.counts(),
+            entries=outbox.entries(state)[:limit],
+        )
+
+    @app.get(
+        "/printers/{printer_id}/agent-mode",
+        response_model=AgentModeView,
+        tags=["agent-mode"],
+    )
+    async def read_agent_mode(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        gate: Annotated[AgentModeGate, Depends(get_agent_gate)],
+    ) -> AgentModeView:
+        """Whether agents may run this printer end to end, with the audit trail."""
+
+        return gate.view(monitor.definition.id)
+
+    @app.post(
+        "/printers/{printer_id}/agent-mode",
+        response_model=AgentModeView,
+        responses={
+            403: {"description": "Not an edge-verified admin, or the caller is an agent."},
+            409: {"description": "Agent mode is not available for this printer."},
+        },
+        tags=["agent-mode"],
+    )
+    async def set_agent_mode(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        gate: Annotated[AgentModeGate, Depends(get_agent_gate)],
+        actor: Annotated[Actor, Depends(get_actor)],
+        agent: Annotated[AgentCaller, Depends(get_agent)],
+        request: AgentModeRequest,
+    ) -> AgentModeView:
+        """Switch agent mode on or off. Edge-verified admins only; always audited.
+
+        Turning it off stops new agent submissions, approvals and starts at
+        once; a job already printing is not affected.
+        """
+
+        admin_roles = app.state.settings.dispatch.agent_mode_admin_roles
+        if not (actor.verified and actor.user and actor.role in admin_roles):
+            raise HTTPException(
+                status_code=403,
+                detail="only an edge-verified admin can switch agent mode",
+            )
+        if agent.is_agent:
+            raise HTTPException(
+                status_code=403, detail="an agent cannot switch agent mode, even as an admin"
+            )
+        printer_id = monitor.definition.id
+        if printer_id not in gate.eligible:
+            raise HTTPException(
+                status_code=409,
+                detail=f"agent mode is not available for {printer_id}; "
+                "it is approved for the Bambu A1 only",
+            )
+        reason = clean_text(request.reason, field="reason", required=True) or ""
+        await gate.store.set(
+            printer_id,
+            enabled=request.enabled,
+            changed_by=actor.user,
+            role=actor.role,
+            reason=reason,
+        )
+        return gate.view(printer_id)
+
     @app.post(
         "/submissions/{submission_id}/approve",
         response_model=SubmissionJob,
@@ -713,6 +1244,7 @@ def create_app(
     async def approve_submission(
         store: Annotated[SubmissionStore, Depends(get_store)],
         actor: Annotated[Actor, Depends(get_actor)],
+        agent: Annotated[AgentCaller, Depends(get_agent)],
         submission_id: Annotated[str, Path(pattern=r"^[0-9a-f]{32}$")],
         approval: ApprovalRequest,
     ) -> SubmissionJob:
@@ -720,20 +1252,31 @@ def create_app(
 
         This is the approval gate and nothing more: it moves no hardware, starts
         no print, and reaches no printer. It marks the job ``approved`` and sets
-        ``verdict.dispatch_ready``, which a future dispatch step would require.
+        ``verdict.dispatch_ready``, which dispatch requires. An agent may approve
+        only on a printer in agent mode. ``eln_project`` optionally sets where
+        the finished record is filed.
         """
 
         job = store.get(submission_id)
         if job is None:
             raise HTTPException(status_code=404, detail="unknown submission")
+        require_agent_mode(job.target_machine, agent, "approval")
         try:
-            who, verified = actor_for(actor, approval.approved_by)
+            who, verified = actor_for(actor, approval.approved_by or agent.agent_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="approved_by is required") from exc
         try:
-            return await store.approve(job, approved_by=who, verified=verified)
+            return await store.approve(
+                job,
+                approved_by=who,
+                verified=verified,
+                eln_project=approval.eln_project,
+                agent_id=agent.agent_id if agent.is_agent else None,
+            )
         except InvalidTransition as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except SubmissionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post(
         "/submissions/{submission_id}/cancel",
@@ -811,10 +1354,52 @@ def create_app(
         return camera
 
     if control_enabled:
-        _register_control_routes(app, get_monitor, get_actor, get_dispatcher)
+        _register_control_routes(app, get_monitor, get_actor, get_dispatcher, get_agent)
         _register_camera_route(app, get_monitor, get_camera)
+        if settings and settings.agent_workflow.vision_enabled:
+            _register_advisory_bed_check(app, get_monitor, get_dispatcher, workflows)
 
     return app
+
+
+def _register_advisory_bed_check(
+    app: FastAPI,
+    get_monitor: Callable[..., PrinterMonitor],
+    get_dispatcher: Callable[[], Dispatcher],
+    workflows: dict[str, object],
+) -> None:
+    """Assess a previously captured control snapshot without printer I/O.
+
+    Advisory input only: the result is not itself a plate check. A person
+    still confirms the plate, or, on a printer in agent mode, the agent makes
+    its own ``agent_camera`` decision and may use this as one input.
+    """
+
+    class BedCheckRequest(BaseModel):
+        snapshot_token: str = Field(min_length=1, max_length=64)
+
+    @app.post(
+        "/printers/{printer_id}/bed-check",
+        response_model=BedAssessment,
+        tags=["agent-workflow"],
+    )
+    async def advisory_bed_check(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        request: BedCheckRequest,
+    ) -> BedAssessment:
+        detector = workflows.get("detector")
+        if not isinstance(detector, ReferenceDigestDetector):
+            raise HTTPException(status_code=503, detail="bed detector unavailable")
+        image = dispatcher.snapshot_image(request.snapshot_token, printer_id=monitor.definition.id)
+        if image is None:
+            raise HTTPException(status_code=404, detail="snapshot token is unknown or expired")
+        return await asyncio.to_thread(
+            detector.assess,
+            printer_id=monitor.definition.id,
+            snapshot_token=request.snapshot_token,
+            image=image,
+        )
 
 
 def _register_camera_route(
@@ -871,8 +1456,9 @@ def _register_control_routes(
     get_monitor: Callable[..., PrinterMonitor],
     get_actor: Callable[..., Actor],
     get_dispatcher: Callable[[], Dispatcher],
+    get_agent: Callable[..., AgentCaller],
 ) -> None:
-    """STATUS_SPEC §5 claims plus the three control verbs, per printer.
+    """STATUS_SPEC §5 claims plus the four control verbs, per printer.
 
     Only called when the local config enables dispatch, so a deployment that
     has not opted in exposes no ``/control/`` path at all.
@@ -974,21 +1560,28 @@ def _register_control_routes(
     async def control_start_print(
         monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
         actor: Annotated[Actor, Depends(get_actor)],
+        agent: Annotated[AgentCaller, Depends(get_agent)],
         dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
         request: StartPrintRequest,
         claim_token: Annotated[str | None, Header(alias=CLAIM_HEADER)] = None,
     ) -> SubmissionJob | JSONResponse:
         """Upload an approved job to the printer and start it.
 
-        Requires the claim, a person's statement that the build plate is
-        empty, an explicit tray for every filament, and every gate in
-        :mod:`bambu_server.dispatch`. Returns once the printer reports the job
-        running, or with the job ``failed`` and the uncertainty recorded.
+        Requires the claim, a statement that the build plate is empty, an
+        explicit tray for every filament, and every gate in
+        :mod:`bambu_server.dispatch`. A person states the plate is empty
+        (``in_person`` or ``printer_camera``). An agent may start only on a
+        printer whose agent mode an admin switched on, and must decide itself
+        from a fresh claimed snapshot: ``plate_check_method: agent_camera`` with
+        that ``snapshot_token`` and an optional ``plate_check_rationale``.
+        Returns once the printer reports the job running, or with the job
+        ``failed`` and the uncertainty recorded.
         """
 
         try:
             return await dispatcher.start_print(
-                monitor.definition.id, request, actor=actor, claim_token=claim_token
+                monitor.definition.id, request, actor=actor, claim_token=claim_token,
+                agent=agent,
             )
         except ControlRefusal as exc:
             return _refusal(exc)

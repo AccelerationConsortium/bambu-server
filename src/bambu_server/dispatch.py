@@ -33,8 +33,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .agent_mode import AgentCaller, AgentModeGate, AgentModeRefusal
 from .artifacts import ArtifactError, ArtifactFacts, inspect_artifact
-from .backend import PrinterBackend, PrinterCommandError, StartPrintCommand
+from .backend import (
+    PrinterBackend,
+    PrinterCommandError,
+    StartPrintCommand,
+    camera_snapshot_supported,
+)
 from .claims import ClaimRegistry
 from .config import DispatchSettings
 from .identity import Actor
@@ -79,6 +85,8 @@ class StartPrintRequest(BaseModel):
     snapshot_token: str | None = Field(default=None, max_length=64)
     ams_mapping: list[TrayAssignment] = Field(min_length=1, max_length=16)
     dispatched_by: str | None = Field(default=None, min_length=1, max_length=120)
+    #: Why the deciding agent judged the plate empty (``agent_camera`` only).
+    plate_check_rationale: str | None = Field(default=None, max_length=1000)
 
 
 class StopPrintRequest(BaseModel):
@@ -249,6 +257,7 @@ class Dispatcher:
         monitors: dict[str, PrinterMonitor],
         backends: dict[str, PrinterBackend],
         poll_interval_s: float,
+        agent_mode: AgentModeGate | None = None,
     ) -> None:
         self.settings = settings
         self.gate = ControlGate(settings)
@@ -258,6 +267,7 @@ class Dispatcher:
         self._poll_s = max(0.01, poll_interval_s)
         self._printers = {printer_id: _PrinterControl() for printer_id in monitors}
         self._snapshots: dict[str, _Snapshot] = {}
+        self._agent_mode = agent_mode
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -310,6 +320,14 @@ class Dispatcher:
         path = self._store.root / f"{job.submission_id}.plate.jpg"
         return path if path.is_file() else None
 
+    def snapshot_image(self, token: str, *, printer_id: str) -> bytes | None:
+        """Return a retained control snapshot for advisory local analysis."""
+
+        snapshot = self._snapshots.get(token)
+        if snapshot is None or snapshot.printer_id != printer_id or not snapshot.path.is_file():
+            return None
+        return snapshot.path.read_bytes()
+
     def _control(self, printer_id: str) -> _PrinterControl:
         control = self._printers.get(printer_id)
         if control is None:
@@ -333,6 +351,16 @@ class Dispatcher:
         """Read one frame under the claim the caller already checked, and keep it."""
 
         control = self._control(printer_id)
+        model = self._monitors[printer_id].definition.model
+        if not camera_snapshot_supported(model):
+            raise ControlRefusal(
+                501,
+                {
+                    "detail": f"camera snapshots are not supported for the {model} yet "
+                    "(its camera is not the P1/A1 port-6000 service); check the plate in person",
+                    "camera_supported": False,
+                },
+            )
         try:
             image = await asyncio.to_thread(self._backends[printer_id].snapshot)
         except PrinterCommandError as exc:
@@ -373,11 +401,14 @@ class Dispatcher:
         *,
         actor: Actor,
         claim_token: str | None,
+        agent: AgentCaller | None = None,
     ) -> SubmissionJob:
         control = self._control(printer_id)
         self.require_claim(printer_id, claim_token)
         monitor = self._monitors[printer_id]
         backend = self._backends[printer_id]
+        agent = agent or AgentCaller()
+        self._check_agent_start(printer_id, request, agent)
 
         async with control.lock:
             job = self._store.get(request.submission_id)
@@ -483,14 +514,19 @@ class Dispatcher:
                     },
                 )
             mapping = check_tray_mapping(request.ams_mapping, facts, profile)
+            # Re-checked under the lock: the switch may have been turned off
+            # while this request waited.
+            self._check_agent_start(printer_id, request, agent)
             plate_check, snapshot_token = await self._plate_check(
-                request, control=control, printer_id=printer_id, who=who, verified=verified
+                request, control=control, printer_id=printer_id, who=who, verified=verified,
+                agent=agent,
             )
 
             remote_name = remote_filename(job)
             record = DispatchRecord(
                 dispatched_by=who,
                 dispatched_by_verified=verified,
+                dispatched_by_agent=agent.agent_id if agent.is_agent else None,
                 requested_at=datetime.now(UTC),
                 plate_check=plate_check,
                 ams_mapping=mapping,
@@ -511,9 +547,10 @@ class Dispatcher:
                 upload = await asyncio.to_thread(backend.upload_file, path, remote_name)
             except PrinterCommandError as exc:
                 control.active_job = None
-                return await self._store.update_dispatch(
+                job = await self._store.update_dispatch(
                     job, to_state="failed", note=f"upload failed: {exc}; nothing was started"
                 )
+                return job
             job = await self._store.update_dispatch(job, upload_verified_bytes=upload.byte_size)
 
             command = StartPrintCommand(
@@ -537,9 +574,10 @@ class Dispatcher:
                     f"start command not confirmed by the broker: {exc}; the file is on the "
                     "printer but no start was confirmed -- check the printer"
                 )
-                return await self._store.update_dispatch(
+                job = await self._store.update_dispatch(
                     job, to_state="failed", note=note, uncertainty=note
                 )
+                return job
             job = await self._store.update_dispatch(job, command_published_at=datetime.now(UTC))
 
         return await self._await_running(job, monitor, backend, control)
@@ -576,9 +614,10 @@ class Dispatcher:
             f"within {int(self.settings.confirm_timeout_s)} s; its real state is unknown -- "
             "look at the printer before doing anything else"
         )
-        return await self._store.update_dispatch(
+        job = await self._store.update_dispatch(
             job, to_state="failed", note=note, uncertainty=note
         )
+        return job
 
     async def _watch_running(self, submission_id: str) -> None:
         job = self._store.get(submission_id)
@@ -596,7 +635,7 @@ class Dispatcher:
                 gcode_state = (print_job.state if print_job and print_job.state else "").upper()
                 now = datetime.now(UTC)
                 if gcode_state == "FINISH":
-                    await self._store.update_dispatch(
+                    job = await self._store.update_dispatch(
                         job,
                         to_state="finished",
                         note="printer reports the job finished",
@@ -608,7 +647,7 @@ class Dispatcher:
                         note += f" (state {gcode_state.lower()})"
                     if status.last_error:
                         note += f"; printer error {status.last_error.code}"
-                    await self._store.update_dispatch(
+                    job = await self._store.update_dispatch(
                         job, to_state="failed", note=note, observed_finished_at=now
                     )
                 return
@@ -688,17 +727,46 @@ class Dispatcher:
         printer_id: str,
         who: str,
         verified: bool,
+        agent: AgentCaller,
     ) -> tuple[PlateCheck, str | None]:
-        """The person's plate confirmation, and the token of the frame recorded with it.
+        """The plate confirmation, and the token of the frame recorded with it.
 
         A camera confirmation with no snapshot token (approved 2026-10-21) has
         the gateway capture the frame itself, now, under this claim: the person
         looked at the live camera view, and the record keeps the frame from the
         moment they pressed start. If the camera cannot deliver one, nothing
-        starts.
+        starts. An ``agent_camera`` decision never gets a frame captured for it:
+        the agent must name the snapshot it actually looked at.
         """
 
         now = datetime.now(UTC)
+        if request.plate_check_method == "agent_camera":
+            if not request.snapshot_token:
+                raise ControlRefusal(
+                    412,
+                    {
+                        "detail": "an agent_camera plate check needs the snapshot_token of "
+                        "the frame the agent judged empty",
+                        "snapshot_missing": True,
+                    },
+                )
+            snap = self._claimed_snapshot(
+                request.snapshot_token, control=control, printer_id=printer_id, now=now,
+                max_age_s=self.settings.agent_snapshot_max_age_s,
+            )
+            rationale = (request.plate_check_rationale or "").strip() or None
+            plate_check = PlateCheck(
+                confirmed_by=who,
+                confirmed_by_verified=verified,
+                method="agent_camera",
+                confirmed_at=now,
+                snapshot_sha256=snap.sha256,
+                snapshot_captured_at=snap.captured_at,
+                decided_by="agent",
+                agent_id=agent.agent_id,
+                rationale=rationale,
+            )
+            return plate_check, snap.token
         if request.plate_check_method == "in_person":
             plate_check = PlateCheck(
                 confirmed_by=who,
@@ -728,7 +796,32 @@ class Dispatcher:
                 snapshot_captured_at=snap.captured_at,
             )
             return plate_check, snap.token
-        snap = self._snapshots.get(request.snapshot_token)
+        snap = self._claimed_snapshot(
+            request.snapshot_token, control=control, printer_id=printer_id, now=now,
+            max_age_s=SNAPSHOT_MAX_AGE_S,
+        )
+        plate_check = PlateCheck(
+            confirmed_by=who,
+            confirmed_by_verified=verified,
+            method="printer_camera",
+            confirmed_at=now,
+            snapshot_sha256=snap.sha256,
+            snapshot_captured_at=snap.captured_at,
+        )
+        return plate_check, snap.token
+
+    def _claimed_snapshot(
+        self,
+        token: str,
+        *,
+        control: _PrinterControl,
+        printer_id: str,
+        now: datetime,
+        max_age_s: float,
+    ) -> _Snapshot:
+        """A snapshot of this printer, taken under the current claim, fresh enough."""
+
+        snap = self._snapshots.get(token)
         holder = control.claims.holder()
         if (
             snap is None
@@ -743,24 +836,54 @@ class Dispatcher:
                 },
             )
         age = (now - snap.captured_at).total_seconds()
-        if age > SNAPSHOT_MAX_AGE_S:
+        if age > max_age_s:
             raise ControlRefusal(
                 412,
                 {
                     "detail": "the camera snapshot is too old; take a new one",
                     "snapshot_age_s": round(age, 1),
-                    "snapshot_max_age_s": SNAPSHOT_MAX_AGE_S,
+                    "snapshot_max_age_s": max_age_s,
                 },
             )
-        plate_check = PlateCheck(
-            confirmed_by=who,
-            confirmed_by_verified=verified,
-            method="printer_camera",
-            confirmed_at=now,
-            snapshot_sha256=snap.sha256,
-            snapshot_captured_at=snap.captured_at,
-        )
-        return plate_check, snap.token
+        return snap
+
+    def _check_agent_start(
+        self, printer_id: str, request: StartPrintRequest, agent: AgentCaller
+    ) -> None:
+        """Agents start only in agent mode, and only on their own camera decision.
+
+        The human path is untouched: a person's request is never subject to
+        agent mode, and only an agent may use ``agent_camera``.
+        """
+
+        if not agent.is_agent:
+            if request.plate_check_method == "agent_camera":
+                raise ControlRefusal(
+                    403,
+                    {
+                        "detail": "agent_camera is an agent's plate check; a person confirms "
+                        "the plate in_person or by printer_camera",
+                        "agent_mode": "not_an_agent",
+                    },
+                )
+            return
+        if self._agent_mode is None:
+            raise ControlRefusal(
+                403, {"detail": "agent starts are not available", "agent_mode": "not_eligible"}
+            )
+        try:
+            self._agent_mode.require(printer_id, "start")
+        except AgentModeRefusal as exc:
+            raise ControlRefusal(exc.status, exc.body) from exc
+        if request.plate_check_method != "agent_camera":
+            raise ControlRefusal(
+                412,
+                {
+                    "detail": "an agent must check the plate itself: use plate_check_method "
+                    "agent_camera with the snapshot_token it judged empty",
+                    "plate_check_method": request.plate_check_method,
+                },
+            )
 
     async def _keep_snapshot(self, token: str, job: SubmissionJob) -> None:
         snap = self._snapshots.pop(token, None)

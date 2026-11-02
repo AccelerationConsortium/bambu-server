@@ -193,6 +193,19 @@ def test_an_unknown_submission_is_404(client: TestClient) -> None:
     assert client.get("/submissions/" + "0" * 32).status_code == 404
 
 
+def test_unlabelled_gcode_reports_no_invented_objects(client: TestClient) -> None:
+    created = _upload(client).json()
+    assert client.get(f"/submissions/{created['submission_id']}/objects").json() == []
+
+
+def test_robot_calibration_is_not_part_of_the_gateway(client: TestClient) -> None:
+    """The arm agent owns bed-to-arm calibration; the gateway serves bed mm only."""
+    paths = client.get("/openapi.json").json()["paths"]
+    assert not any("calibration" in path for path in paths)
+    pickup = client.get("/openapi.json").json()["components"]["schemas"]["PickupInfo"]
+    assert "arm_frame" not in str(pickup)
+
+
 def test_approval_records_sign_off_and_sets_dispatch_ready(client: TestClient) -> None:
     created = _upload(client).json()
 
@@ -310,7 +323,8 @@ def test_cancelling_removes_a_job_from_the_queue(client: TestClient) -> None:
     assert response.status_code == 200
     job = response.json()
     assert job["state"] == "cancelled"
-    assert job["artifact_removed"] is True
+    # Kept by default as part of the print record.
+    assert job["artifact_removed"] is False
     assert job["history"][-1]["note"] == "cancelled by lab-operator: superseded"
     assert client.get("/printers/bambu_test_01/queue").json()["queued"] == []
     # The record survives so the withdrawal stays auditable.

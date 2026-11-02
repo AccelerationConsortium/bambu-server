@@ -30,11 +30,19 @@ claim, one shared read per printer every 2 s, off on the page until a person
 turns it on, never plate-check evidence) was approved, and with it the manual
 snapshot step was dropped: a camera start records its own frame under the
 claim when the person presses start. Homing was considered and
-deliberately not added: it moves the bed into whatever is on the plate. All printer commands go through `bambu_server.dispatch` and
+deliberately not added: it moves the bed into whatever is on the plate. On
+2026-11-02 Yang approved (relayed in PR #8) **agent mode for the Bambu A1
+only**: an admin-controlled, audited switch, off by default, that lets an agent
+submit, approve and start jobs on `bambu_a1_01`, deciding itself from a claimed
+camera snapshot that the plate is empty (`agent_camera`). Every other printer,
+and the A1 with the switch off, keeps the human-in-the-loop rules unchanged; see
+`AGENT_RULES.md` rule 4. The same day, robot calibration was ruled out of scope:
+the gateway reports object positions in bed millimetres and the arm agent owns
+the transform. All printer commands go through `bambu_server.dispatch` and
 the backend's control methods; nothing else may call `bambulabs_api` command
 methods. Adding a verb, relaxing a gate, or letting an agent start a print
-without a person needs a new explicitly approved design. Routing control
-through `lab-skills` is still owed.
+without a person anywhere beyond that A1 approval needs a new explicitly
+approved design. Routing control through `lab-skills` is still owed.
 
 ## Working conventions
 

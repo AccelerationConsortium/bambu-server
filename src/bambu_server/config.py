@@ -117,11 +117,24 @@ class PrinterDefinition(BaseModel):
     model: str | None = Field(default=None, max_length=120)
     env_prefix: str = Field(pattern=r"^[A-Z][A-Z0-9_]*$")
     profile: MachineProfileConfig = Field(default_factory=MachineProfileConfig)
+    #: Whether an admin may switch agent mode on for this printer at runtime.
+    #: Approved 2026-11-02 for the Bambu A1 only; refused on any other model.
+    agent_mode_eligible: bool = False
 
     @field_validator("id", "name", "model", "env_prefix", mode="before")
     @classmethod
     def strip_text(cls, value: Any) -> Any:
         return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def agent_mode_only_on_a1(self) -> PrinterDefinition:
+        from .agent_mode import model_is_agent_mode_capable
+
+        if self.agent_mode_eligible and not model_is_agent_mode_capable(self.model):
+            raise ValueError(
+                f"agent_mode_eligible is approved for Bambu A1 printers only, not {self.model!r}"
+            )
+        return self
 
 
 class SubmissionSettings(BaseModel):
@@ -138,10 +151,14 @@ class SubmissionSettings(BaseModel):
     # enough to trust a motion-derived bounding box, so plate fit is reported
     # as not applicable rather than computed from a partial scan.
     scan_max_bytes: int = Field(default=64 * 1024 * 1024, ge=64 * 1024)
-    #: Age after which a *terminal* job's record is swept at startup. Jobs that
-    #: are still in play are never swept however old they are: a job stuck in
-    #: `validating` is a signal, not litter. Set to null to keep everything.
-    retain_terminal_days: float | None = Field(default=30.0, gt=0)
+    #: Age after which a *terminal* job's record is swept at startup. Off by
+    #: default: job records and their artifacts are the lab's print records.
+    #: Jobs still in play are never swept however old they are. Result bundles
+    #: under ``results/`` are never swept.
+    retain_terminal_days: float | None = Field(default=None, gt=0)
+    #: Delete the stored artifact when a waiting job is cancelled. Off by
+    #: default so a withdrawn job can still be inspected and downloaded.
+    cancel_deletes_artifact: bool = False
 
 
 class DispatchSettings(BaseModel):
@@ -167,11 +184,60 @@ class DispatchSettings(BaseModel):
     #: the job in flight before the dispatch is recorded as failed. Covers the
     #: P1S's file-prepare phase; a bed-leveling pass happens *after* PREPARE.
     confirm_timeout_s: float = Field(default=180.0, ge=10, le=1800)
+    #: Edge roles allowed to flip a printer's agent mode switch.
+    agent_mode_admin_roles: list[str] = Field(default_factory=lambda: ["admin"])
+    #: Edge roles whose callers are treated as agents (as is any request with
+    #: an ``X-Agent-Id`` header).
+    agent_roles: list[str] = Field(default_factory=lambda: ["agent"])
+    #: An ``agent_camera`` decision must rest on a frame at most this old.
+    agent_snapshot_max_age_s: float = Field(default=120.0, ge=5, le=300)
     #: Printer-side pre-print steps, forwarded in the start command.
     bed_leveling: bool = True
     flow_calibration: bool = False
     vibration_calibration: bool = False
     timelapse: bool = False
+
+
+class AgentWorkflowSettings(BaseModel):
+    """Optional data integrations for orchestration agents; all are off by default."""
+
+    #: Operator-configured HTTPS endpoints, e.g. the dashboard event ingest
+    #: route.  Failed delivery is logged without a body and never affects a job.
+    event_webhook_urls: list[str] = Field(default_factory=list)
+    event_buffer_size: int = Field(default=1000, ge=10, le=10000)
+    #: Temperature at or below which a finished bed counts as cooled for
+    #: pickup. Advice for the arm agent, never a robot command.
+    pickup_safe_bed_c: float = Field(default=45.0, gt=0)
+    #: How long after ``job.finished`` to keep watching the cached bed
+    #: temperature for ``job.cooled``. Not resumed after a restart.
+    cooldown_watch_timeout_s: float = Field(default=4 * 3600.0, ge=1, le=86400)
+    #: Vision remains advisory under the lab safety rules. It cannot satisfy
+    #: the human plate-clear confirmation required by start_print.
+    vision_enabled: bool = False
+    #: A directory containing operator-captured empty-bed references named
+    #: ``<printer_id>.jpg``. No reference produces ``unknown``, never ``clear``.
+    empty_bed_reference_directory: Path | None = None
+
+
+class ResultsSettings(BaseModel):
+    """Durable result bundles and the optional central-ingest outbox.
+
+    Devices never write to the ELN directly: bundles go only to the central
+    dashboard's ``/api/ingest/*``, which holds the ELN credentials. Without an
+    ingest URL and token every job stays ``local_only``.
+    """
+
+    #: Identifies this gateway in result bundles and events.
+    gateway_id: str = Field(default="bambu_gateway", pattern=r"^[a-z][a-z0-9_]*$")
+    #: Central ingest endpoint, e.g. ``https://<dashboard>/api/ingest/print-results``.
+    #: ``BAMBU_RESULTS_URL`` overrides it; the bearer token is only ever read
+    #: from ``BAMBU_RESULTS_TOKEN``.
+    ingest_url: str | None = Field(default=None, pattern=r"^https?://")
+    poll_interval_s: float = Field(default=60.0, ge=0.05, le=86400)
+    retry_initial_s: float = Field(default=10.0, ge=0.05, le=3600)
+    retry_max_s: float = Field(default=1800.0, ge=0.05, le=86400)
+    request_timeout_s: float = Field(default=10.0, ge=0.5, le=120)
+    worker_tick_s: float = Field(default=2.0, ge=0.05, le=60)
 
 
 class SlicerSettings(BaseModel):
@@ -216,6 +282,8 @@ class Settings(BaseModel):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
     submissions: SubmissionSettings = Field(default_factory=SubmissionSettings)
     dispatch: DispatchSettings = Field(default_factory=DispatchSettings)
+    agent_workflow: AgentWorkflowSettings = Field(default_factory=AgentWorkflowSettings)
+    results: ResultsSettings = Field(default_factory=ResultsSettings)
     slicer: SlicerSettings = Field(default_factory=SlicerSettings)
 
     @model_validator(mode="after")
@@ -251,6 +319,23 @@ def resolve_edge_secret() -> str | None:
     """
 
     return (os.getenv(EDGE_SECRET_ENV) or "").strip() or None
+
+
+RESULTS_URL_ENV = "BAMBU_RESULTS_URL"
+RESULTS_TOKEN_ENV = "BAMBU_RESULTS_TOKEN"
+
+
+def resolve_results_ingest(settings: ResultsSettings) -> tuple[str | None, str | None]:
+    """The central ingest URL and bearer token, or ``None`` for either.
+
+    The token is a credential and is read from the environment only.
+    """
+
+    url = (os.getenv(RESULTS_URL_ENV) or "").strip() or settings.ingest_url
+    if url and not url.startswith(("http://", "https://")):
+        raise ValueError(f"{RESULTS_URL_ENV} must be an http(s) URL")
+    token = (os.getenv(RESULTS_TOKEN_ENV) or "").strip() or None
+    return (url.rstrip("/") if url else None), token
 
 
 def resolve_credentials(printer: PrinterDefinition) -> PrinterCredentials:
@@ -292,4 +377,9 @@ def load_settings(path: str | Path | None = None) -> Settings:
         ).resolve()
     if not settings.slicer.work_dir.is_absolute():
         settings.slicer.work_dir = (resolved.parent / settings.slicer.work_dir).resolve()
+    references = settings.agent_workflow.empty_bed_reference_directory
+    if references is not None and not references.is_absolute():
+        settings.agent_workflow.empty_bed_reference_directory = (
+            resolved.parent / references
+        ).resolve()
     return settings

@@ -46,8 +46,11 @@ class CameraViewer:
         *,
         min_interval_s: float = DEFAULT_MIN_INTERVAL_S,
         timeout_s: float = 5.0,
+        unsupported: frozenset[str] = frozenset(),
     ) -> None:
         self._backends = backends
+        #: Printers whose camera protocol is not supported (the H2D); never read.
+        self._unsupported = unsupported
         self._min_interval_s = min_interval_s
         self._timeout_s = timeout_s
         self._locks: dict[str, asyncio.Lock] = {}
@@ -55,6 +58,8 @@ class CameraViewer:
         self._latest: dict[str, tuple[float, CameraFrame | str]] = {}
 
     async def frame(self, printer_id: str) -> CameraFrame:
+        if printer_id in self._unsupported:
+            raise CameraUnavailable("this printer's camera is not supported yet")
         lock = self._locks.setdefault(printer_id, asyncio.Lock())
         async with lock:
             cached = self._latest.get(printer_id)

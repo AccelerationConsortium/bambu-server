@@ -31,6 +31,17 @@ logger = logging.getLogger(__name__)
 #: The printer's chamber-camera service (P1 series: authenticated JPEG frames).
 _CAMERA_PORT = 6000
 
+#: Models whose camera is not the port-6000 JPEG service this backend reads.
+#: The H2D streams over RTSP instead; snapshots for it are not supported yet.
+_UNSUPPORTED_CAMERA_MODELS = frozenset({"h2d"})
+
+
+def camera_snapshot_supported(model: str | None) -> bool:
+    """False for a model known not to serve the port-6000 camera protocol."""
+
+    name = (model or "").strip().lower()
+    return not any(unsupported in name for unsupported in _UNSUPPORTED_CAMERA_MODELS)
+
 #: Models with no chamber temperature sensor. Their firmware still reports a
 #: fixed ``chamber_temper`` (5 C on the P1S and A1), which is a placeholder, not
 #: a reading. Matched exactly against the operator-declared ``model``; an

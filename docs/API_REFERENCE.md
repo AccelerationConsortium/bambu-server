@@ -65,14 +65,99 @@ Per printer, under `/printers/{id}/control/`: `claim`, `heartbeat`, `release`
 `start_print`, `stop_print`, each requiring
 `X-Claim-Token` (423 without it). `start_print` takes the approved
 `submission_id`, `plate_confirmed_empty: true`, `plate_check_method`
-(`printer_camera` with a `snapshot_token`, or `in_person`), and an
-`ams_mapping` of `{filament_id, ams_id, tray_id}`. Refusals are 412 with a body
-naming the failed gate; `allowed_actions` on `/status` mirrors them, and
+(`printer_camera` with a `snapshot_token`, `in_person`, or — for an agent on a
+printer in agent mode — `agent_camera`), and an `ams_mapping` of
+`{filament_id, ams_id, tray_id}`. Refusals are 412 with a body naming the
+failed gate; `allowed_actions` on `/status` mirrors them, and
 `details.claimed_by` names the holder. `GET /submissions/{id}/plate.jpg` returns
 the camera frame a start was confirmed against. Without dispatch enabled none
 of these paths exist.
+
+**Camera snapshot for a plate check.** `POST /printers/{id}/control/snapshot`
+with the claim token returns `{token, printer_id, captured_at, sha256,
+content_type: "image/jpeg", image_base64}`. The token is valid for that printer
+and that claim session only. A person's camera start accepts it for 5 minutes;
+an agent's `agent_camera` start for `dispatch.agent_snapshot_max_age_s` (120 s
+by default). H2D snapshots are not supported yet: the route answers 501 without
+contacting the printer, so an H2D plate check is in person.
 
 The gateway trusts edge identity only with its configured shared edge secret.
 Names supplied directly by clients are unverified labels. Dashboard links use
 the authenticated edge; this does not turn the gateway's direct port into an
 authenticated surface. Never send secrets or printer addresses in submissions.
+
+## Agent mode (Bambu A1 only)
+
+Approved 2026-11-02 for `bambu_a1_01`. An agent is a request carrying
+`X-Agent-Id`, or whose edge-verified role is in `dispatch.agent_roles`
+(default `agent`). Agents may submit, approve and start only on a printer with
+`agent_mode_eligible: true` (config accepts it on a Bambu A1 only) whose switch
+is on; otherwise 403 with `agent_mode: "not_eligible"` or `"off"`.
+
+- `GET /printers/{id}/agent-mode` — `{printer_id, eligible, enabled,
+  changed_by, changed_by_role, changed_at, reason, audit: [...]}`.
+- `POST /printers/{id}/agent-mode` `{"enabled": bool, "reason": "..."}` —
+  edge-verified identities with a role in `dispatch.agent_mode_admin_roles`
+  (default `admin`) only, never an agent; 409 for an ineligible printer. Each
+  flip is appended to the audit log before it takes effect.
+- `details.agent_mode` on `/printers/{id}/status`, and per printer on
+  `/status`: `{eligible, enabled, changed_by, changed_at, reason}`.
+
+An agent's start uses `plate_check_method: agent_camera`, a fresh
+`snapshot_token` from this printer and claim, and optionally
+`plate_check_rationale`. The dispatch record's `plate_check` then has
+`decided_by: "agent"`, `agent_id`, `rationale` and `snapshot_sha256`, and the
+frame is archived at `/submissions/{id}/plate.jpg`.
+
+## Print records and ELN ingest
+
+- `GET /submissions/{id}/artifact` streams the exact stored file with `ETag:
+  "<sha256>"` (304 on `If-None-Match`; 410 once deleted).
+- `GET /submissions/{id}/result` returns the result bundle (`schema_id`
+  `ac.bambu.print_result`, `schema_version` 1, `final` once terminal). It
+  survives `DELETE` of the job record.
+- `POST /submissions/{id}/eln-ingest` `{"eln_project": "...", "requested_by"?}`
+  queues a terminal job for filing through the central server's ingest; `GET`
+  on the same path reads its outbox entry; `GET /results/outbox` lists them.
+  States: `local_only`, `pending`, `delivered`, `filing`, `filed`, `held`.
+- `POST /submissions` and `POST /submissions/{id}/approve` take an optional
+  `eln_project`.
+- `GET /submissions` adds `updated_after`, `order=newest` and `offset` for
+  change paging; the default order is unchanged.
+
+The gateway never writes to the ELN; only the central server does. `/status`
+reports `results_ingest_configured`, `results_outbox`, `results_pending`,
+`results_filing` and `results_held`.
+
+## Agent workflow data
+
+`GET /submissions/{id}/objects` returns where each sliced object sits on the
+plate in **bed coordinates**: millimetres, origin at the front-left corner of
+the printable area, +X right, +Y toward the back seen from the front, Z up, as
+the printer's own toolpath addresses it (compare with the profile's
+`bed_size_mm`). Each object has `object_id`, `name`, `center_x_mm`,
+`center_y_mm`, `bounds`, `rotation_deg` (when known), `plate_index`, `source`
+(`slicer_plate_json`, `gcode_label` or `model_transform`) and `gcode_bounds`,
+the labelled-extrusion cross-check. No invented positions: an empty list when
+the file does not say. There is no robot frame; the arm agent owns calibration.
+
+`GET /submissions/{id}/pickup-targets` returns those objects with
+`bed_size_mm`, `pickup: {bed_temperature_c, safe_bed_temperature_c, cooled,
+observed_at}` from the monitor's cache, and `ready` (finished, cooled, and at
+least one object). It never contacts a printer or a robot.
+
+`GET /events?after=<event_id>` is a pollable lifecycle feed: `job.started`,
+`job.finished`, `job.failed`, `job.rejected`, `job.cancelled`, `job.cooled`
+and `gateway.restarted`, each with `schema_version`, `event_id`,
+`gateway_id`, `boot_id`, `submission_id`, `printer_id`, `state`,
+`updated_at`, `eln_project`, `note`, and for job events the bed-frame
+`object_positions`; `job.finished` and `job.cooled` add `pickup`. Ids persist
+across restarts, and a restart-recovered failure is a `job.failed` with
+`recovered_after_restart: true`. Configure `agent_workflow.event_webhook_urls`
+to POST the same JSON elsewhere; delivery is best effort and never affects a
+job.
+
+When both dispatch and `agent_workflow.vision_enabled` are enabled,
+`POST /printers/{id}/bed-check` accepts a claimed-control `snapshot_token` and
+returns an advisory empty-bed assessment based on an operator reference image.
+It performs no camera access itself, and its result is not a plate check.
