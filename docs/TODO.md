@@ -59,6 +59,42 @@ Still owed:
 - **`lab-skills` integration** and the §6.4 human-gated reconcile verb.
 - **Slicing is inline** in `POST /submissions`; a slow slice holds the request.
 
+## A1 agent mode: part placement (owed, found 2026-11-04)
+
+Found on the first agent-run A1 print (submission
+`24dd23a8d8dd4707a986c21a734227dd`, B1-B2-B3 adaptor, started 2026-11-04
+19:21 UTC). The person asked mid-print for the part to sit towards the front and
+slightly left; no agent could do that.
+
+- **The gateway slicer cannot place a part.** `slicer.py` runs Bambu Studio with
+  `--arrange 1`, so an uploaded `.stl` lands wherever auto-arrange puts it
+  (about centre). `POST /submissions` has no position or rotation field. The
+  only way to place a part is to slice locally with A1 presets and submit the
+  `.3mf`, which most agents cannot do.
+- **The fit check is blind for these slices.** `build_fits_plate` returned
+  `not_applicable` ("the toolpath uses relative positioning"), so an agent
+  moving a part towards an edge would get no fit check.
+- **Reading back is possible:** `GET /submissions/{id}/objects` already reports
+  where each sliced object sits in bed coordinates (mm, origin front-left, +X
+  right, +Y back). It is not exposed in the lab MCP yet.
+
+Proposed (needs approval; a submission parameter, not a new printer verb, so it
+stays inside the approved A1 agent-mode workflow):
+
+1. Optional `center_x_mm`, `center_y_mm`, `rotation_deg` form fields on `.stl`
+   submissions. When present, slice with `--arrange 0` and the part translated
+   to that centre; refuse (422) a placement whose footprint leaves the declared
+   `bed_size_mm`. Record the requested placement in `provenance`.
+2. Make `build_fits_plate` use the slicer's `plate_N.json` object bounds when the
+   toolpath is relative, so placement is actually checked.
+3. Lab MCP (`ac-lab-agent/.ac-lab-agent/lab_mcp.py`, not under git yet): add the
+   placement fields to `a1_submit` and an `a1_objects` tool so an agent confirms
+   the position before `a1_approve`.
+
+Also owed from the same session: `docs/API_REFERENCE.md` still says "Agents use
+the SDK for printer I/O"; align it with the agent guide's *How printer I/O is
+routed* (AGENTIC_LAB_DESIGN.md §1.3, ac-organic-lab#102).
+
 ## Submission pipeline (implemented, including dispatch)
 
 See `docs/SUBMISSION_PIPELINE_DESIGN.md`. Built: submission intake
