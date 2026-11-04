@@ -13,9 +13,17 @@ calibrate a robot or move a robot. Monitoring never starts or stops a print.
 The binding lab contract is `ac-organic-lab/docs/AGENTIC_LAB_DESIGN.md`, Part I;
 the wire contract is `ac-organic-lab/docs/STATUS_SPEC.md`; printer-specific
 approvals are in `bambu-server/AGENT_RULES.md`. Documentation is not permission
-to execute hardware actions. Agents route printer I/O through `lab-skills`,
-respect live claims and preconditions, and never bypass a refusal. Registration
-in the lab plan executor is a separate approval; these endpoints do not add it.
+to execute hardware actions. Agents respect live claims and preconditions and
+never bypass a refusal. Registration in the lab plan executor is a separate
+approval; these endpoints do not add it.
+
+**How printer I/O is routed.** `lab-skills` has no Bambu skill yet. Until it
+does, the lab rules (`AGENTIC_LAB_DESIGN.md` §1.3, *Bambu A1 agent mode*)
+allow exactly one route: the A1 agent-mode workflow below, called directly on
+this gateway's HTTP API through the authenticated edge. No other printer may
+be driven by an agent, and nothing beyond that workflow is allowed on the A1.
+When a Bambu skill lands in `lab-skills`, this exemption ends and the same
+steps go through the SDK.
 
 ## Find the printer and establish identity
 
@@ -78,7 +86,7 @@ stop command for a running print.
 
 ## Claim, inspect the plate and start once
 
-1. Acquire `/printers/{id}/control/claim` through the SDK and keep the claim
+1. Acquire `/printers/{id}/control/claim` (see *How printer I/O is routed*) and keep the claim
    alive with `heartbeat`. Send its `X-Claim-Token` on every control request.
    Never take over another session's claim; release yours on exit.
 2. Read the printer's status and `allowed_actions`. These are current device
@@ -90,7 +98,7 @@ stop command for a running print.
    release the claim and stop. Do not send a start request to test a known
    occupied plate. Ask a person to inspect/remove the object, then obtain
    fresh evidence before any later attempt.
-4. Only after a clear decision, call `start_print` through the SDK with the
+4. Only after a clear decision, call `/printers/{id}/control/start_print` with the
    approved submission, `plate_check_method: agent_camera`, that snapshot
    token, an affirmative empty-plate decision, its rationale, and an explicit
    mapping for every filament. The snapshot must be from the same printer and
