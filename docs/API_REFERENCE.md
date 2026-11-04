@@ -6,6 +6,39 @@ The dashboard also publishes the live schema through
 `/api/equipment/bambu_gateway/documentation/openapi.json` and a read-only Swagger
 viewer at `/api/equipment/bambu_gateway/documentation/docs`.
 
+The served [agent guide](../src/bambu_server/docs/AGENT_GUIDE.md) is available
+at `/agent-docs`; `/agent-docs/api-reference` generates the full method/path,
+parameter, request, response and shared-schema reference from the running
+app's OpenAPI. `/llms.txt` indexes the documentation, and `/docs/agent` exposes
+the service-level JSON guide for SDK discovery as `bambu_gateway`. The
+dashboard registers these under the same documentation proxy prefix above.
+Swagger is read-only; the documentation proxy cannot execute commands.
+
+## Endpoint summary
+
+All paths are relative to the gateway. `{id}` denotes a printer or submission
+ID as indicated by the prefix. The generated reference is authoritative for
+the routes enabled in a deployment.
+
+| Purpose | Methods and paths |
+|---|---|
+| Discovery and health | `GET /`, `/health`, `/status`, `/whoami`, `/printers` |
+| Per-printer reads | `GET /printers/{id}/`, `/health`, `/status`, `/profile`, `/queue` |
+| Submit and review | `POST /submissions`; `GET /submissions`, `/submissions/{id}`; `POST /submissions/{id}/approve`, `/cancel` |
+| Claims (dispatch enabled) | `POST /printers/{id}/control/claim`, `/heartbeat`, `/release` |
+| Printer I/O (dispatch enabled) | `POST /printers/{id}/control/snapshot`, `/light`, `/start_print`, `/stop_print` |
+| View-only camera (dispatch enabled) | `GET /printers/{id}/camera.jpg` |
+| Agent switch | `GET /printers/{id}/agent-mode`; `POST` on that path is admin-only, never agent-operated |
+| Completion and pickup | `GET /events`, `/submissions/{id}/objects`, `/submissions/{id}/pickup-targets` |
+| Durable records | `GET /submissions/{id}/artifact`, `/result`, `/plate.jpg`; `DELETE /submissions/{id}` for terminal-job housekeeping |
+| Optional ELN delivery | `GET` / `POST /submissions/{id}/eln-ingest`; `GET /results/outbox` |
+| Optional vision advisory | `POST /printers/{id}/bed-check` (dispatch and vision enabled) |
+| Documentation | `GET /docs`, `/openapi.json`, `/agent-docs`, `/agent-docs/api-reference`, `/docs/agent`, `/llms.txt` |
+
+Agents use the SDK for printer I/O. An occupied or unclear claimed snapshot
+means release the claim and stop; never send a start request to test the gate.
+Failed or uncertain dispatches require human reconciliation, without retries.
+
 ## Printer inventory
 
 `GET /printers` discovers configured printers. For each ID:
@@ -26,9 +59,10 @@ chamber camera frame (`image/jpeg`, `Cache-Control: no-store`, capture time in
 `X-Captured-At`) without a claim. It is the one read that touches the printer:
 the camera is read at most once per printer every 2 s and the frame is shared by
 all callers; 503 when the camera does not deliver one. A frame from here is
-never plate-check evidence: a camera `start_print` records its own frame under
-the claim (a fresh capture when no `snapshot_token` is sent, or a
-`/control/snapshot` taken under the claim within 5 minutes).
+never plate-check evidence. A person's camera `start_print` records a fresh
+frame when no `snapshot_token` is sent, or uses a claimed `/control/snapshot`
+no older than 5 minutes. An agent must supply its own claimed snapshot and
+visual decision; the agent age limit is normally 120 seconds.
 
 | Tray field | Meaning |
 |---|---|
@@ -70,8 +104,8 @@ printer in agent mode — `agent_camera`), and an `ams_mapping` of
 `{filament_id, ams_id, tray_id}`. Refusals are 412 with a body naming the
 failed gate; `allowed_actions` on `/status` mirrors them, and
 `details.claimed_by` names the holder. `GET /submissions/{id}/plate.jpg` returns
-the camera frame a start was confirmed against. Without dispatch enabled none
-of these paths exist.
+the camera frame a start was confirmed against. Without dispatch enabled the
+control routes are absent; the stored plate-evidence route remains registered.
 
 **Camera snapshot for a plate check.** `POST /printers/{id}/control/snapshot`
 with the claim token returns `{token, printer_id, captured_at, sha256,

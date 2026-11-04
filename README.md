@@ -30,6 +30,19 @@ artifact on the gateway's disk. Filing a record in the ELN is optional and goes
 only through the central dashboard's ingest ([Print records and ELN
 ingest](#print-records-and-eln-ingest)); the gateway never writes to the ELN.
 
+## Documentation for agents
+
+Read the [operating guide](src/bambu_server/docs/AGENT_GUIDE.md) for identity,
+A1 agent mode, slicing/submission, claimed-camera decisions, external-spool
+mapping, completion and recovery. The [API overview](docs/API_REFERENCE.md)
+summarizes the endpoint families.
+
+The service serves `/agent-docs`, `/agent-docs/api-reference` (generated from
+its actual OpenAPI), `/llms.txt`, and the JSON `/docs/agent` guide. All are
+credential-free documentation reads without printer I/O. Swagger at `/docs`
+is read-only. Dashboard registration belongs on the shared `bambu_gateway`
+entry; deploy these routes before enabling the new registry links.
+
 ## Architecture
 
 ```text
@@ -424,13 +437,35 @@ a *record*, not an action: it marks the job `approved` and sets
 ### STL slicing
 
 With `slicer.enabled`, `POST /submissions` also takes an `.stl` for any printer
-listed under `slicer.machine_profiles`, plus a `material` listed under
-`slicer.filament_profiles`. The gateway runs the installed Bambu Studio CLI
+listed under `slicer.machine_profiles`, plus a configured `material`. Each
+printer may name its own machine, process and filament presets; a bare machine
+name retains the shared process/filament defaults. An explicit per-printer
+filament map replaces those defaults. Presets with a `compatible_printers`
+list must include the selected machine, including inherited restrictions.
+The gateway runs the installed Bambu Studio CLI
 headlessly in a scratch directory, forcing two machine facts the stock presets
 get wrong: the nozzle type the printer reports and the build plate declared in
 its profile. The resulting `.3mf` is then validated and queued like any other
 upload, and the job carries `provenance` (source mesh hash, presets, slicer
 version). Slicing runs inline in the request.
+
+For A1 server-side PLA slicing, add the following alongside existing printer
+entries under `slicer.machine_profiles` in the local configuration:
+
+```yaml
+bambu_a1_01:
+  machine: Bambu Lab A1 0.4 nozzle
+  process: 0.20mm Standard @BBL A1
+  filaments:
+    PLA: Generic PLA @BBL A1
+```
+
+Agents upload multipart fields `file=design.stl`,
+`target_machine=bambu_a1_01`, and `material=PLA` to `POST /submissions`
+through the authenticated edge with their own API key and `X-Agent-Id`.
+A1 agent mode must be on. There is no separate `/slice` endpoint. HTTP 201
+returns a stored submission; inspect its validation and state before approval.
+Slicing and submission do not claim, upload to, or start the physical printer.
 
 ### Control plane
 

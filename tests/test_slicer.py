@@ -20,7 +20,7 @@ from bambu_server.config import Settings, SlicerSettings
 from bambu_server.main import create_app
 from bambu_server.slicer import BambuStudioSlicer, SliceRequest, SlicerError, SlicerUnavailable
 
-from .conftest import FakeBackend, write_3mf
+from .conftest import SAMPLE_GCODE, FakeBackend, write_3mf
 
 FAKE_CLI = """#!{python}
 import json, shutil, sys
@@ -178,6 +178,134 @@ async def test_slicing_without_a_declared_plate_is_refused(
         )
 
 
+def _preset(root: Path, kind: str, name: str, compatible: list[str] | None = None) -> None:
+    body: dict[str, object] = {"name": name}
+    if compatible is not None:
+        body["compatible_printers"] = compatible
+    (root / kind / f"{name}.json").write_text(json.dumps(body))
+
+
+def test_machine_profiles_accept_a_bare_machine_or_full_presets() -> None:
+    settings = SlicerSettings.model_validate(
+        {
+            "process_profile": "0.20mm Standard @BBL X1C",
+            "filament_profiles": {"pla": "Bambu PLA Basic @BBL X1C"},
+            "machine_profiles": {
+                "bambu_p1s_01": "Bambu Lab P1S 0.4 nozzle",
+                "bambu_a1_01": {
+                    "machine": "Bambu Lab A1 0.4 nozzle",
+                    "process": "0.20mm Standard @BBL A1",
+                    "filaments": {"pla": "Bambu PLA Basic @BBL A1"},
+                },
+            },
+        }
+    )
+    assert settings.machine_profiles["bambu_p1s_01"].machine == "Bambu Lab P1S 0.4 nozzle"
+    assert settings.process_for("bambu_p1s_01") == "0.20mm Standard @BBL X1C"
+    assert settings.filaments_for("bambu_p1s_01") == {"PLA": "Bambu PLA Basic @BBL X1C"}
+    assert settings.process_for("bambu_a1_01") == "0.20mm Standard @BBL A1"
+    assert settings.filaments_for("bambu_a1_01") == {"PLA": "Bambu PLA Basic @BBL A1"}
+
+
+def test_a_printers_own_presets_are_used(slicer_settings: SlicerSettings) -> None:
+    root = slicer_settings.profiles_dir
+    assert root is not None
+    _preset(root, "machine", "Bambu Lab A1 0.4 nozzle")
+    _preset(root, "process", "0.20mm Standard @BBL A1", ["Bambu Lab A1 0.4 nozzle"])
+    _preset(root, "filament", "Bambu PLA Basic @BBL A1", ["Bambu Lab A1 0.4 nozzle"])
+    settings = slicer_settings.model_copy(
+        update={
+            "machine_profiles": SlicerSettings.model_validate(
+                {
+                    "machine_profiles": {
+                        "bambu_test_01": "Bambu Lab Test 0.4 nozzle",
+                        "bambu_a1_01": {
+                            "machine": "Bambu Lab A1 0.4 nozzle",
+                            "process": "0.20mm Standard @BBL A1",
+                            "filaments": {"PLA": "Bambu PLA Basic @BBL A1"},
+                        },
+                    }
+                }
+            ).machine_profiles
+        }
+    )
+    slicer = BambuStudioSlicer(settings)
+
+    machine, process, filament = slicer.resolve_presets(_request(printer_id="bambu_a1_01"))
+
+    assert (machine.stem, process.stem, filament.stem) == (
+        "Bambu Lab A1 0.4 nozzle",
+        "0.20mm Standard @BBL A1",
+        "Bambu PLA Basic @BBL A1",
+    )
+    # The printer without its own presets still slices with the defaults.
+    _, process, filament = slicer.resolve_presets(_request())
+    assert process.stem == "0.20mm Standard @BBL X1C"
+    assert filament.stem == "Bambu PLA Basic @BBL Test"
+
+
+def test_a_printers_filaments_replace_the_defaults(slicer_settings: SlicerSettings) -> None:
+    root = slicer_settings.profiles_dir
+    assert root is not None
+    _preset(root, "filament", "Bambu PETG Basic @BBL Test")
+    settings = slicer_settings.model_copy(
+        update={
+            "filament_profiles": {
+                "PLA": "Bambu PLA Basic @BBL Test",
+                "PETG": "Bambu PETG Basic @BBL Test",
+            },
+            "machine_profiles": SlicerSettings.model_validate(
+                {
+                    "machine_profiles": {
+                        "bambu_test_01": {
+                            "machine": "Bambu Lab Test 0.4 nozzle",
+                            "filaments": {"PLA": "Bambu PLA Basic @BBL Test"},
+                        }
+                    }
+                }
+            ).machine_profiles,
+        }
+    )
+    slicer = BambuStudioSlicer(settings)
+
+    assert slicer.materials("bambu_test_01") == ["PLA"]
+    with pytest.raises(SlicerError, match="materials that can be sliced for it here: PLA$"):
+        slicer.resolve_presets(_request(material="PETG"))
+
+
+@pytest.mark.parametrize("kind", ["process", "filament"])
+def test_inherited_machine_restrictions_are_checked(
+    slicer_settings: SlicerSettings, kind: str,
+) -> None:
+    root = slicer_settings.profiles_dir
+    assert root is not None
+    parent = {"process": "fdm_process_test_common", "filament": "fdm_filament_test_pla"}[kind]
+    _preset(root, kind, parent, ["Bambu Lab X1 Carbon 0.4 nozzle"])
+    with pytest.raises(SlicerUnavailable, match=f"{kind} preset .* not made for"):
+        BambuStudioSlicer(slicer_settings).resolve_presets(_request())
+
+
+@pytest.mark.parametrize("kind", ["process", "filament"])
+def test_a_preset_made_for_another_machine_is_refused(
+    slicer_settings: SlicerSettings, kind: str
+) -> None:
+    root = slicer_settings.profiles_dir
+    assert root is not None
+    name = {
+        "process": "0.20mm Standard @BBL X1C",
+        "filament": "Bambu PLA Basic @BBL Test",
+    }[kind]
+    _preset(root, kind, name, ["Bambu Lab X1 Carbon 0.4 nozzle"])
+    slicer = BambuStudioSlicer(slicer_settings)
+
+    with pytest.raises(SlicerUnavailable, match=f"{kind} preset .* not made for"):
+        slicer.resolve_presets(_request())
+
+    # Listing the machine makes the same preset acceptable.
+    _preset(root, kind, name, ["Bambu Lab X1 Carbon 0.4 nozzle", "Bambu Lab Test 0.4 nozzle"])
+    slicer.resolve_presets(_request())
+
+
 def test_discard_stays_inside_the_work_dir(slicer_settings: SlicerSettings, tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         BambuStudioSlicer(slicer_settings).discard(tmp_path)
@@ -227,6 +355,63 @@ def test_an_stl_needs_a_material(slicing_client: TestClient) -> None:
     )
     assert response.status_code == 422
     assert "PLA" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("agent_mode", [False, True])
+def test_a1_agent_stl_intake_uses_a1_presets_without_printer_commands(
+    settings: Settings, slicer_settings: SlicerSettings, backend: FakeBackend,
+    tmp_path: Path, monkeypatch, agent_mode: bool,
+) -> None:
+    monkeypatch.setenv("BAMBU_EDGE_SHARED_SECRET", "test-edge-secret")
+    payload = settings.model_dump(mode="json")
+    printer = payload["printers"][0]
+    printer.update(id="bambu_a1_01", model="A1", agent_mode_eligible=True)
+    printer["profile"].update(plate="textured_plate", enclosure="open")
+    payload["dispatch"] = {"enabled": True, "require_verified_identity": True}
+    slicer_payload = slicer_settings.model_dump(mode="json")
+    machine = "Bambu Lab A1 0.4 nozzle"
+    process = "0.20mm Standard @BBL A1"
+    filament = "Generic PLA @BBL A1"
+    slicer_payload["machine_profiles"]["bambu_a1_01"] = {
+        "machine": machine, "process": process, "filaments": {"PLA": filament},
+    }
+    payload["slicer"] = slicer_payload
+    root = slicer_settings.profiles_dir
+    _preset(root, "machine", machine)
+    _preset(root, "process", process, [machine])
+    _preset(root, "filament", filament, [machine])
+    write_3mf(
+        tmp_path / "template.3mf", plate_gcode=SAMPLE_GCODE.replace("X1 Carbon", "A1"),
+        project_settings={"printer_model": "Bambu Lab A1"},
+    )
+    app = create_app(settings=Settings.model_validate(payload), backend_factory=lambda _d, _c: backend)
+    with TestClient(app) as client:
+        if agent_mode:
+            response = client.post(
+                "/printers/bambu_a1_01/agent-mode",
+                headers={"X-Edge-Auth": "test-edge-secret", "X-Auth-User": "admin", "X-Auth-Role": "admin"},
+                json={"enabled": True, "reason": "Enable fake-printer slicing test"},
+            )
+            assert response.status_code == 200
+        response = client.post(
+            "/submissions",
+            headers={"X-Edge-Auth": "test-edge-secret", "X-Auth-User": "test-agent", "X-Auth-Role": "agent", "X-Agent-Id": "test-agent"},
+            files={"file": ("coupon.stl", b"solid coupon\nendsolid\n", "model/stl")},
+            data={"target_machine": "bambu_a1_01", "material": "PLA"},
+        )
+        if agent_mode:
+            assert response.status_code == 201, response.text
+            job = response.json()
+            assert job["state"] == "queued"
+            assert job["artifact_kind"] == "3mf"
+            assert job["provenance"]["machine_preset"] == machine
+            assert job["provenance"]["process_preset"] == process
+            assert job["provenance"]["filament_preset"] == filament
+        else:
+            assert response.status_code == 403, response.text
+    assert backend.uploads == []
+    assert backend.start_commands == []
+    assert backend.snapshots == 0
 
 
 def test_stl_is_refused_where_slicing_is_off(client: TestClient) -> None:

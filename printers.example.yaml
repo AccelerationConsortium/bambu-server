@@ -65,11 +65,23 @@ slicer:
   profiles_dir: /home/you/.local/opt/bambu-studio/squashfs-root/resources/profiles/BBL
   work_dir: var/slicer
   timeout_s: 600
+  # Defaults for a printer that does not name its own process or filaments.
   process_profile: "0.20mm Standard @BBL X1C"
   filament_profiles:               # material a submitter names -> filament preset
     PLA: "Bambu PLA Basic @BBL X1C"
-  machine_profiles:                # printer id -> machine preset; others refuse .stl
+  # Printer id -> its presets; a printer not listed refuses .stl. A bare string
+  # is the machine preset alone, with the defaults above. A printer whose
+  # motion differs from the defaults' (an A1 bed-slinger against X1C presets)
+  # names its own `process` and `filaments`; its `filaments` replace the
+  # defaults rather than adding to them. A bundled preset that lists
+  # `compatible_printers` must list this machine, or slicing is refused.
+  machine_profiles:
     bambu_x1c_01: "Bambu Lab X1 Carbon 0.4 nozzle"
+    # bambu_a1_01:
+    #   machine: "Bambu Lab A1 0.4 nozzle"
+    #   process: "0.20mm Standard @BBL A1"
+    #   filaments:
+    #     PLA: "Bambu PLA Basic @BBL A1"
 
 printers:
   - id: bambu_x1c_01
