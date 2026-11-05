@@ -19,7 +19,12 @@ the Bambu printer gateway.
    the claim, an idle printer in no error state with no job in flight, an
    edge-verified caller -- an agent also needs the A1's agent mode on -- and the
    caller's statement `bed_path_clear: true` that no robot arm, hand or object
-   is in the bed's travel or above the plate. The caller names a position,
+   is in the bed's travel or above the plate. An agent may base that statement
+   on the operator's standing declaration (`bed_positions.arm_clear`, published
+   on the printer profile; Yang declared on 2026-11-05 that the arm is always
+   clear of the bed, reaching over the plate only while its agent holds the
+   A1's claim), on the arm's reported state, or on a person's statement for
+   that move. The caller names a position,
    never a coordinate; a refused or undelivered move is never retried and is
    never "fixed" by homing. Any other verb, a relaxed gate, or integration with
    `lab-skills` plan execution needs a new, explicitly approved design.

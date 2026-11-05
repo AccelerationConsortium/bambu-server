@@ -126,6 +126,10 @@ printers:
     # bed_positions:
     #   inspect_y_mm: 128
     #   pickup_y_mm: 250
+    #   arm_clear:                  # optional standing arm-clear declaration
+    #     declared_by: yang
+    #     declared_on: 2026-11-05
+    #     statement: "The arm is always clear of the A1's bed travel; it reaches over the plate only while its agent holds the A1's claim."
     profile:
       enclosure: open
       nozzle_diameter_mm: 0.4

@@ -171,10 +171,20 @@ position, never a coordinate. The response gives `position`, the configured
 `note`.
 
 - **Before you send it:** `bed_path_clear: true` states that the robot arm is
-  parked clear of the bed's travel and nothing stands above the plate. Send it
-  only after confirming that from the arm's own reported state, or from a
-  person's statement for that specific move. If you cannot confirm it, do not
-  move the bed. The A1 camera shows the bed, not the arm.
+  clear of the bed's travel and nothing stands above the plate. Confirm it
+  from one of: the operator's standing declaration on the printer profile
+  (`GET /printers/bambu_a1_01/profile`, `bed_positions.arm_clear`; on this
+  deployment Yang declared on 2026-11-05 that the arm is always clear of the
+  bed), the arm's own reported state, or a person's statement for that
+  specific move. Name the basis in `reason`, e.g. `"plate check; standing
+  arm-clear declaration 2026-11-05"`. If `arm_clear` is `null` and you have
+  neither of the others, do not move the bed. The A1 camera shows the bed,
+  not the arm.
+- **The standing declaration has one condition:** the arm may enter the bed's
+  travel (to take parts off) only while its agent holds the A1's claim, so no
+  bed move can start mid-pickup. An arm agent must claim `bambu_a1_01` before
+  reaching over the plate and release it once the arm is clear again. If you
+  see the claim held by someone else, do not move the bed.
 - **Gates:** the claim (423); an idle printer reporting no error and no
   gateway job in flight (412, and `position_bed` is missing from
   `allowed_actions`); an edge-verified identity (403); for an agent, A1 agent

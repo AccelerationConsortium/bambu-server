@@ -230,3 +230,32 @@ def test_the_backend_sends_a_y_only_absolute_move() -> None:
         with pytest.raises(PrinterCommandError):
             backend.move_bed_y(*bad)
     assert len(sent) == 1
+
+
+def test_the_profile_publishes_positions_and_the_arm_clear_declaration(
+    settings: Settings, backends: dict[str, FakeBackend], monkeypatch
+) -> None:
+    built = _settings(settings, monkeypatch)
+    payload = built.model_dump(mode="json")
+    a1 = next(p for p in payload["printers"] if p["id"] == A1)
+    a1["bed_positions"]["arm_clear"] = {
+        "declared_by": "yang", "declared_on": "2026-11-05",
+        "statement": "The arm is always clear of the A1's bed travel.",
+    }
+    app = create_app(
+        settings=Settings.model_validate(payload),
+        backend_factory=lambda definition, _c: backends[definition.id],
+    )
+    with TestClient(app) as test_client:
+        profile = test_client.get(f"/printers/{A1}/profile").json()
+        other = test_client.get(f"/printers/{X1}/profile").json()
+    positions = profile["bed_positions"]
+    assert (positions["inspect_y_mm"], positions["pickup_y_mm"]) == (128, 250)
+    assert positions["arm_clear"]["declared_by"] == "yang"
+    assert positions["arm_clear"]["declared_on"] == "2026-11-05"
+    assert other["bed_positions"] is None
+
+
+def test_without_a_declaration_the_profile_says_none(client: TestClient) -> None:
+    positions = client.get(f"/printers/{A1}/profile").json()["bed_positions"]
+    assert positions["arm_clear"] is None
