@@ -14,6 +14,12 @@ What the lab's rules ask of a control plane meets here:
   step that ends without the printer settling the question is ``failed`` with
   the uncertainty written down. Nothing here retries.
 
+``position_bed`` (approved by Yang on 2026-11-05, Bambu A1 only) moves the bed
+between two configured Y positions -- ``inspect`` so the camera sees the whole
+plate, ``pickup`` for the robot arm -- on an idle printer, under the claim, with
+the caller's affirmative statement that nothing is in the bed's path. It is a
+Y-only move: no X, no Z, no homing.
+
 Refusals never touch ``last_error`` (STATUS_SPEC §6.3).
 """
 
@@ -112,6 +118,32 @@ class LightResponse(BaseModel):
     on: bool
     requested_at: datetime
     note: str = "command delivered; the printer's light_state in /status confirms it"
+
+
+BedPosition = Literal["inspect", "pickup"]
+
+
+class PositionBedRequest(BaseModel):
+    position: BedPosition
+    #: Must be literally true: the caller states that no robot arm, hand or
+    #: object is in the bed's travel or standing above the plate.
+    bed_path_clear: Literal[True]
+    moved_by: str | None = Field(default=None, min_length=1, max_length=120)
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class PositionBedResponse(BaseModel):
+    printer_id: str
+    position: BedPosition
+    y_mm: float
+    requested_at: datetime
+    moved_by: str
+    moved_by_verified: bool
+    agent_id: str | None = None
+    note: str = (
+        "command delivered; the printer does not report bed position, so confirm "
+        "it with a camera snapshot before relying on it"
+    )
 
 
 class StopPrintResponse(BaseModel):
@@ -215,12 +247,59 @@ class ControlGate:
             ]
         return []
 
+    def position_bed_blockers(
+        self, monitor: PrinterMonitor, *, busy_with_dispatch: bool
+    ) -> list[dict[str, object]]:
+        """Only an idle, error-free printer with configured positions moves its bed."""
+
+        if monitor.definition.bed_positions is None:
+            return [
+                {
+                    "detail": "position_bed is not configured for this printer "
+                    "(approved for the Bambu A1 only)",
+                    "bed_positions": None,
+                }
+            ]
+        status = monitor.status()
+        if status.activity == "unknown":
+            return [
+                {
+                    "detail": "printer state is not determinable (telemetry missing or stale)",
+                    "activity": "unknown",
+                    "retry_after_s": 10,
+                }
+            ]
+        blockers: list[dict[str, object]] = []
+        if status.activity != "idle":
+            blockers.append(
+                {"detail": "the bed only moves on an idle printer", "activity": status.activity}
+            )
+        if status.equipment_status == "error":
+            blockers.append(
+                {
+                    "detail": "the printer reports an error; clear it on the printer first",
+                    "equipment_status": "error",
+                }
+            )
+        if busy_with_dispatch:
+            blockers.append(
+                {
+                    "detail": "the gateway is tracking a job on this printer",
+                    "gateway_job_in_flight": True,
+                }
+            )
+        return blockers
+
     def allowed_actions(self, monitor: PrinterMonitor, *, busy_with_dispatch: bool) -> list[str]:
         if not self.settings.enabled:
             return []
         actions = ["snapshot"]
         if not self.light_blockers(monitor):
             actions.append("light")
+        if monitor.definition.bed_positions is not None and not self.position_bed_blockers(
+            monitor, busy_with_dispatch=busy_with_dispatch
+        ):
+            actions.append("position_bed")
         if not self.start_print_blockers(monitor, busy_with_dispatch=busy_with_dispatch):
             actions.append("start_print")
         if not self.stop_print_blockers(monitor):
@@ -708,6 +787,76 @@ class Dispatcher:
         except PrinterCommandError as exc:
             raise ControlRefusal(502, {"detail": f"light command not delivered: {exc}"}) from exc
         return LightResponse(printer_id=printer_id, on=request.on, requested_at=datetime.now(UTC))
+
+    # -- position_bed --------------------------------------------------------
+
+    async def position_bed(
+        self,
+        printer_id: str,
+        request: PositionBedRequest,
+        *,
+        actor: Actor,
+        agent: AgentCaller,
+        claim_token: str | None,
+    ) -> PositionBedResponse:
+        """Move the bed to a named position. Never retried; never homes."""
+
+        control = self._control(printer_id)
+        self.require_claim(printer_id, claim_token)
+        monitor = self._monitors[printer_id]
+        positions = monitor.definition.bed_positions
+        if positions is None:
+            raise ControlRefusal(
+                412, self.gate.position_bed_blockers(monitor, busy_with_dispatch=False)[0]
+            )
+        who, verified = self._identity(actor, request.moved_by)
+        if self.settings.require_verified_identity and not verified:
+            raise ControlRefusal(
+                403, {"detail": "moving the bed requires an edge-verified identity"}
+            )
+        if agent.is_agent:
+            if self._agent_mode is None:
+                raise ControlRefusal(
+                    403, {"detail": "agent bed moves are not available", "agent_mode": "not_eligible"}
+                )
+            try:
+                self._agent_mode.require(printer_id, "bed move")
+            except AgentModeRefusal as exc:
+                raise ControlRefusal(exc.status, exc.body) from exc
+        if control.lock.locked():
+            raise ControlRefusal(
+                412, {"detail": "another control step is in progress on this printer"}
+            )
+        async with control.lock:
+            blockers = self.gate.position_bed_blockers(
+                monitor, busy_with_dispatch=self.busy(printer_id)
+            )
+            if blockers:
+                raise ControlRefusal(412, {**blockers[0], "blockers": blockers})
+            y_mm = positions.y_for(request.position)
+            try:
+                await asyncio.to_thread(
+                    self._backends[printer_id].move_bed_y, y_mm, positions.feed_mm_min
+                )
+            except PrinterCommandError as exc:
+                raise ControlRefusal(
+                    502, {"detail": f"bed move not delivered: {exc}; check the printer, do not retry"}
+                ) from exc
+        logger.info(
+            "Bed on %s moved to %s (Y%.1f) by %s%s%s",
+            printer_id, request.position, y_mm, who,
+            " (verified identity)" if verified else "",
+            f" as agent {agent.agent_id}" if agent.is_agent else "",
+        )
+        return PositionBedResponse(
+            printer_id=printer_id,
+            position=request.position,
+            y_mm=y_mm,
+            requested_at=datetime.now(UTC),
+            moved_by=who,
+            moved_by_verified=verified,
+            agent_id=agent.agent_id if agent.is_agent else None,
+        )
 
     # -- helpers -----------------------------------------------------------
 

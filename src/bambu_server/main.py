@@ -73,6 +73,8 @@ from .dispatch import (
     Dispatcher,
     LightRequest,
     LightResponse,
+    PositionBedRequest,
+    PositionBedResponse,
     SnapshotResponse,
     StartPrintRequest,
     StopPrintRequest,
@@ -1384,7 +1386,9 @@ def create_app(
         return camera
 
     if control_enabled:
-        _register_control_routes(app, get_monitor, get_actor, get_dispatcher, get_agent)
+        _register_control_routes(
+            app, get_monitor, get_actor, get_dispatcher, get_agent, get_events
+        )
         _register_camera_route(app, get_monitor, get_camera)
         if settings and settings.agent_workflow.vision_enabled:
             _register_advisory_bed_check(app, get_monitor, get_dispatcher, workflows)
@@ -1488,8 +1492,9 @@ def _register_control_routes(
     get_actor: Callable[..., Actor],
     get_dispatcher: Callable[[], Dispatcher],
     get_agent: Callable[..., AgentCaller],
+    get_events: Callable[[], EventHub],
 ) -> None:
-    """STATUS_SPEC §5 claims plus the four control verbs, per printer.
+    """STATUS_SPEC §5 claims plus the control verbs, per printer.
 
     Only called when the local config enables dispatch, so a deployment that
     has not opted in exposes no ``/control/`` path at all.
@@ -1642,6 +1647,49 @@ def _register_control_routes(
             )
         except ControlRefusal as exc:
             return _refusal(exc)
+
+    @app.post(
+        "/printers/{printer_id}/control/position_bed",
+        response_model=PositionBedResponse,
+        responses={
+            502: {"model": RefusalBody, "description": "Command not delivered."},
+            **control_responses,
+        },
+        tags=["control"],
+    )
+    async def control_position_bed(
+        monitor: Annotated[PrinterMonitor, Depends(get_monitor)],
+        actor: Annotated[Actor, Depends(get_actor)],
+        agent: Annotated[AgentCaller, Depends(get_agent)],
+        dispatcher: Annotated[Dispatcher, Depends(get_dispatcher)],
+        events: Annotated[EventHub, Depends(get_events)],
+        request: PositionBedRequest,
+        claim_token: Annotated[str | None, Header(alias=CLAIM_HEADER)] = None,
+    ) -> PositionBedResponse | JSONResponse:
+        """Move the bed to a named position: ``inspect`` (the camera sees the
+        whole plate) or ``pickup`` (where the arm takes parts off).
+
+        Approved 2026-11-05 for the Bambu A1 only. Needs the claim, an idle
+        printer, a verified identity (an agent also needs agent mode on), and
+        ``bed_path_clear: true``. A Y-only move -- no X, no Z, no homing. The
+        printer does not report bed position: confirm it with a snapshot.
+        Never retry a refused or undelivered move; check the printer first.
+        """
+
+        try:
+            moved = await dispatcher.position_bed(
+                monitor.definition.id, request, actor=actor, agent=agent,
+                claim_token=claim_token,
+            )
+        except ControlRefusal as exc:
+            return _refusal(exc)
+        note = f"bed moved to {moved.position} (Y{moved.y_mm:g}) by {moved.moved_by}"
+        if moved.agent_id:
+            note += f" (agent {moved.agent_id})"
+        if request.reason:
+            note += f": {request.reason.strip()}"
+        await events.publish("bed.moved", printer_id=moved.printer_id, note=note[:500])
+        return moved
 
     @app.post(
         "/printers/{printer_id}/control/stop_print",

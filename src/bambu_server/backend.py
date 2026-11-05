@@ -178,6 +178,8 @@ class PrinterBackend(Protocol):
 
     def set_chamber_light(self, on: bool) -> None: ...
 
+    def move_bed_y(self, y_mm: float, feed_mm_min: int) -> None: ...
+
     def current_job_file(self) -> str | None: ...
 
     def snapshot(self, timeout_s: float = 10.0) -> bytes: ...
@@ -331,6 +333,26 @@ class BambuLabsBackend:
                     "loop_times": 0,
                     "interval_time": 0,
                     "sequence_id": "10000001",
+                }
+            }
+        )
+
+    def move_bed_y(self, y_mm: float, feed_mm_min: int) -> None:
+        """Move the Y axis only (on a bed-slinger, the bed), in absolute mode.
+
+        Exactly two gcode lines, built here from numbers: no X, no Z, no
+        homing, no heat, no extrusion. Approved 2026-11-05 for the A1's
+        ``position_bed`` verb; :mod:`bambu_server.dispatch` gates every call.
+        """
+
+        if not (0 <= y_mm <= 256) or not (300 <= feed_mm_min <= 6000):
+            raise PrinterCommandError("bed move out of range")
+        self._publish(
+            {
+                "print": {
+                    "command": "gcode_line",
+                    "param": f"G90\nG1 Y{y_mm:.1f} F{int(feed_mm_min)}\n",
+                    "sequence_id": "10000002",
                 }
             }
         )

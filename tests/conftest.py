@@ -123,6 +123,8 @@ class FakeBackend:
         self.start_commands: list[StartPrintCommand] = []
         self.stop_calls = 0
         self.light_calls: list[bool] = []
+        self.bed_moves: list[tuple[float, int]] = []
+        self.fail_bed_move = False
         self.snapshots = 0
         self.fail_upload = False
         self.fail_snapshot = False
@@ -163,6 +165,11 @@ class FakeBackend:
     def set_chamber_light(self, on: bool) -> None:
         self.light_calls.append(on)
         self.reading = replace(self.reading, light_state="on" if on else "off")
+
+    def move_bed_y(self, y_mm: float, feed_mm_min: int) -> None:
+        if self.fail_bed_move:
+            raise PrinterCommandError("the MQTT broker did not confirm the command")
+        self.bed_moves.append((y_mm, feed_mm_min))
 
     def current_job_file(self) -> str | None:
         return self.job_file

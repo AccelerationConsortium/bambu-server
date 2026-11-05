@@ -120,6 +120,12 @@ printers:
     # (POST /printers/bambu_a1_01/agent-mode). The switch itself starts off.
     # Accepted on a Bambu A1 only; any other model fails config validation.
     agent_mode_eligible: true
+    # Named bed positions for POST /control/position_bed (approved 2026-11-05,
+    # A1 only): `inspect` where the camera sees the whole plate, `pickup` where
+    # the arm takes parts off (keep equal to the slicer's end_bed_y_mm).
+    # bed_positions:
+    #   inspect_y_mm: 128
+    #   pickup_y_mm: 250
     profile:
       enclosure: open
       nozzle_diameter_mm: 0.4

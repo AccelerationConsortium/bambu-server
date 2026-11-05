@@ -16,7 +16,8 @@ a printer.
 
 By default the service is **monitoring-only** and exposes no control endpoints.
 A deployment that sets `dispatch.enabled` gets a narrow control plane: claims
-plus four verbs (camera snapshot, chamber light, start an approved job, stop),
+plus five verbs (camera snapshot, chamber light, start an approved job, stop,
+and — on the Bambu A1 only — moving the bed to a named position),
 behind the gates described in [Control plane](#control-plane). A person
 confirms the plate is empty before every start, except on a printer whose
 **agent mode** an admin has switched on — approved 2026-11-02 for the Bambu A1
@@ -489,7 +490,7 @@ Slicing and submission do not claim, upload to, or start the physical printer.
 ### Control plane
 
 Off unless `dispatch.enabled` is set. When on, each printer gets STATUS_SPEC
-v1.1 claims and four verbs under `/printers/{id}/control/`:
+v1.1 claims and five verbs under `/printers/{id}/control/`:
 
 | Route | What it does |
 |---|---|
@@ -498,6 +499,17 @@ v1.1 claims and four verbs under `/printers/{id}/control/`:
 | `light` | Switch the chamber light (`{"on": true}`), e.g. before a snapshot. No motion, no heat. |
 | `start_print` | Upload an approved job's `.3mf` and start it. |
 | `stop_print` | Stop the job in flight. |
+| `position_bed` | Bambu A1 only (approved 2026-11-05): move the bed to `inspect` (camera sees the whole plate) or `pickup` (where the arm takes parts). |
+
+`position_bed` takes `{"position": "inspect" | "pickup", "bed_path_clear": true}`
+and moves the bed to the Y configured under the printer's `bed_positions`
+(`inspect_y_mm`, `pickup_y_mm`; keep `pickup_y_mm` equal to the slicer's
+`end_bed_y_mm`). It sends exactly `G90` / `G1 Y<y> F<feed>` -- no X, no Z, no
+homing -- and is refused (412) unless the printer is idle, error-free and not
+running a gateway job; it needs an edge-verified caller, and an agent also needs
+agent mode on. Each move emits a `bed.moved` event. The printer does not report
+bed position, so confirm it with a snapshot; a refused or undelivered move
+(502) is never retried. Config accepts `bed_positions` on an A1 only.
 
 `start_print` is refused (412, a body naming the failed gate) unless the printer
 is observable, idle, not in a failed state and cold (`safe_bed_c`,

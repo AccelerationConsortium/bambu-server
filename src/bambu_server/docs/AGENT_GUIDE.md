@@ -101,6 +101,15 @@ stop command for a running print.
 2. Read the printer's status and `allowed_actions`. These are current device
    preconditions, not a complete job-specific authorization. A listed
    `start_print` does not mean that the build plate is clear.
+   On the A1 the previous print leaves the bed parked forward for pickup,
+   where the camera cannot see the front of the plate. Before the snapshot,
+   move it into view: `POST /printers/bambu_a1_01/control/position_bed` with
+   `{"position": "inspect", "bed_path_clear": true}`. Send
+   `bed_path_clear: true` only after confirming the robot arm is parked clear
+   of the bed's travel and nothing stands above the plate. If the move is
+   refused or returns 502, stop and ask a person; never retry it. For pickup,
+   `{"position": "pickup", ...}` returns the bed to where the arm expects it
+   (`bed_park_y_mm` on `pickup-targets`).
 3. Take `POST /printers/{id}/control/snapshot` under that claim. Inspect the
    returned image itself and retain its token. If an object is present, the
    plate is obscured, or the image is unclear, record occupied/unknown,

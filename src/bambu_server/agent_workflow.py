@@ -34,6 +34,7 @@ EventType = Literal[
     "job.cancelled",
     "job.cooled",
     "gateway.restarted",
+    "bed.moved",
 ]
 
 #: Terminal job state to the event announcing it.
