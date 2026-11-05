@@ -89,6 +89,11 @@ does not affect validation or establish physical spool identity after a swap.
 `POST /submissions` accepts an artifact (`.3mf`, `.gcode`, or `.stl` where
 slicing is enabled for the target; `.stl` requires `material`) and metadata,
 validates it, and queues passing jobs. A sliced job carries `provenance`.
+For an `.stl`, optional `placement` is `auto` (default: the slicer centres the
+part) or `front_left` (the part's footprint `slicer.placement_margin_mm`,
+default 10 mm, in from the front-left corner of the printable area, resting on
+the plate, orientation unchanged). A part that does not fit there is refused
+with 422; `placement` on a `.3mf` or `.gcode` is refused with 422.
 Approval and cancellation update gateway records only, and approval alone does
 not establish a filament-to-slot mapping or sufficient remaining quantity.
 
@@ -178,7 +183,13 @@ the file does not say. There is no robot frame; the arm agent owns calibration.
 `GET /submissions/{id}/pickup-targets` returns those objects with
 `bed_size_mm`, `pickup: {bed_temperature_c, safe_bed_temperature_c, cooled,
 observed_at}` from the monitor's cache, and `ready` (finished, cooled, and at
-least one object). It never contacts a printer or a robot.
+least one object). It never contacts a printer or a robot. `bed_park_y_mm` is
+the Y axis position the job's end gcode left the bed at, when the gateway set
+it while slicing (`slicer.machine_profiles.<id>.end_bed_y_mm`); `null` means
+unknown (the stock end move, or a file sliced elsewhere). Object positions are
+in the bed's own frame and move with the bed: on a bed-slinger such as the A1,
+parking at Y 250 instead of the stock Y 180 puts every object 70 mm further
+toward the front of the printer.
 
 `GET /events?after=<event_id>` is a pollable lifecycle feed: `job.started`,
 `job.finished`, `job.failed`, `job.rejected`, `job.cancelled`, `job.cooled`

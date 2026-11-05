@@ -170,6 +170,12 @@ class SliceProvenance(BaseModel):
     machine_preset: str
     process_preset: str
     filament_preset: str
+    #: Where the mesh was put on the plate: ``auto`` (the slicer arranged it)
+    #: or ``front_left``. The job's object positions say where it landed.
+    placement: str = "auto"
+    #: The Y axis position the end gcode parks the bed at for pickup, when the
+    #: gateway set it; None means the stock end move was left as it was.
+    end_bed_y_mm: float | None = None
     warnings: list[str] = Field(default_factory=list)
 
 

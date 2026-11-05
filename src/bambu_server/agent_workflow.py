@@ -233,5 +233,10 @@ class PickupInfo(BaseModel):
     ready: bool
     reason: str
     bed_size_mm: tuple[float, float] | None = None
+    #: The Y axis position the job's end gcode parked the bed at, when the
+    #: gateway set it while slicing. Object positions are in the bed's own
+    #: frame and move with it, so the arm needs this to find them; None means
+    #: unknown (the stock end move, or a file sliced elsewhere).
+    bed_park_y_mm: float | None = None
     pickup: PickupReadiness
     objects: list[ObjectPosition] = Field(default_factory=list)
