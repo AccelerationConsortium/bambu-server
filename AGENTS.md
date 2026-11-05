@@ -19,7 +19,8 @@ telemetry into one STATUS_SPEC v1.0 HTTP surface per configured printer.
 
 Monitoring is the default. A human approved (2026-10-04) a narrow,
 human-in-the-loop control plane, enabled per deployment by `dispatch.enabled`:
-STATUS_SPEC v1.1 claims plus exactly four verbs -- camera snapshot, chamber
+STATUS_SPEC v1.1 claims plus exactly four verbs (and, since 2026-11-05, a
+fifth on the A1 only; see below) -- camera snapshot, chamber
 light (added 2026-10-05), `start_print` for an approved job after a person
 confirms the plate is empty, and `stop_print`. On 2026-10-20 a human approved
 the external spool (`vt_tray`) as a `start_print` mapping target for printers

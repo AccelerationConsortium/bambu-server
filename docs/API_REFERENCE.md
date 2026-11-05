@@ -35,9 +35,13 @@ the routes enabled in a deployment.
 | Optional vision advisory | `POST /printers/{id}/bed-check` (dispatch and vision enabled) |
 | Documentation | `GET /docs`, `/openapi.json`, `/agent-docs`, `/agent-docs/api-reference`, `/docs/agent`, `/llms.txt` |
 
-Agents use the SDK for printer I/O. An occupied or unclear claimed snapshot
-means release the claim and stop; never send a start request to test the gate.
-Failed or uncertain dispatches require human reconciliation, without retries.
+Until `lab-skills` merges its Bambu skills (ac-organic-lab PR #98), the lab
+rules (`AGENTIC_LAB_DESIGN.md` §1.3) let an agent drive only the A1 agent-mode
+workflow, `position_bed` included, directly on this API through the
+authenticated edge; see the [agent guide](../src/bambu_server/docs/AGENT_GUIDE.md).
+An occupied or unclear claimed snapshot means release the claim and stop;
+never send a start request to test the gate. Failed or uncertain dispatches
+and undelivered bed moves require human reconciliation, without retries.
 
 ## Printer inventory
 
@@ -115,6 +119,20 @@ failed gate; `allowed_actions` on `/status` mirrors them, and
 the camera frame a start was confirmed against. Without dispatch enabled the
 control routes are absent; the stored plate-evidence route remains registered.
 
+**Bed positioning (Bambu A1 only).** `POST /printers/bambu_a1_01/control/position_bed`
+with the claim token and `{"position": "inspect" | "pickup", "bed_path_clear": true,
+"reason"?: "..."}` moves the bed along Y only to the configured position
+(`bed_positions` on the printer: `inspect_y_mm`, where the camera sees the
+whole plate, and `pickup_y_mm`, kept equal to the slicer's `end_bed_y_mm`).
+It returns `{printer_id, position, y_mm, requested_at, moved_by,
+moved_by_verified, agent_id, note}`. Refusals: 423 without the claim; 412 when
+the printer is not idle, reports an error, has a gateway job in flight, or has
+no `bed_positions` (every printer but the A1); 403 for an unverified caller, or
+an agent while agent mode is off; 422 when `bed_path_clear` is not `true` or
+the position is unknown; 502 when the command was not delivered (never retry).
+The printer does not report bed position, so confirm with a snapshot. A
+delivered move emits `bed.moved`.
+
 **Camera snapshot for a plate check.** `POST /printers/{id}/control/snapshot`
 with the claim token returns `{token, printer_id, captured_at, sha256,
 content_type: "image/jpeg", image_base64}`. The token is valid for that printer
@@ -132,7 +150,8 @@ authenticated surface. Never send secrets or printer addresses in submissions.
 
 Approved 2026-11-02 for `bambu_a1_01`. An agent is a request carrying
 `X-Agent-Id`, or whose edge-verified role is in `dispatch.agent_roles`
-(default `agent`). Agents may submit, approve and start only on a printer with
+(default `agent`). Agents may submit, approve, move the bed (`position_bed`)
+and start only on a printer with
 `agent_mode_eligible: true` (config accepts it on a Bambu A1 only) whose switch
 is on; otherwise 403 with `agent_mode: "not_eligible"` or `"off"`.
 
@@ -195,8 +214,9 @@ parking at Y 250 instead of the stock Y 180 puts every object 70 mm further
 toward the front of the printer.
 
 `GET /events?after=<event_id>` is a pollable lifecycle feed: `job.started`,
-`job.finished`, `job.failed`, `job.rejected`, `job.cancelled`, `job.cooled`
-and `gateway.restarted`, each with `schema_version`, `event_id`,
+`job.finished`, `job.failed`, `job.rejected`, `job.cancelled`, `job.cooled`,
+`bed.moved` (printer id and a note naming the position, Y, who and why) and
+`gateway.restarted`, each with `schema_version`, `event_id`,
 `gateway_id`, `boot_id`, `submission_id`, `printer_id`, `state`,
 `updated_at`, `eln_project`, `note`, and for job events the bed-frame
 `object_positions`; `job.finished` and `job.cooled` add `pickup`. Ids persist
