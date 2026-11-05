@@ -1,10 +1,12 @@
 # Bambu gateway: operating guide for agents
 
 This gateway monitors multiple Bambu printers and, where enabled, provides
-claimed camera snapshots, chamber-light control, print starts and print stops.
-Each printer's primary operation is printing a job; the aggregate gateway
-has no physical operation of its own. It does not home, jog, heat on demand,
-calibrate a robot or move a robot. Monitoring never starts or stops a print.
+claimed camera snapshots, chamber-light control, print starts and print stops,
+and on the Bambu A1 only, moving the bed between two named positions
+(`position_bed`). Each printer's primary operation is printing a job; the
+aggregate gateway has no physical operation of its own. It does not home, jog,
+move any other axis, heat on demand, calibrate a robot or move a robot.
+Monitoring never starts or stops a print.
 
 [API reference]({{root}}agent-docs/api-reference) ·
 [OpenAPI]({{root}}openapi.json) · [Read-only Swagger]({{root}}docs) ·
@@ -17,13 +19,22 @@ to execute hardware actions. Agents respect live claims and preconditions and
 never bypass a refusal. Registration in the lab plan executor is a separate
 approval; these endpoints do not add it.
 
-**How printer I/O is routed.** `lab-skills` has no Bambu skill yet. Until it
-does, the lab rules (`AGENTIC_LAB_DESIGN.md` §1.3, *Bambu A1 agent mode*)
-allow exactly one route: the A1 agent-mode workflow below, called directly on
-this gateway's HTTP API through the authenticated edge. No other printer may
-be driven by an agent, and nothing beyond that workflow is allowed on the A1.
-When a Bambu skill lands in `lab-skills`, this exemption ends and the same
-steps go through the SDK.
+**How printer I/O is routed.** `lab-skills` has no merged Bambu skill yet
+(ac-organic-lab PR #98 adds `snapshot`, `position_bed` and `start_print` for
+the A1). Until it is merged, the lab rules (`AGENTIC_LAB_DESIGN.md` §1.3,
+*Bambu A1 agent mode* and *Bambu A1 bed positioning*, the latter added
+2026-11-05) allow exactly one route: the A1 agent-mode workflow below,
+including `position_bed`, called directly on this gateway's HTTP API through
+the authenticated edge. No other printer may be driven by an agent, and
+nothing beyond that workflow is allowed on the A1. When the Bambu skill lands
+in `lab-skills`, this exemption ends and the same steps go through the SDK.
+
+**The A1 agent loop at a glance.** Submit (optionally an `.stl` with
+`placement=front_left`) → check the validation and object positions → approve
+→ claim → `position_bed` to `inspect` → claimed snapshot → your plate decision
+→ `start_print` → release → wait for `job.finished` (the print's own end gcode
+parks the bed at the pickup position) → wait for `job.cooled` → hand
+`pickup-targets` to the arm agent. Each step is described below.
 
 ## Find the printer and establish identity
 
@@ -43,7 +54,8 @@ For the dashboard assistant's SDK documentation discovery, request
    session or manufacture edge identity headers.
 4. Read `/printers/{id}/agent-mode`. Eligibility is static configuration;
    `enabled` is the audited admin switch. Only the approved Bambu A1 workflow
-   (`bambu_a1_01`) may use agent submission, approval and autonomous plate checks.
+   (`bambu_a1_01`) may use agent submission, approval, bed positioning and
+   autonomous plate checks.
    H2D and P1S keep their human-in-the-loop rules. An agent cannot flip the
    switch, even if its request carries an admin role.
 
@@ -97,34 +109,34 @@ stop command for a running print.
 
 1. Acquire `/printers/{id}/control/claim` (see *How printer I/O is routed*) and keep the claim
    alive with `heartbeat`. Send its `X-Claim-Token` on every control request.
-   Never take over another session's claim; release yours on exit.
+   Never take over another session's claim; release yours on exit. Hold one
+   claim for the whole sequence: a snapshot is valid only under the claim it
+   was taken with.
 2. Read the printer's status and `allowed_actions`. These are current device
    preconditions, not a complete job-specific authorization. A listed
    `start_print` does not mean that the build plate is clear.
-   On the A1 the previous print leaves the bed parked forward for pickup,
-   where the camera cannot see the front of the plate. Before the snapshot,
-   move it into view: `POST /printers/bambu_a1_01/control/position_bed` with
-   `{"position": "inspect", "bed_path_clear": true}`. Send
-   `bed_path_clear: true` only after confirming the robot arm is parked clear
-   of the bed's travel and nothing stands above the plate. If the move is
-   refused or returns 502, stop and ask a person; never retry it. For pickup,
-   `{"position": "pickup", ...}` returns the bed to where the arm expects it
-   (`bed_park_y_mm` on `pickup-targets`).
-3. Take `POST /printers/{id}/control/snapshot` under that claim. Inspect the
+3. On the A1, move the bed into the camera's view first (see *Bed
+   positioning* below): a finished print leaves the bed parked forward for
+   pickup, where the camera cannot see the front of the plate, and
+   front-left parts sit exactly there. Send `position_bed` with
+   `{"position": "inspect", "bed_path_clear": true, "reason": "..."}`, then
+   wait a few seconds for the move to finish before the snapshot.
+4. Take `POST /printers/{id}/control/snapshot` under that claim. Inspect the
    returned image itself and retain its token. If an object is present, the
    plate is obscured, or the image is unclear, record occupied/unknown,
    release the claim and stop. Do not send a start request to test a known
    occupied plate. Ask a person to inspect/remove the object, then obtain
    fresh evidence before any later attempt.
-4. Only after a clear decision, call `/printers/{id}/control/start_print` with the
+5. Only after a clear decision, call `/printers/{id}/control/start_print` with the
    approved submission, `plate_check_method: agent_camera`, that snapshot
    token, an affirmative empty-plate decision, its rationale, and an explicit
    mapping for every filament. The snapshot must be from the same printer and
    claim, normally no older than 120 seconds (deployment-configurable).
-5. Inspect the returned job state. A successful HTTP response can carry a
+6. Inspect the returned job state. A successful HTTP response can carry a
    failed job if running could not be confirmed. Never automatically repeat
    a failed, timed-out, disconnected or uncertain dispatch. Preserve the
    evidence and ask a person to reconcile the printer first.
+7. Release the claim. The print runs without it.
 
 The gateway still requires a reachable, observable, idle, cold printer; a
 declared matching build plate; successful artifact revalidation; suitable
@@ -139,6 +151,44 @@ supported by this gateway; its human plate check must be in person.
 The optional `/bed-check` compares an existing claimed snapshot with an
 operator reference. Its output is advisory and never substitutes for the
 agent's own visual decision.
+
+## Bed positioning (Bambu A1 only)
+
+`POST /printers/bambu_a1_01/control/position_bed` moves the bed along Y only,
+in absolute mode (`G90` / `G1 Y<y> F<feed>`), to one of two positions the
+deployment configures. Approved by Yang on 2026-11-05 (bambu-server PR #12)
+and allowed for agents by `AGENTIC_LAB_DESIGN.md` §1.3 (ac-organic-lab #103).
+
+| Position | Use |
+|---|---|
+| `inspect` | The camera sees the whole plate. Use it before the plate-check snapshot. |
+| `pickup` | Where the robot arm takes parts off. A finished print already parks the bed here through its end gcode, so call it only to return the bed after an `inspect`. |
+
+Request body: `position` (`inspect` or `pickup`), `bed_path_clear` (must be
+literally `true`) and an optional `reason`, which is recorded. You name a
+position, never a coordinate. The response gives `position`, the configured
+`y_mm`, `requested_at`, `moved_by`, `moved_by_verified`, `agent_id` and a
+`note`.
+
+- **Before you send it:** `bed_path_clear: true` states that the robot arm is
+  parked clear of the bed's travel and nothing stands above the plate. Send it
+  only after confirming that from the arm's own reported state, or from a
+  person's statement for that specific move. If you cannot confirm it, do not
+  move the bed. The A1 camera shows the bed, not the arm.
+- **Gates:** the claim (423); an idle printer reporting no error and no
+  gateway job in flight (412, and `position_bed` is missing from
+  `allowed_actions`); an edge-verified identity (403); for an agent, A1 agent
+  mode on (403 with `agent_mode`). Any other printer answers 412: the verb is
+  configured on the A1 only.
+- **After it:** the printer does not report bed position. Confirm the move
+  with a claimed snapshot before relying on it. On 2026-11-05 the A1 accepted
+  the move straight after a finished print, without homing, and `inspect`
+  showed the whole plate.
+- **Failure:** a refusal or a 502 (command not delivered) means stop and ask a
+  person. Never retry the move, never "fix" it by homing or any other command,
+  and never use it as a recovery step.
+- Each delivered move emits a `bed.moved` event naming the position, the Y,
+  who moved it and the reason.
 
 ## External spool and color labels
 
@@ -158,7 +208,9 @@ is an estimate or unknown; approval does not prove sufficient quantity.
 
 ## Observe completion, cooling and records
 
-Use the job record and `/events?after=<event_id>` for lifecycle changes.
+Use the job record and `/events?after=<event_id>` for lifecycle changes:
+`job.started`, `job.finished`, `job.failed`, `job.rejected`, `job.cancelled`,
+`job.cooled`, `bed.moved` and `gateway.restarted`.
 `job.started` is not completion; wait for `job.finished` or a terminal failure.
 Event IDs persist across restarts. Save the event cursor; do not turn event
 delivery into an automatic command retry.
@@ -172,9 +224,12 @@ never commands the arm. Unknown positions are an empty list, never a guess.
 On the A1 the bed itself moves in Y, so bed coordinates do not fix a world
 position on their own: `bed_park_y_mm` says where the job's end gcode parked
 the bed (`null` when unknown, e.g. the stock Y 180 end move). A larger value
-puts the plate, and every object on it, that much further toward the front.
-After the print the bed motors are released, so the bed can be pushed; check
-it has not moved before relying on it.
+puts the plate, and every object on it, that much further toward the front;
+on this deployment the park is Y 250, 70 mm forward of stock. After the print
+the bed motors are released, so the bed can be pushed. If anything moved the
+bed since the print (an `inspect` move, a person), return it with
+`position_bed` `pickup` and check it with a snapshot before the arm relies on
+it. A front-left part is out of the camera's view at the pickup position.
 
 `/submissions/{id}/artifact` returns the exact stored bytes and SHA-256 ETag.
 `/result` returns the durable versioned bundle; `final: false` means the job is
@@ -200,11 +255,11 @@ with `last_error.code: print_failed`. `activity` separately reports `idle`,
 | 403 | Identity/admin requirement or agent mode refused the action. Do not impersonate a person or flip the switch. |
 | 404 | Unknown job/printer/resource, or a route disabled in this deployment. Inspect OpenAPI. |
 | 409 | Claim/job state conflict or ineligible admin toggle. Respect the holder/state. |
-| 412 | A dispatch precondition failed; the body names the gate, and may include Retry-After. Do not change parameters to evade it. |
+| 412 | A dispatch or bed-move precondition failed; the body names the gate, and may include Retry-After. Do not change parameters to evade it. |
 | 423 | Missing, stale or wrong claim token on a hard-enforced control action. |
 | 422 | Invalid request or failed slicing; inspect the response. |
 | 501 | Unsupported snapshot model, including H2D. |
-| 502 / 503 | Camera/upstream failure or a service component unavailable. A failed camera check is not a clear plate. |
+| 502 / 503 | Camera/upstream failure, an undelivered bed move or printer command, or a service component unavailable. A failed camera check is not a clear plate; an undelivered move is never retried. |
 
 Refusal envelopes can carry gate-specific fields alongside `detail`; FastAPI
 request validation uses its standard structured `detail` list. OpenAPI names
@@ -215,6 +270,7 @@ Background monitoring reconnects independently of HTTP reads. Gateway shutdown
 does not stop the physical printer. A restart loses active claims and can
 record an interrupted dispatch as failed/uncertain; it never authorizes replay.
 Cooldown event watching does not resume after restart, so poll pickup readiness.
-Turning agent mode off blocks subsequent agent submissions, approvals and
-starts; it does not stop an already-running print. Operator inspection resolves
-ambiguous outcomes; never home or move the bed as a recovery step.
+Turning agent mode off blocks subsequent agent submissions, approvals, bed
+moves and starts; it does not stop an already-running print. Operator
+inspection resolves ambiguous outcomes; never home or move the bed as a
+recovery step (`position_bed` is for the plate check and pickup only).

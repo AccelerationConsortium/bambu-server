@@ -48,8 +48,9 @@ def api_reference(schema: dict[str, Any], root: str = "../") -> str:
         "",
         "Paths are relative to the gateway. Browser clients use the authenticated `/bambu` "
         "edge prefix. The dashboard documentation proxy is read-only and cannot execute "
-        "these operations. lab-skills has no Bambu skill yet; until it does, agents may "
-        "drive only the A1 agent-mode workflow here, as the operating guide describes.",
+        "these operations. lab-skills has no merged Bambu skill yet; until it does, agents "
+        "may drive only the A1 agent-mode workflow here (position_bed included), as the "
+        "operating guide describes.",
         "",
         "## Endpoints",
         "",

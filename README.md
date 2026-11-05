@@ -23,8 +23,9 @@ confirms the plate is empty before every start, except on a printer whose
 **agent mode** an admin has switched on — approved 2026-11-02 for the Bambu A1
 (`bambu_a1_01`) only — where an agent may decide from a claimed camera
 snapshot ([Agent mode](#agent-mode-bambu-a1-only)). The third-party library's
-other command methods remain unreachable. Control is not yet exposed as
-`lab-skills` skills.
+other command methods remain unreachable. Control is not yet exposed as merged
+`lab-skills` skills (ac-organic-lab PR #98 adds the A1's); until then the lab
+rules let agents use the A1 agent-mode workflow on this API directly.
 
 Every job keeps a durable, schema-versioned **result bundle** and its exact
 artifact on the gateway's disk. Filing a record in the ELN is optional and goes
@@ -182,7 +183,8 @@ sliced) plate is reported.
 **Events.** `GET /events?after=<event_id>` (or the webhooks in
 `agent_workflow.event_webhook_urls`) delivers `job.started`, one event per
 terminal state (`job.finished`, `job.failed`, `job.rejected`,
-`job.cancelled`), `job.cooled`, and `gateway.restarted`. Each event carries
+`job.cancelled`), `job.cooled`, `bed.moved` (A1 `position_bed`), and
+`gateway.restarted`. Each event carries
 `schema_version`, `event_id`, `gateway_id`, `boot_id`, `submission_id`,
 `printer_id`, `state`, `updated_at`, `eln_project` and `note`. Event ids are
 zero-padded decimals that keep increasing across restarts (they are kept in
@@ -201,18 +203,26 @@ logged and never affect a job.
 
 **End-to-end for an agent:**
 
-1. `POST /submissions` (sliced `.3mf`, `target_machine`, optional `eln_project`).
+1. `POST /submissions` (sliced `.3mf`, or an `.stl` with `material` and
+   optionally `placement=front_left`; `target_machine`; optional `eln_project`).
 2. Approval: a person approves — or, on the A1 in agent mode, the agent.
 3. `POST /printers/{id}/control/claim`, then keep it alive with `heartbeat`.
-4. Plate check: a person confirms (`in_person` / `printer_camera`) — or, in
+4. On the A1, `POST /printers/bambu_a1_01/control/position_bed`
+   `{"position": "inspect", "bed_path_clear": true}` once the arm is confirmed
+   clear, because the last print left the bed parked forward out of the
+   camera's view.
+5. Plate check: a person confirms (`in_person` / `printer_camera`) — or, in
    agent mode, the agent takes `POST /printers/{id}/control/snapshot`, judges
    the returned `image_base64` itself, and keeps the `token`.
-5. `POST /printers/{id}/control/start_print` (see [Agent mode](#agent-mode-bambu-a1-only)).
-6. Wait for `job.finished` (or `job.failed`) on `/events` or a webhook.
-7. Wait for cool-down: `job.cooled`, or poll
+6. `POST /printers/{id}/control/start_print` (see [Agent mode](#agent-mode-bambu-a1-only)),
+   then release the claim.
+7. Wait for `job.finished` (or `job.failed`) on `/events` or a webhook. The
+   A1's end gcode parks the bed at `end_bed_y_mm` (Y 250 here) for pickup.
+8. Wait for cool-down: `job.cooled`, or poll
    `GET /submissions/{id}/pickup-targets` until `ready`.
-8. Hand the bed-frame `objects` to the arm agent, which applies its own
-   calibration. The bundle at `/submissions/{id}/result` keeps the record.
+9. Hand the bed-frame `objects` and `bed_park_y_mm` to the arm agent, which
+   applies its own calibration. The bundle at `/submissions/{id}/result` keeps
+   the record.
 
 `agent_workflow.vision_enabled` adds an optional, dependency-light advisory
 check, `POST /printers/{id}/bed-check`, that compares a claimed snapshot with an
@@ -224,7 +234,8 @@ decision.
 ### Agent mode (Bambu A1 only)
 
 Approved by Yang on 2026-11-02. With the switch on, an agent may submit,
-approve and start jobs on the Bambu A1, deciding itself that the plate is empty.
+approve and start jobs on the Bambu A1, deciding itself that the plate is empty,
+and (approved 2026-11-05) move its bed with `position_bed`.
 Everywhere else, and on the A1 with the switch off, agents are refused and the
 human-in-the-loop path is unchanged.
 
@@ -245,8 +256,8 @@ human-in-the-loop path is unchanged.
   verified identity and the agent id are both recorded
   (`requested_by_agent`, `approved_by_agent`, `dispatch.dispatched_by_agent`).
 - **Refusals** are 403 with `agent_mode: "not_eligible"` (any printer but the
-  A1) or `agent_mode: "off"` (switch off), for agent submissions, approvals and
-  starts.
+  A1) or `agent_mode: "off"` (switch off), for agent submissions, approvals,
+  bed moves and starts.
 
 An agent's start, on the A1 with the switch on:
 

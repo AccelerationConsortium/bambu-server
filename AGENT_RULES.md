@@ -46,7 +46,9 @@ the Bambu printer gateway.
    decide the plate is empty from a camera snapshot it took under its claim
    (`plate_check_method: agent_camera`, frame at most
    `dispatch.agent_snapshot_max_age_s` old, deciding agent and rationale
-   recorded, frame archived with its SHA-256). The switch is off by default,
+   recorded, frame archived with its SHA-256). Under the same switch, approved
+   2026-11-05, it may also move the bed with `position_bed` as rule 1 allows
+   (`AGENTIC_LAB_DESIGN.md` §1.3, *Bambu A1 bed positioning*). The switch is off by default,
    only an admin can flip it, and every flip is audited. Nothing else changes:
    on every other printer, and on the A1 with the switch off, the rule above
    holds in full, and no agent ever retries a failed or uncertain dispatch.
