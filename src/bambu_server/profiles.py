@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar
 from pydantic import BaseModel, Field
 
 from .backend import EXTERNAL_SPOOL_ID
-from .config import AmsPolicy, MachineLimits, PrinterDefinition, TrayColorLabel
+from .config import AmsPolicy, BedPositions, MachineLimits, PrinterDefinition, TrayColorLabel
 from .filament_colors import ColorSource, tray_color_label
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -120,6 +120,9 @@ class MachineProfile(BaseModel):
     chamber_temperature_c: float | None = None
     limits: MachineLimits = Field(default_factory=MachineLimits)
     ams: AmsPolicy = Field(default_factory=AmsPolicy)
+    #: Named positions for ``position_bed`` (Bambu A1 only) and the operator's
+    #: standing arm-clear declaration, when made; None where the verb is absent.
+    bed_positions: BedPositions | None = None
     observed: ObservedMachineState = Field(default_factory=ObservedMachineState)
     warnings: list[str] = Field(default_factory=list)
 
@@ -186,6 +189,7 @@ def build_profile(
         chamber_temperature_c=declared.chamber_temperature_c,
         limits=declared.limits,
         ams=declared.ams,
+        bed_positions=definition.bed_positions,
         observed=observed,
         warnings=warnings,
     )

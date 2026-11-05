@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
@@ -111,6 +112,20 @@ class MachineProfileConfig(BaseModel):
 BedPlate = Literal["cool_plate", "eng_plate", "hot_plate", "textured_plate", "supertack_plate"]
 
 
+class ArmClearDeclaration(BaseModel):
+    """An operator's standing statement that the robot arm stays clear of the bed.
+
+    Published on the printer's profile so an agent can rely on it for
+    ``position_bed``'s ``bed_path_clear`` instead of asking before every move
+    (``AGENTIC_LAB_DESIGN.md`` §1.3, *Bambu A1 bed positioning*). Removing it
+    from the config withdraws it.
+    """
+
+    declared_by: str = Field(min_length=1, max_length=120)
+    declared_on: date
+    statement: str = Field(min_length=1, max_length=500)
+
+
 class BedPositions(BaseModel):
     """Named Y positions the ``position_bed`` verb may park a bed-slinger at.
 
@@ -125,6 +140,8 @@ class BedPositions(BaseModel):
     #: Feed rate of the move, mm/min. 3000 (50 mm/s) is gentler than the
     #: A1's own end-gcode park move (3600).
     feed_mm_min: int = Field(default=3000, ge=300, le=6000)
+    #: The operator's standing arm-clear declaration, when one was made.
+    arm_clear: ArmClearDeclaration | None = None
 
     def y_for(self, position: str) -> float:
         return self.inspect_y_mm if position == "inspect" else self.pickup_y_mm

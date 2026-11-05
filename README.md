@@ -522,6 +522,25 @@ agent mode on. Each move emits a `bed.moved` event. The printer does not report
 bed position, so confirm it with a snapshot; a refused or undelivered move
 (502) is never retried. Config accepts `bed_positions` on an A1 only.
 
+An operator who knows the arm stays clear of the bed can record that once
+instead of confirming it before every move:
+
+```yaml
+bed_positions:
+  inspect_y_mm: 128
+  pickup_y_mm: 250
+  arm_clear:
+    declared_by: yang
+    declared_on: 2026-11-05
+    statement: >-
+      The robot arm is always clear of the A1's bed travel; it reaches over
+      the plate only while its agent holds the A1's claim.
+```
+
+`GET /printers/{id}/profile` publishes `bed_positions`, declaration included,
+so agents can rely on it for `bed_path_clear` (`AGENTIC_LAB_DESIGN.md` §1.3).
+Delete `arm_clear` to withdraw it; agents then confirm per move again.
+
 `start_print` is refused (412, a body naming the failed gate) unless the printer
 is observable, idle, not in a failed state and cold (`safe_bed_c`,
 `safe_nozzle_c`); a build plate is declared and matches the plate the job was

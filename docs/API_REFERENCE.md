@@ -131,7 +131,13 @@ no `bed_positions` (every printer but the A1); 403 for an unverified caller, or
 an agent while agent mode is off; 422 when `bed_path_clear` is not `true` or
 the position is unknown; 502 when the command was not delivered (never retry).
 The printer does not report bed position, so confirm with a snapshot. A
-delivered move emits `bed.moved`.
+delivered move emits `bed.moved`. `GET /printers/{id}/profile` publishes
+`bed_positions` (`inspect_y_mm`, `pickup_y_mm`, `feed_mm_min`, `arm_clear`;
+`null` on printers without the verb). `arm_clear` is the operator's standing
+declaration `{declared_by, declared_on, statement}` that the arm stays clear of
+the bed's travel (it enters only while its agent holds the printer's claim);
+when present, an agent may rely on it for `bed_path_clear`. `null` means none
+was made: confirm the arm per move instead.
 
 **Camera snapshot for a plate check.** `POST /printers/{id}/control/snapshot`
 with the claim token returns `{token, printer_id, captured_at, sha256,
