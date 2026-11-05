@@ -111,6 +111,25 @@ class MachineProfileConfig(BaseModel):
 BedPlate = Literal["cool_plate", "eng_plate", "hot_plate", "textured_plate", "supertack_plate"]
 
 
+class BedPositions(BaseModel):
+    """Named Y positions the ``position_bed`` verb may park a bed-slinger at.
+
+    Approved by Yang on 2026-11-05 for the Bambu A1 only. The caller names a
+    position, never a coordinate: ``inspect`` is where the camera sees the
+    whole plate (for the plate check), ``pickup`` where the robot arm takes
+    parts off (keep it equal to the slicer's ``end_bed_y_mm``).
+    """
+
+    inspect_y_mm: float = Field(ge=0, le=256)
+    pickup_y_mm: float = Field(ge=0, le=256)
+    #: Feed rate of the move, mm/min. 3000 (50 mm/s) is gentler than the
+    #: A1's own end-gcode park move (3600).
+    feed_mm_min: int = Field(default=3000, ge=300, le=6000)
+
+    def y_for(self, position: str) -> float:
+        return self.inspect_y_mm if position == "inspect" else self.pickup_y_mm
+
+
 class PrinterDefinition(BaseModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
     name: str = Field(min_length=1, max_length=120)
@@ -120,6 +139,9 @@ class PrinterDefinition(BaseModel):
     #: Whether an admin may switch agent mode on for this printer at runtime.
     #: Approved 2026-11-02 for the Bambu A1 only; refused on any other model.
     agent_mode_eligible: bool = False
+    #: Named bed positions for ``position_bed`` (approved 2026-11-05 for the
+    #: Bambu A1 only). Absent means the verb is refused on this printer.
+    bed_positions: BedPositions | None = None
 
     @field_validator("id", "name", "model", "env_prefix", mode="before")
     @classmethod
@@ -134,6 +156,16 @@ class PrinterDefinition(BaseModel):
             raise ValueError(
                 f"agent_mode_eligible is approved for Bambu A1 printers only, not {self.model!r}"
             )
+        if self.bed_positions is not None and not model_is_agent_mode_capable(self.model):
+            raise ValueError(
+                f"bed_positions (position_bed) is approved for Bambu A1 printers only, "
+                f"not {self.model!r}"
+            )
+        bed = self.profile.bed_size_mm
+        if self.bed_positions is not None and bed is not None:
+            for name in ("inspect_y_mm", "pickup_y_mm"):
+                if getattr(self.bed_positions, name) > bed[1]:
+                    raise ValueError(f"bed_positions.{name} is beyond the {bed[1]:g} mm bed")
         return self
 
 

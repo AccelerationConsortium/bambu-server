@@ -26,7 +26,7 @@ the routes enabled in a deployment.
 | Per-printer reads | `GET /printers/{id}/`, `/health`, `/status`, `/profile`, `/queue` |
 | Submit and review | `POST /submissions`; `GET /submissions`, `/submissions/{id}`; `POST /submissions/{id}/approve`, `/cancel` |
 | Claims (dispatch enabled) | `POST /printers/{id}/control/claim`, `/heartbeat`, `/release` |
-| Printer I/O (dispatch enabled) | `POST /printers/{id}/control/snapshot`, `/light`, `/start_print`, `/stop_print` |
+| Printer I/O (dispatch enabled) | `POST /printers/{id}/control/snapshot`, `/light`, `/start_print`, `/stop_print`, `/position_bed` (A1 only) |
 | View-only camera (dispatch enabled) | `GET /printers/{id}/camera.jpg` |
 | Agent switch | `GET /printers/{id}/agent-mode`; `POST` on that path is admin-only, never agent-operated |
 | Completion and pickup | `GET /events`, `/submissions/{id}/objects`, `/submissions/{id}/pickup-targets` |
@@ -101,7 +101,10 @@ not establish a filament-to-slot mapping or sufficient remaining quantity.
 
 Per printer, under `/printers/{id}/control/`: `claim`, `heartbeat`, `release`
 (STATUS_SPEC §5), then `snapshot`, `light` (`{"on": true|false}`),
-`start_print`, `stop_print`, each requiring
+`start_print`, `stop_print` and, on the Bambu A1 only, `position_bed`
+(`{"position": "inspect"|"pickup", "bed_path_clear": true}`: a Y-only move to a
+configured position on an idle printer; verified caller, agent mode for an
+agent; emits `bed.moved`; never retried), each requiring
 `X-Claim-Token` (423 without it). `start_print` takes the approved
 `submission_id`, `plate_confirmed_empty: true`, `plate_check_method`
 (`printer_camera` with a `snapshot_token`, `in_person`, or — for an agent on a

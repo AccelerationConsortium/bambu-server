@@ -38,7 +38,13 @@ camera snapshot that the plate is empty (`agent_camera`). Every other printer,
 and the A1 with the switch off, keeps the human-in-the-loop rules unchanged; see
 `AGENT_RULES.md` rule 4. The same day, robot calibration was ruled out of scope:
 the gateway reports object positions in bed millimetres and the arm agent owns
-the transform. All printer commands go through `bambu_server.dispatch` and
+the transform. On 2026-11-05 Yang approved (in a Claude Code session, recorded
+in this change) a fifth verb, **`position_bed`, for the Bambu A1 only**: a
+Y-only move of the bed to one of two configured positions -- `inspect`, where
+the camera sees the whole plate, and `pickup`, where the arm takes parts off --
+on an idle printer, under the claim, with a verified caller (an agent also
+needs agent mode on) who states `bed_path_clear: true`. No X, no Z, no homing,
+no caller-supplied coordinate; never retried. See `AGENT_RULES.md` rule 1. All printer commands go through `bambu_server.dispatch` and
 the backend's control methods; nothing else may call `bambulabs_api` command
 methods. Adding a verb, relaxing a gate, or letting an agent start a print
 without a person anywhere beyond that A1 approval needs a new explicitly

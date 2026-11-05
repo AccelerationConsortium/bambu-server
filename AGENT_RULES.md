@@ -12,7 +12,16 @@ the Bambu printer gateway.
    the stock start gcode's bed-mesh `M500` right after `G29` accepted -- every
    other refused command still refused), and
    `stop_print`, all behind `dispatch.enabled` and the gates in
-   `bambu_server.dispatch`. Any other verb, a relaxed gate, or integration with
+   `bambu_server.dispatch`. **Added 2026-11-05, approved by Yang, Bambu A1
+   only:** `position_bed`, which moves the bed (Y axis only, absolute `G90` /
+   `G1 Y.. F..`, nothing else) to a configured `inspect` or `pickup` position
+   (`bed_positions` on the printer, accepted by config on an A1 only). It needs
+   the claim, an idle printer in no error state with no job in flight, an
+   edge-verified caller -- an agent also needs the A1's agent mode on -- and the
+   caller's statement `bed_path_clear: true` that no robot arm, hand or object
+   is in the bed's travel or above the plate. The caller names a position,
+   never a coordinate; a refused or undelivered move is never retried and is
+   never "fixed" by homing. Any other verb, a relaxed gate, or integration with
    `lab-skills` plan execution needs a new, explicitly approved design.
 2. Monitoring must never start, pause, resume, stop, heat, home, move, calibrate,
    upload to, or otherwise control a printer.
