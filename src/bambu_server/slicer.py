@@ -24,6 +24,13 @@ the override file:
   bed temperatures and the plate named in the gcode belong to the surface the
   printer actually has.
 
+Placement: by default the CLI auto-arranges the part onto the plate centre.
+``front_left`` instead puts the part's footprint a margin in from the front-left
+corner of the printable area (the origin of the bed frame). The CLI has no
+translate option and drops a bare STL off the plate when arrange is disabled,
+so the mesh is wrapped in a minimal 3MF whose build-item transform carries the
+offset, and the slice runs with ``--arrange 0``.
+
 Slicing touches no printer. It is pure computation on the gateway host.
 """
 
@@ -34,8 +41,11 @@ import json
 import logging
 import re
 import shutil
+import struct
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .config import BedPlate, SlicerSettings
 from .plates import PRINTER_TO_SLICER
@@ -49,6 +59,12 @@ _MAX_INHERITS_DEPTH = 16
 _PRESET_META_KEYS = {"name", "inherits", "include", "instantiation", "setting_id", "from", "type"}
 #: Result codes Bambu Studio's CLI writes to ``result.json``; 0 is success.
 _SUCCESS_RETURN_CODE = 0
+
+
+#: Where an uploaded mesh goes on the plate. ``auto`` is the slicer's own
+#: arrangement (centred); ``front_left`` is a margin in from the bed origin.
+Placement = Literal["auto", "front_left"]
+PLACEMENTS: tuple[Placement, ...] = ("auto", "front_left")
 
 
 class SlicerError(RuntimeError):
@@ -65,6 +81,7 @@ class SliceRequest:
     material: str
     nozzle_type: str | None
     plate: BedPlate | None
+    placement: Placement = "auto"
 
 
 @dataclass(frozen=True)
@@ -73,6 +90,12 @@ class SliceResult:
     slicer_version: str | None
     estimated_minutes: float | None
     warnings: tuple[str, ...]
+    #: Where the mesh's footprint was put, front-left corner first, in bed
+    #: millimetres; None when the slicer arranged it.
+    placed_min_xy_mm: tuple[float, float] | None = None
+    #: The Y axis position the end gcode parks the bed at, when the gateway
+    #: set it; None when the stock end gcode was left alone.
+    end_bed_y_mm: float | None = None
 
 
 class BambuStudioSlicer:
@@ -172,6 +195,14 @@ class BambuStudioSlicer:
         # `curr_bed_type` is a project-level setting; the CLI takes it from any
         # loaded settings file and the exported plate gcode carries it.
         machine_body["curr_bed_type"] = PRINTER_TO_SLICER[request.plate]
+        presets = self._settings.presets_for(request.printer_id)
+        end_bed_y = presets.end_bed_y_mm if presets is not None else None
+        if end_bed_y is not None:
+            machine_body["machine_end_gcode"] = _with_end_bed_y(
+                machine_body.get("machine_end_gcode"),
+                end_bed_y,
+                printable_area=_printable_area(machine_body),
+            )
         override = job_dir / "machine.json"
         override.write_text(json.dumps(machine_body, indent=2), encoding="utf-8")
         process = job_dir / "process.json"
@@ -182,20 +213,37 @@ class BambuStudioSlicer:
         datadir.mkdir(exist_ok=True)
         output = job_dir / "plate.3mf"
 
+        model_input = mesh
+        arrange = "1"
+        placed: tuple[float, float] | None = None
+        if request.placement == "front_left":
+            model_input = job_dir / "placed.3mf"
+            placed = await asyncio.to_thread(
+                _place_front_left,
+                mesh,
+                model_input,
+                printable_area=_printable_area(machine_body),
+                margin_mm=self._settings.placement_margin_mm,
+            )
+            arrange = "0"
+
         argv = [
             str(self._settings.executable),
             "--debug", "1",
             "--datadir", str(datadir),
             "--load-settings", f"{override};{process}",
             "--load-filaments", str(filament),
-            "--arrange", "1",
+            "--arrange", arrange,
             "--orient", "0",
             "--slice", "0",
             "--export-3mf", output.name,
             "--outputdir", str(job_dir),
-            str(mesh),
+            str(model_input),
         ]
-        logger.info("Slicing %s for %s (%s)", mesh.name, request.printer_id, request.material)
+        logger.info(
+            "Slicing %s for %s (%s, placement %s)",
+            mesh.name, request.printer_id, request.material, request.placement,
+        )
         try:
             process_handle = await asyncio.create_subprocess_exec(
                 *argv,
@@ -248,6 +296,8 @@ class BambuStudioSlicer:
             slicer_version=_slicer_version(stderr),
             estimated_minutes=estimated,
             warnings=tuple(warnings),
+            placed_min_xy_mm=placed,
+            end_bed_y_mm=end_bed_y,
         )
 
     def discard(self, job_dir: Path) -> None:
@@ -320,6 +370,209 @@ def _compatible_printers(preset: Path) -> list[str]:
     if not isinstance(listed, list):
         return []
     return [name for name in listed if isinstance(name, str)]
+
+
+#: The stock end gcode's last park move, e.g. the A1's ``G1 X-48 Y180 F3600``:
+#: toolhead to the left parking spot, bed to a Y position, just before the
+#: motors are released. Only the Y word is ever rewritten.
+_END_PARK_MOVE_RE = re.compile(
+    r"^(?P<head>G1 X-?\d+(?:\.\d+)? )Y\d+(?:\.\d+)?(?P<tail> F\d+[^\n]*)$", re.MULTILINE
+)
+
+
+def _with_end_bed_y(
+    end_gcode: object, y_mm: float, *, printable_area: tuple[float, float, float, float]
+) -> str:
+    """The machine end gcode with its final bed park move set to ``y_mm``.
+
+    The last absolute ``G1 X.. Y.. F..`` after the stock ``G90`` is the park
+    move. A preset whose end gcode does not have one is refused rather than
+    guessed at, and so is a position outside the printable area.
+    """
+
+    _, area_min_y, _, area_max_y = printable_area
+    if not area_min_y <= y_mm <= area_max_y:
+        raise SlicerUnavailable(
+            f"end_bed_y_mm {y_mm:g} is outside the bed's Y travel "
+            f"({area_min_y:g}-{area_max_y:g} mm)"
+        )
+    if not isinstance(end_gcode, str):
+        raise SlicerUnavailable("the machine preset has no end gcode to set the bed position in")
+    matches = list(_END_PARK_MOVE_RE.finditer(end_gcode))
+    if not matches:
+        raise SlicerUnavailable(
+            "the machine end gcode has no final park move, so end_bed_y_mm cannot be applied"
+        )
+    last = matches[-1]
+    if "G90" not in end_gcode[: last.start()]:
+        raise SlicerUnavailable(
+            "the machine end gcode's park move is not in absolute positioning"
+        )
+    replacement = (
+        f"{last.group('head')}Y{y_mm:g}{last.group('tail')} "
+        "; bed parked for pickup (gateway end_bed_y_mm)"
+    )
+    return end_gcode[: last.start()] + replacement + end_gcode[last.end():]
+
+
+_STL_TRIANGLE = struct.Struct("<12x9f2x")
+_ASCII_VERTEX_RE = re.compile(rb"^\s*vertex\s+(\S+)\s+(\S+)\s+(\S+)", re.MULTILINE)
+_AREA_POINT_RE = re.compile(r"^\s*(-?[0-9.]+)\s*x\s*(-?[0-9.]+)\s*$")
+
+Vertex = tuple[float, float, float]
+
+
+def _read_stl(path: Path) -> tuple[list[Vertex], list[tuple[int, int, int]]]:
+    """An STL's shared vertices and its triangles as vertex indices.
+
+    Binary STL is recognised by its exact length (80-byte header, a triangle
+    count, 50 bytes per triangle); anything else starting with ``solid`` is
+    read as ASCII. Vertices are shared by exact value so the 3MF stays one
+    connected mesh, as the STL describes it.
+    """
+
+    data = path.read_bytes()
+    coordinates: list[float]
+    if len(data) >= 84:
+        (count,) = struct.unpack_from("<I", data, 80)
+    else:
+        count = -1
+    if count >= 0 and len(data) == 84 + 50 * count:
+        coordinates = [
+            value for triangle in _STL_TRIANGLE.iter_unpack(data[84:]) for value in triangle
+        ]
+    elif data.lstrip().startswith(b"solid"):
+        try:
+            coordinates = [
+                float(value) for match in _ASCII_VERTEX_RE.finditer(data) for value in match.groups()
+            ]
+        except ValueError as exc:
+            raise SlicerError("the uploaded mesh is not a readable STL") from exc
+        if len(coordinates) % 9:
+            raise SlicerError("the uploaded mesh is not a readable STL")
+    else:
+        raise SlicerError("the uploaded mesh is not a readable STL")
+    if not coordinates:
+        raise SlicerError("the uploaded mesh has no triangles")
+    if any(value != value or value in (float("inf"), float("-inf")) for value in coordinates):
+        raise SlicerError("the uploaded mesh has non-finite coordinates")
+
+    index: dict[Vertex, int] = {}
+    vertices: list[Vertex] = []
+    triangles: list[tuple[int, int, int]] = []
+    for start in range(0, len(coordinates), 9):
+        corners = []
+        for offset in (0, 3, 6):
+            vertex = (
+                coordinates[start + offset],
+                coordinates[start + offset + 1],
+                coordinates[start + offset + 2],
+            )
+            found = index.get(vertex)
+            if found is None:
+                found = index[vertex] = len(vertices)
+                vertices.append(vertex)
+            corners.append(found)
+        if len(set(corners)) == 3:  # a degenerate triangle has no area to print
+            triangles.append((corners[0], corners[1], corners[2]))
+    if not triangles:
+        raise SlicerError("the uploaded mesh has no triangles")
+    return vertices, triangles
+
+
+def _printable_area(machine_body: dict[str, object]) -> tuple[float, float, float, float]:
+    """The machine's printable rectangle as ``(min_x, min_y, max_x, max_y)``."""
+
+    points: list[tuple[float, float]] = []
+    raw = machine_body.get("printable_area")
+    for entry in raw if isinstance(raw, list) else []:
+        match = _AREA_POINT_RE.match(str(entry))
+        if match:
+            points.append((float(match.group(1)), float(match.group(2))))
+    if len(points) < 3:
+        raise SlicerUnavailable("the machine preset does not declare its printable area")
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _place_front_left(
+    mesh: Path,
+    output: Path,
+    *,
+    printable_area: tuple[float, float, float, float],
+    margin_mm: float,
+) -> tuple[float, float]:
+    """Write ``mesh`` as a one-object 3MF placed at the front-left of the bed.
+
+    The part keeps its orientation; it is only translated so its footprint's
+    front-left corner sits ``margin_mm`` in from the printable area's and its
+    lowest point rests on the plate. The margin leaves room for a brim or a
+    skirt. A part too large to fit with the margin is refused rather than
+    hung off the bed. Returns the footprint's new front-left corner.
+    """
+
+    vertices, triangles = _read_stl(mesh)
+    min_x = min(v[0] for v in vertices)
+    min_y = min(v[1] for v in vertices)
+    min_z = min(v[2] for v in vertices)
+    size_x = max(v[0] for v in vertices) - min_x
+    size_y = max(v[1] for v in vertices) - min_y
+    area_min_x, area_min_y, area_max_x, area_max_y = printable_area
+    target_x = area_min_x + margin_mm
+    target_y = area_min_y + margin_mm
+    if target_x + size_x > area_max_x or target_y + size_y > area_max_y:
+        raise SlicerError(
+            f"the part ({size_x:.1f} x {size_y:.1f} mm) does not fit at the front left "
+            f"with a {margin_mm:g} mm margin on a "
+            f"{area_max_x - area_min_x:g} x {area_max_y - area_min_y:g} mm bed"
+        )
+    tx, ty, tz = target_x - min_x, target_y - min_y, -min_z
+
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" '
+            'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="model" '
+            'ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>'
+            "</Types>",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Target="/3D/3dmodel.model" Id="rel0" '
+            'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>'
+            "</Relationships>",
+        )
+        with archive.open("3D/3dmodel.model", "w") as model:
+            model.write(
+                b'<?xml version="1.0" encoding="UTF-8"?>\n'
+                b'<model unit="millimeter" xml:lang="en-US" '
+                b'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+                b'<resources><object id="1" type="model"><mesh><vertices>'
+            )
+            model.write(
+                "".join(
+                    f'<vertex x="{x:.9g}" y="{y:.9g}" z="{z:.9g}"/>' for x, y, z in vertices
+                ).encode("ascii")
+            )
+            model.write(b"</vertices><triangles>")
+            model.write(
+                "".join(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in triangles).encode(
+                    "ascii"
+                )
+            )
+            model.write(
+                b"</triangles></mesh></object></resources><build>"
+                + f'<item objectid="1" transform="1 0 0 0 1 0 0 0 1 '
+                f'{tx:.6f} {ty:.6f} {tz:.6f}"/>'.encode("ascii")
+                + b"</build></model>"
+            )
+    return round(target_x, 3), round(target_y, 3)
 
 
 _VERSION_RE = re.compile(r"BambuStudio Version (\S+)")

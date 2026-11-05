@@ -260,6 +260,11 @@ class SlicerPrinterPresets(BaseModel):
     machine: str = Field(min_length=1)
     process: str | None = Field(default=None, min_length=1)
     filaments: dict[str, str] | None = None
+    #: Where the stock end gcode's final park move leaves the bed, as the Y
+    #: axis position in bed millimetres. Unset keeps the stock move (the A1's
+    #: ``G1 X-48 Y180``). On a bed-slinger a larger Y brings the plate further
+    #: toward the front for pickup; stay short of the printable area's edge.
+    end_bed_y_mm: float | None = Field(default=None, ge=0, le=1000)
 
     @field_validator("filaments", mode="before")
     @classmethod
@@ -296,6 +301,9 @@ class SlicerSettings(BaseModel):
     machine_profiles: dict[str, SlicerPrinterPresets] = Field(default_factory=dict)
     #: Ceiling on an uploaded mesh.
     max_stl_bytes: int = Field(default=100 * 1024 * 1024, ge=1024)
+    #: Gap, in millimetres, between a ``front_left`` part's footprint and the
+    #: front and left edges of the printable area: room for a brim or skirt.
+    placement_margin_mm: float = Field(default=10.0, ge=0, le=100)
 
     @field_validator("filament_profiles", mode="before")
     @classmethod

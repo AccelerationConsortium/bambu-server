@@ -104,7 +104,13 @@ from .records import (
     Transport,
     urllib_transport,
 )
-from .slicer import BambuStudioSlicer, SliceRequest, SlicerError, SlicerUnavailable
+from .slicer import (
+    BambuStudioSlicer,
+    Placement,
+    SliceRequest,
+    SlicerError,
+    SlicerUnavailable,
+)
 from .submissions import (
     TERMINAL_STATES as TERMINAL_JOB_STATES,
 )
@@ -707,6 +713,14 @@ def create_app(
         requested_by: Annotated[str | None, Form(max_length=120)] = None,
         material: Annotated[str | None, Form(max_length=60)] = None,
         eln_project: Annotated[str | None, Form(max_length=120)] = None,
+        placement: Annotated[
+            Placement | None,
+            Form(
+                description="Where the gateway puts an uploaded .stl on the plate: "
+                "`auto` (default; the slicer centres it) or `front_left` (a margin in "
+                "from the front-left corner of the bed). Only for an .stl."
+            ),
+        ] = None,
     ) -> SubmissionJob:
         """Accept a print artifact, validate it, and queue it if it passes.
 
@@ -716,6 +730,8 @@ def create_app(
         ``eln_project`` optionally names the ELN project the finished record
         is filed under, through the central server. An agent (``X-Agent-Id`` or
         an agent edge role) may submit only to a printer in agent mode.
+        ``placement`` positions an ``.stl`` the gateway slices; a sliced file
+        is printed where its slicer put it, so it is refused there.
         """
 
         # A verified identity wins over the form field: a signed-in person must
@@ -743,6 +759,13 @@ def create_app(
                 material=material,
                 eln_project=eln_project,
                 agent_id=agent_id,
+                placement=placement or "auto",
+            )
+        if placement is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="placement applies only to an .stl the gateway slices; "
+                "a sliced file prints where its slicer placed it",
             )
         kind = ARTIFACT_EXTENSIONS.get(extension)
         if kind is None:
@@ -800,6 +823,7 @@ def create_app(
         material: str | None,
         eln_project: str | None = None,
         agent_id: str | None = None,
+        placement: Placement = "auto",
     ) -> SubmissionJob:
         """Slice an uploaded mesh for the target machine, then intake the 3mf.
 
@@ -846,6 +870,7 @@ def create_app(
                 material=material,
                 nozzle_type=monitor.profile().nozzle_type,
                 plate=monitor.definition.profile.plate,
+                placement=placement,
             )
             try:
                 machine, process, filament = slicer.resolve_presets(request)
@@ -864,6 +889,8 @@ def create_app(
                 machine_preset=machine.stem,
                 process_preset=process.stem,
                 filament_preset=filament.stem,
+                placement=placement,
+                end_bed_y_mm=result.end_bed_y_mm,
                 warnings=list(result.warnings),
             )
 
@@ -1103,6 +1130,7 @@ def create_app(
             ready=ready,
             reason=reason,
             bed_size_mm=keeper.bed_size(job.target_machine),
+            bed_park_y_mm=job.provenance.end_bed_y_mm if job.provenance else None,
             pickup=pickup,
             objects=objects,
         )

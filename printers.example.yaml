@@ -65,6 +65,7 @@ slicer:
   profiles_dir: /home/you/.local/opt/bambu-studio/squashfs-root/resources/profiles/BBL
   work_dir: var/slicer
   timeout_s: 600
+  placement_margin_mm: 10          # gap to the bed edges for placement=front_left
   # Defaults for a printer that does not name its own process or filaments.
   process_profile: "0.20mm Standard @BBL X1C"
   filament_profiles:               # material a submitter names -> filament preset
@@ -82,6 +83,7 @@ slicer:
     #   process: "0.20mm Standard @BBL A1"
     #   filaments:
     #     PLA: "Bambu PLA Basic @BBL A1"
+    #   end_bed_y_mm: 250            # park the bed forward when done (stock Y180)
 
 printers:
   - id: bambu_x1c_01

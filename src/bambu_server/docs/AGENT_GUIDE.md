@@ -72,6 +72,15 @@ preset provenance. Allow time for slicing; it is synchronous with the upload
 request. It does not send any printer command. The server selects the target's
 presets, so callers cannot silently use P1S process settings for an A1.
 
+To put the part near the front-left corner of the plate instead of the centre,
+add `placement=front_left`. The part keeps its orientation and is moved so its
+footprint starts `slicer.placement_margin_mm` (default 10 mm) from the front
+and left edges of the printable area, in the bed frame (origin front-left, +X
+right, +Y toward the back). A part too large to fit there is refused with 422.
+`provenance.placement` records the choice and `GET /submissions/{id}/objects`
+reports where the slicer actually put it. `placement` is accepted only with an
+`.stl`; a sliced `.3mf` prints where its own slicer placed it.
+
 An agent may instead slice locally with Bambu Studio and submit the result.
 Use A1 machine, process and filament presets for an A1; P1S/X1C process settings
 are not substitutes. Check the validation verdict returned by submission.
@@ -151,6 +160,12 @@ Temperature alone does not establish safe robot clearance, part release or
 graspability. Objects are in bed millimetres, origin front-left, +X right,
 +Y back, Z up. The arm agent owns its calibration and transform; the gateway
 never commands the arm. Unknown positions are an empty list, never a guess.
+On the A1 the bed itself moves in Y, so bed coordinates do not fix a world
+position on their own: `bed_park_y_mm` says where the job's end gcode parked
+the bed (`null` when unknown, e.g. the stock Y 180 end move). A larger value
+puts the plate, and every object on it, that much further toward the front.
+After the print the bed motors are released, so the bed can be pushed; check
+it has not moved before relying on it.
 
 `/submissions/{id}/artifact` returns the exact stored bytes and SHA-256 ETag.
 `/result` returns the durable versioned bundle; `final: false` means the job is

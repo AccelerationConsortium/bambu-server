@@ -447,7 +447,16 @@ headlessly in a scratch directory, forcing two machine facts the stock presets
 get wrong: the nozzle type the printer reports and the build plate declared in
 its profile. The resulting `.3mf` is then validated and queued like any other
 upload, and the job carries `provenance` (source mesh hash, presets, slicer
-version). Slicing runs inline in the request.
+version, placement). Slicing runs inline in the request.
+
+By default the slicer centres the part. The optional form field
+`placement=front_left` instead puts its footprint `slicer.placement_margin_mm`
+(default 10 mm, room for a brim) in from the front-left corner of the printable
+area, resting on the plate and keeping its orientation. The gateway wraps the
+mesh in a one-object 3MF whose build transform carries the offset and slices
+with `--arrange 0`, since the CLI drops a bare STL off the plate when arrange
+is off. On the A1 this keeps the part clear of the purge line, which runs along
+the front edge at X 108-158.
 
 For A1 server-side PLA slicing, add the following alongside existing printer
 entries under `slicer.machine_profiles` in the local configuration:
@@ -458,10 +467,20 @@ bambu_a1_01:
   process: 0.20mm Standard @BBL A1
   filaments:
     PLA: Generic PLA @BBL A1
+  end_bed_y_mm: 250   # optional: park the bed forward for pickup
 ```
 
+`end_bed_y_mm` rewrites the Y of the stock end gcode's final park move (the
+A1's `G1 X-48 Y180 F3600`, just before the motors are released) so a finished
+plate is presented further forward; on the A1 a larger Y moves the bed toward
+the front. It must lie within the printable area, and a preset whose end gcode
+has no such move is refused rather than guessed at. The value is recorded as
+`provenance.end_bed_y_mm` and returned by `pickup-targets` as `bed_park_y_mm`,
+because object positions move with the bed.
+
 Agents upload multipart fields `file=design.stl`,
-`target_machine=bambu_a1_01`, and `material=PLA` to `POST /submissions`
+`target_machine=bambu_a1_01`, `material=PLA` and optionally
+`placement=front_left` to `POST /submissions`
 through the authenticated edge with their own API key and `X-Agent-Id`.
 A1 agent mode must be on. There is no separate `/slice` endpoint. HTTP 201
 returns a stored submission; inspect its validation and state before approval.
